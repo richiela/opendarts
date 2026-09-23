@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+*.egg-info/
+build/
+dist/
+.DS_Store
+
+# local data, not tracked
+/data/
+/tmp/
+
+# Loaded DLLs renamed aside by run.ps1 so a pull can update them
+tools/winvcam/vcam_probe.dll.old-*

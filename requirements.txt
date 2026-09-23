@@ -1,0 +1,20 @@
+# What the product needs to run. Tests need more -- see requirements-dev.txt.
+numpy
+# OpenCV: the HEADLESS build everywhere. The GUI build needs libGL.so.1, which a Linux server does not have.
+# Windows no longer needs the full build for Media Foundation: cameras are read by our own Media Foundation code
+# (opendarts/live/win_mf_capture.py), with DirectShow as the fallback. run.ps1 removes a leftover full build once.
+opencv-python-headless
+# PyAV: writes/reads the per-throw video clips (opendarts/capture/clip.py) --
+# muxes the camera's own MJPEG frames into MKV by stream copy on Linux/Windows
+# (exact scored bytes, no re-encode) and FFV1-encodes decoded frames on macOS.
+# A pip wheel that bundles the ffmpeg libraries, same shape as opencv-python:
+# no system ffmpeg, works on every platform we ship (incl. Windows).
+av
+fastapi
+uvicorn
+# uvicorn's optional extras, named one by one instead of uvicorn[standard],
+# which also drags in watchfiles (a reloader this never uses), python-dotenv
+# and PyYAML onto every rig.
+websockets  # the WebSocket protocol implementation /api/live is served over
+httptools   # the faster HTTP parser
+uvloop; sys_platform != "win32"  # the faster event loop; not built for Windows

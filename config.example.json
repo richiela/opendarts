@@ -1,0 +1,53 @@
+{
+  "_readme": [
+    "TEMPLATE ONLY -- nothing reads this file.",
+    "The live file is data/config.json, which is gitignored because the same code runs on rigs with different hardware. This one is checked in so every key and its real default can be seen without reading source.",
+    "Copying it is optional, and copying it wholesale is not recommended: every key is optional, and an ABSENT key means 'use the code default', which is exactly what each value below already is. Copy the two or three lines you actually want to change.",
+    "Precedence, highest first: a CLI flag (--port, --host, --ad-base-url) beats this file, which beats the code default.",
+    "HOW KEYS ARE WRITTEN: the dashboard's Config tab sends PATCH /api/config with just the keys it is changing, and the server merges them into data/config.json -- the same file, the same keys, that you would hand-edit. There is no parallel store and no per-setting endpoint: one document (GET /api/config) reports every key with the value actually in force, and one PATCH changes any of them. A PATCH is all-or-nothing: an unknown key or a bad value is refused by name and NOTHING is written. A key it would only reach at the next start (port, host, cv2_num_threads, v4l2_format, engine_config, camera_resolutions, reprojection_targets_px, publish_virtual_cameras) is reported back as restart-required rather than silently accepted as live. See docs/LIVE_API.md.",
+    "always_update: whether run.sh/run.ps1 pull the checked-out branch on EVERY relaunch. False by default, and that default is the point: a relaunch is triggered by the process exiting, which includes crashing, so an unconditional pull meant a rig that fell over mid-match came back on whatever was on main at that second. Set it to true only on a machine that is SUPPOSED to follow main (a dev VM); a rig scoring real darts should leave it false and ask for updates one at a time. See docs/DEPLOYMENT.md.",
+    "update_on_next_restart: a ONE-SHOT 'pull before the next relaunch' request, false by default. Written by POST /api/restart {\"update\": true} -- which is what the dashboard's Config tab -> Maintenance -> 'Update and restart' button sends -- and CLEARED by the launcher as it reads it, so one request means one pull and a later crash cannot repeat it. A pull that fails is logged loudly and NOT retried: the flag is already cleared and the product starts on the code the machine already has. Hand-editing it to true works and is the offline equivalent of pressing the button.",
+    "NOT LISTED HERE: 'capabilities'. That section is written by the startup capability probe, not by hand, and anything typed into it is overwritten on the next launch -- PATCH /api/config refuses it outright for the same reason. Also absent: 'camera_urls' (per-slot stream URLs; absent means every slot reads local hardware), 'v4l2_format' (absent means the publisher's own default) and 'frame_ring_max_gb' (absent means no ceiling) -- three keys whose absence is meaningful, so a template value would invite copying a decision nobody made.",
+    "camera_resolutions: per-camera-index map, values either the string 'auto' (probe the camera and use its highest supported mode) or an explicit 'WIDTHxHEIGHT'. Example: {\"0\": \"auto\", \"1\": \"1920x1080\"}. A camera ABSENT from the map is not the same as 'auto' -- it keeps the fixed 1280x720 capture default, which is why the default below is an empty object.",
+    "reprojection_targets_px: per-camera-index map of the calibration reprojection error, in pixels, that camera is expected to reach. Example: {\"0\": 1.0, \"1\": 3.1, \"2\": 1.0}. A camera absent from the map uses the uniform 2.5 px target.",
+    "publish_virtual_cameras: Windows and Linux, and it has no fixed default -- when the key is absent it FOLLOWS ad_enabled, so the virtual cameras other software reads are only fed when the Autodarts comparison is on. 'false' below is what that resolves to given the ad_enabled default (off) directly above it, not a constant in the code. Set it explicitly to keep the cameras fed with the comparison off, or vice versa.",
+    "cv2_num_threads: a NEGATIVE value means 'keep OpenCV's own thread pool'. See docs/DEPLOYMENT.md for the measurement behind the default of 1.",
+    "idle_timeout_sec: seconds of no darts before the capture loop auto-stops; 0 or less disables the auto-stop entirely.",
+    "min_free_disk_gb: the free-space floor both on-disk writers stop at. Below it, a throw package is SKIPPED (the throw still scores -- the live board, match history and retail channel never read a package) and a frame-ring capture is REFUSED with the numbers in the refusal. An ABSENT key and 0 both mean the default of 5; a NEGATIVE value disables the guard entirely. A ring dump is also checked against its own size, not merely against the free space right now, so a 4.7 GB dump onto 5.1 GB of disk is refused. The package skip is logged once per session, not once per throw. See docs/DEPLOYMENT.md.",
+    "engine_config: 'primary' is required if the section is present at all; an unregistered engine name in either field makes the whole section fall back to the defaults below.",
+    "frame_ring_seconds: how many SECONDS of recent camera frames are kept in memory so a missed or misscored dart can be written to disk afterwards. Local cameras keep each frame as JPEG -- the camera's own bytes on Linux and Windows, OpenDarts' own q50 encode on macOS -- about 80 KB a frame, so three cameras at 30 fps hold roughly 7 MB per second and the default of 20 is about 150 MB. A slot with no JPEG (a pixels-only source) holds raw frames at ~2.7 MB each instead, which is what frame_ring_max_gb is for. 0 disables the ring. The dashboard's Config tab writes this key and applies it live. frame_ring_max_gb (absent by default) is an optional hard ceiling; when it fires it SHORTENS the window below what frame_ring_seconds promises, so the ring logs it and the dashboard shows the ring as capped rather than quietly giving you less than the number on screen.",
+    "NOT LISTED HERE EITHER: 'audio'. There was an audio.enabled/audio.voice section until 2026-09-15, when spoken calls moved into the browser. On/off, volume and voice are now per-device settings in each browser's localStorage, not rig-wide config -- the TV above the board and the iPad in your hand are different listeners. Set them per screen in the dashboard's Config tab. The clip sets themselves still live in assets/voices/, and adding a voice is still dropping in a directory."
+  ],
+  "host": "0.0.0.0",
+  "port": 8420,
+  "ad_base_url": "http://localhost:3180",
+  "ad_enabled": false,
+  "camera_devices": [
+    0,
+    1,
+    2
+  ],
+  "camera_resolutions": {},
+  "reprojection_targets_px": {},
+  "store_packages": true,
+  "min_free_disk_gb": 5,
+  "frame_ring_seconds": 20,
+  "publish_virtual_cameras": false,
+  "cv2_num_threads": 1,
+  "always_update": false,
+  "update_on_next_restart": false,
+  "idle_timeout_sec": 900,
+  "lifecycle_settings": {
+    "dart_stable_frames": 2
+  },
+  "engine_config": {
+    "primary": "Zeus",
+    "also_run": [
+      "Apollo",
+      "Talos",
+      "Athena",
+      "Ares"
+    ],
+    "timeout_s": 5.0
+  }
+}

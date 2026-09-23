@@ -1,0 +1,10 @@
+; Exactly the four COM entry points, nothing else.
+; Without this, MinGW auto-exports every symbol -- including the hundreds of
+; GUIDs initguid.h instantiates -- which makes the export table meaningless
+; and was visible in the first smoke build.
+LIBRARY vcam_probe.dll
+EXPORTS
+    DllGetClassObject   PRIVATE
+    DllCanUnloadNow     PRIVATE
+    DllRegisterServer   PRIVATE
+    DllUnregisterServer PRIVATE

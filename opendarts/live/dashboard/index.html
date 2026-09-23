@@ -1,0 +1,586 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>@@OD_HOST_LABEL@@ - opendarts dashboard</title>
+<style>
+@@OD_APP_CSS@@
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" width="22" height="22">
+      <circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="1.6" opacity=".45"/>
+      <circle cx="12" cy="12" r="6" fill="none" stroke="currentColor" stroke-width="1.6" opacity=".75"/>
+      <circle cx="12" cy="12" r="2.2" fill="currentColor"/>
+    </svg></span>
+    <div>
+      <strong>opendarts live dashboard</strong>
+      <div class="sub" id="brand-sub">live scoring</div>
+    </div>
+  </div>
+  <div class="top-end">
+    <div class="status-pill" id="status-pill" title="">
+      <span class="dot" id="status-dot"></span>
+      <span id="status-text">&mdash;</span>
+      <span class="sep" id="status-sep" style="display:none;">&middot;</span>
+      <span class="status-detail" id="status-detail"></span>
+    </div>
+    <!-- THREE states, not two. "Sound on" is the user's choice; whether
+         anything will actually PLAY is a separate fact the browser owns,
+         and the two disagree exactly when it matters. An iPad that moved
+         its AudioContext to 'interrupted' on a phone call reported itself
+         enabled and healthy while silent for the rest of the session --
+         a green/red pair would have said "on" throughout. So: on,
+         off, and on-but-blocked. -->
+    <span id="audio-indicator" class="badge unknown" title="" role="button" tabindex="0" aria-label="Toggle spoken calls">sound</span>
+    <span id="ws-indicator" class="badge unknown">connecting</span>
+  </div>
+</header>
+
+<main class="layout">
+  <aside class="sidebar">
+    <!-- Sidebar, 2026-09-08: actions only -- Controls (buttons) ->
+         Recent actions. The old third block (camera timeout / detection
+         time / engine picker) is gone: the two timeout selects MOVED to
+         the Config tab (same element ids, same handlers -- see that
+         panel's own comment), and the engine picker was REMOVED outright
+         because Zeus always runs as the primary. There is no longer any
+         per-engine choice to present, so presenting one would be
+         inventing a decision that isn't real. -->
+    <section class="side-block side-block-controls">
+      <h2>Controls</h2>
+      <div class="btn-grid">
+        <button id="btn-start" class="action primary" type="button" title="Opens the camera hub and starts a capture-loop session (auto-calibrates only if no valid calibration exists yet).">Start</button>
+        <button id="btn-stop" class="action" type="button" title="Stops the current capture-loop session and closes the camera hub.">Stop</button>
+        <button id="btn-reset" class="action" type="button" title="Takes whatever the board looks like right now as the fresh empty baseline (dart or no dart, no validation) and resets the turn's dart count to 0.">Reset</button>
+        <button id="btn-refresh-calib" class="action" type="button" title="Recalibrates now, replaces what the capture loop scores every dart with, and saves a durable snapshot to disk.">Calibrate</button>
+      </div>
+    </section>
+    <section class="side-block">
+      <h2>Recent actions</h2>
+      <!-- Persistent, timestamped log of every Start/Stop/Reset/Calibrate
+           click (and the async "auto-calibrate ran/reused" confirmation
+           after a Start) -- see #action-log's own CSS comment above for
+           the real incident this fixes. Newest first, capped client-side. -->
+      <div id="action-log" class="action-log"></div>
+    </section>
+  </aside>
+
+  <section class="stage">
+    <nav class="tabs">
+      <button class="tab active" data-tab="scoring" type="button">Scoring</button>
+      <button class="tab" data-tab="engines" type="button">Engines</button>
+      <button class="tab" data-tab="config" type="button">Config</button>
+      <!-- Info, restored 2026-09-13 after a day of being folded into
+           Config. The original Info tab deserved deleting: it printed
+           eight READ-ONLY COPIES OF CONFIG VALUES, so the operator hunted
+           in two places for one subject, and its note claimed all eight
+           "are set in data/config.json" when host, package root and
+           frame source never were. What lives here now is a different
+           thing entirely -- build, machine, versions, what this process
+           is wired to -- which duplicates no setting and belongs nowhere
+           near controls you can change. Config is what you edit; Info is
+           what this rig IS. -->
+      <button class="tab" data-tab="info" type="button">Info</button>
+    </nav>
+
+    <!-- Scoring: the live board. Driven ENTIRELY by the THROW_DETECTED /
+         VISIT_CLEARED / THROW_CORRECTED websocket events plus /api/state's
+         own `visit` section on load -- never by packages, deliberately
+         (2026-09-08: package writing may be switched off). Nothing in
+         this panel reads
+         allKnownPackages; see renderVisit()/onThrowDetected() below. -->
+    <div id="tab-scoring" class="tab-panel active">
+      <!-- Darts across the top, board below and as large as the panel
+           allows, with the three dart boxes in a row above it
+           (2026-09-08). No visit total -- deliberately dropped at the
+           same time; this rig is a scoring
+           instrument, not a game engine, and the per-dart call is the
+           thing being read off it. The legend went with it: the dart
+           boxes now carry the same three colours as their own left
+           border, so a separate colour key is redundant. -->
+      <div class="scoring-live">
+        <div class="visit-strip">
+          <div class="visit-slot" id="visit-slot-0"><span class="vs-n">dart 1</span><span class="vs-v">&ndash;</span><span class="vs-sub"></span></div>
+          <div class="visit-slot" id="visit-slot-1"><span class="vs-n">dart 2</span><span class="vs-v">&ndash;</span><span class="vs-sub"></span></div>
+          <div class="visit-slot" id="visit-slot-2"><span class="vs-n">dart 3</span><span class="vs-v">&ndash;</span><span class="vs-sub"></span></div>
+          <div class="visit-total" id="visit-total"><span class="vt-n">turn</span><span class="vt-v">&ndash;</span></div>
+        </div>
+        <div class="visit-meta">
+          <span class="visit-note" id="visit-note"></span>
+          <span class="visit-id" id="visit-id-label" title="The capture loop's own visit id for the turn in progress"></span>
+        </div>
+        <div class="board-stage">
+          <canvas id="board-canvas"></canvas>
+        </div>
+      </div>
+    </div>
+
+    <!-- Config: the old Cameras tab (per-camera snapshot + calibration)
+         PLUS every config-related control that used to live in the
+         sidebar (camera timeout, detection time) -- 2026-09-08,
+         everything config-related lives here. The
+         sidebar keeps ONLY the four action buttons + the action log. -->
+    <div id="tab-config" class="tab-panel">
+      <!-- This was two paragraphs of documentation sitting above the
+           fold, 2026-09-08. None of it was actionable: it explained how
+           the refresh works and restated what the Calibrate button does.
+           A settings screen should show state and controls; the manual
+           belongs on the control it describes, which is where the rest
+           of this went (title= on the Calibrate button). -->
+      <!-- "Cameras refresh every 3s" went with the snapshot poll it
+           described (7525bb4 made the previews MJPEG); it was stale copy
+           about an internal that the operator cannot act on either way.
+           What is left is the one fact with a consequence: a calibration
+           does not re-derive itself. -->
+      <div class="panel-sub">Calibration persists across restarts and is recalculated only when you press Calibrate in the sidebar.</div>
+      <!-- "What's actually live right now" -- distinct from the per-camera
+           cards above (this dashboard's own last-refresh display) and from
+           CALIBRATION_STATUS's ts, neither of which survive a process
+           restart. Added 2026-08-26 alongside calibration persistence
+           (CalibrationStore's snapshot_path): a calibration can now be
+           reused across a process restart with NO automatic re-derivation
+           if hardware was re-seated in between (see that class's own
+           docstring for the accepted trade-off) -- this is the real,
+           visible mitigation, populated from calibration.live_source
+           (CalibrationStore.meta(), already computed server-side, just
+           never rendered before this). Absent/unknown renders nothing
+           alarming, just honestly blank -- see renderLiveCalibrationAge(). -->
+      <div id="live-calib-age" class="panel-sub"></div>
+      <!-- Says so when a calibration found the cameras had moved on the
+           ring and relearned this rig's layout. It used to refuse and ask
+           the operator to clear the layout by hand; it relearns and carries
+           on now, so this is the only place the physical event shows up
+           besides the log. -->
+      <div id="calib-moved-note" class="panel-sub calib-moved" hidden></div>
+      <div class="cams">
+        @@OD_CAM_CARDS@@
+      </div>
+
+      <!-- Three sections, not five, 2026-09-14.
+           Autodarts and this server are both ADDRESSES -- one this rig
+           calls out to, one it answers on -- and Recording is a capture
+           setting like the two beside it. Filing each under its own
+           heading made five one- and two-field sections stack down the
+           page, which read as five unrelated subjects and left most of
+           the width empty. Two rows of three, then Audio. -->
+      <h2 class="config-section-title">Network</h2>
+      <div class="panel-sub">What this rig talks to, and where it answers. The Autodarts comparison runs after each throw is scored and never delays scoring.</div>
+      <div class="config-grid">
+        <!-- Port and bind address are ONE field, not two: a single fact,
+             the address this dashboard answers on. The port is editable
+             and the bind address is not, which is a difference in what
+             you may DO to them, not a reason to split them. It sits
+             first because it is the more important of the two: this is
+             how anyone reaches the rig at all, where the Autodarts
+             comparison is a second opinion the rig works without. It differs from its
+             neighbours in being read once at startup, which its own
+             note says rather than a separate heading implying it. -->
+        <label class="config-field" title="The TCP port the dashboard and API are served on. Saved to data/config.json's &quot;port&quot; key -- the same key a --port flag overrides. The listening socket is bound before this page exists, so a change cannot move it under a live session.">
+          <span class="config-field-label">Local Address</span>
+          <div class="field-row">
+            <!-- READ-ONLY ON PURPOSE, and not merely a disabled input --
+                 see the comment on GET /api/port. Short version: a wrong
+                 bind address takes the dashboard away with it at the next
+                 restart, and the Windows rig has no shell, so the fix is a
+                 physical visit. It stays editable in
+                 data/config.json, where whoever is typing is already
+                 standing in front of the machine. -->
+            <span id="server-host" class="config-field-value">&mdash;</span>
+            <span class="field-sep">:</span>
+            <!-- type=number for the phone/tablet keypad and the browser's
+                 own spinner, but NOT trusted: min/max here are a hint, and
+                 the real 1-65535 check is server-side in POST /api/port,
+                 which is also what a curl or a hand-edited config hits. -->
+            <input type="number" id="server-port" min="1" max="65535" step="1" inputmode="numeric" spellcheck="false">
+          </div>
+          <!-- Seeded with "checking" rather than blank: it stays empty
+               until /api/port answers, matching the Recording control. -->
+          <span id="server-port-note" class="config-field-note">Checking&hellip;</span>
+        </label>
+        <label class="config-field">
+          <span class="config-field-label">Compare against Autodarts</span>
+          <!-- A yes/no select rather than a checkbox: this reads back as a
+               STATE in a column of other settings, and an unticked box is
+               easy to mistake for "not configured". Saves on change, like
+               every other control here. -->
+          <select id="ad-enabled-toggle">
+            <option value="yes">Yes</option>
+            <option value="no">No</option>
+          </select>
+          <!-- The live status IS this field's note, as of 2026-09-12. It
+               used to be a second span in a floating div under the grid --
+               an orphaned container left behind when the camera-devices
+               section was deleted, still wearing that section's class name
+               and so matching no CSS rule at all: it aligned with nothing
+               and sat away from the control it reports on. It also
+               restated, whenever the toggle was off, the static note that
+               used to sit here. Two notes collapsed into one: the static
+               note's single unique fact (No also
+               stops publishing to the virtual cameras) moved into the
+               off-state string in renderAdConfig(), so nothing was lost,
+               and the live text carries "on but NOT connected", which the
+               static note could never say. Seeded rather than left empty
+               because it stays empty until /api/ad-config answers -- and
+               if that never answers, "checking" is the honest reading. -->
+          <span id="ad-config-note" class="config-field-note">Checking Autodarts…</span>
+        </label>
+        <label class="config-field">
+          <span class="config-field-label">Autodarts URL</span>
+          <input type="text" id="ad-base-url" placeholder="http://localhost:3180" spellcheck="false"
+                 title="The Autodarts address, scheme included -- e.g. http://localhost:3180.">
+          <span class="config-field-note">Saves when you leave the field or press Enter.</span>
+        </label>
+      </div>
+
+      <!-- Moved here from the sidebar's old .side-block-configs, 2026-09-08.
+           Same element ids (idle-timeout-select / detection-time-select) so
+           renderIdleTimeoutSelect()/renderDetectionTimeSelect() and their
+           change handlers below are untouched by the relocation -- this is a
+           move, not a rewrite of any of that wiring. -->
+      <h2 class="config-section-title">Capture</h2>
+      <div class="panel-sub">How the loop decides a dart has landed, and what it keeps.</div>
+      <div class="config-grid">
+        <label class="config-field" title="Auto-stop the capture loop after this long with no activity. Applies immediately.">
+          <span class="config-field-label">Camera timeout</span>
+          <select id="idle-timeout-select">
+            <option value="5">5 min</option>
+            <option value="10">10 min</option>
+            <option value="15">15 min</option>
+            <option value="30">30 min</option>
+            <option value="45">45 min</option>
+            <option value="60">60 min</option>
+          </select>
+          <span class="config-field-note">The session auto-stops after this long with no darts.</span>
+        </label>
+        <!-- 1-5 consecutive still frames before a dart is scored; fewer
+             frames is faster, so the options run fastest to safest. -->
+        <label class="config-field" title="How many consecutive still frames a landed dart must hold before it is scored. Fewer frames scores sooner but is likelier to score a wobble or a bounce-out. Applies on the next frame.">
+          <span class="config-field-label">Detection speed</span>
+          <select id="detection-time-select">
+            <option value="1">1 frame &mdash; fastest</option>
+            <option value="2">2 frames</option>
+            <option value="3">3 frames</option>
+            <option value="4">4 frames</option>
+            <option value="5">5 frames &mdash; safest</option>
+          </select>
+          <span class="config-field-note">Still frames a landed dart must hold before it is scored. Fewer frames = faster but more errors.</span>
+        </label>
+        <!-- Recording joins the two controls above, 2026-09-14. It was
+             kept apart because they apply immediately and this one
+             cannot -- it is read once per session, so a change lands at
+             the next Start. That timing difference is real, but it is a
+             property of the setting and belongs in its note, which says
+             so, rather than in a heading that separated three capture
+             settings into two sections to express it. -->
+        <label class="config-field" title="Off keeps scoring, the live board and match history exactly as they are -- those never read packages. What stops is the replay corpus, per-throw diagnostics, AD ground truth on disk, and the Engines tab, which has nothing to read without packages. Read once per session, so a change lands at the next Start.">
+          <span class="config-field-label">Save throw packages</span>
+          <!-- A yes/no select, matching the Autodarts toggle above rather
+               than the Audio section's On/Off: this reads back as a STATE
+               in a column of settings. -->
+          <select id="store-packages-select">
+            <option value="yes">Yes</option>
+            <option value="no">No</option>
+          </select>
+          <!-- Seeded with "checking" rather than left blank: it stays empty
+               until /api/store-packages answers, and if that never answers
+               "checking" is the honest reading. -->
+          <span id="store-packages-note" class="config-field-note">Checking…</span>
+        </label>
+        <!-- THROW CAPTURE BUFFER. Configured in SECONDS and priced in the
+             note underneath, because the question an operator has is "how
+             far back can I reach", and the answer they need alongside it
+             is "and what does that cost" -- three 720p cameras produce
+             about 270 MB every second, so 22 seconds is 6GB, and nobody
+             should have to work that out from a seconds box. The note is
+             recomputed from the live slot count as the value changes, so
+             a two-camera rig is not quoted a three-camera price.
+
+             Applies IMMEDIATELY, unlike Recording beside it: this one
+             spends memory right now, so a change that waited for the next
+             Start would leave gigabytes committed after the operator had
+             asked for them back. -->
+        <label class="config-field" title="How many seconds of raw camera frames are kept in memory so a missed or misscored dart can be written to disk afterwards. Costs real memory -- the note below prices the current setting for this rig's camera count. 0 turns it off. Applies immediately.">
+          <span class="config-field-label">Throw capture buffer</span>
+          <div class="field-row">
+            <!-- type=number for the keypad and spinner; min/max here are
+                 a hint only, and POST /api/frame-ring does the real check
+                 (which is also what a curl or a hand-edited config hits). -->
+            <input type="number" id="frame-ring-seconds" min="0" max="60" step="1" inputmode="numeric" spellcheck="false">
+            <span class="field-sep">s</span>
+          </div>
+          <span id="frame-ring-note" class="config-field-note">Checking…</span>
+        </label>
+      </div>
+
+      <!-- Spoken calls. THESE SETTINGS BELONG TO THIS SCREEN, not to the
+           rig: they are written to this browser's localStorage and no
+           request is made when you change them. Playback moved into the
+           browser on 2026-09-15 (see opendarts/live/audio.py) precisely
+           so the iPad in someone's hand and the TV above the board can
+           disagree about volume, voice and whether to speak at all. -->
+      <h2 class="config-section-title">Audio</h2>
+      <div class="config-grid">
+        <!-- ONE box holding the whole subject -- on/off, voice, volume
+             and a Test. Rows inside the box rather than one long line,
+             2026-09-14: controls in a row forced the box to the full
+             width of the panel, which made a small setting look like the
+             page's main subject. -->
+        <div class="config-field config-field--audio">
+          <span class="config-field-label">Spoken dart calls (this screen)</span>
+          <div class="field-row field-row--pair" title="Speak each dart as it is scored, THROUGH THIS BROWSER. Stored on this device only -- every screen looking at this dashboard has its own switch, so the TV above the board can be loud while the iPad in your hand stays silent.">
+            <select id="audio-enabled-select">
+              <option value="0">Off</option>
+              <option value="1">On</option>
+            </select>
+            <!-- Which voice THIS screen uses. Changing it refetches and
+                 re-decodes the whole 64-clip set -- about 600 KB, once,
+                 while you are sitting in this panel, which is the right
+                 place to spend it. The list is whatever is installed on
+                 the rig; a set missing clips says so in its own option. -->
+            <select id="audio-voice-select">
+              <option value="">Loading…</option>
+            </select>
+          </div>
+          <!-- Volume is per device for the same reason everything else
+               here is: "loud enough across a room" and "loud enough in
+               your hands" are different numbers on different hardware,
+               and the rig has no way to know either. -->
+          <div class="field-row field-row--volume">
+            <span class="volume-label">Volume</span>
+            <input id="audio-volume" type="range" min="0" max="100" step="5" value="80"
+                   title="How loud this screen speaks. Applies instantly; saved on release.">
+            <span class="volume-value" id="audio-volume-value">80%</span>
+          </div>
+          <div class="field-row field-row--actions">
+            <button id="btn-audio-test" class="action" type="button" title="Speaks one phrase HERE, through this browser, down exactly the path a real dart call takes -- so what you are testing is whether THIS screen can be heard from the oche.">Test</button>
+          </div>
+          <span class="config-field-note" id="audio-voice-note">—</span>
+          <span class="config-field-note" id="audio-coverage-note">&mdash;</span>
+        </div>
+
+        <!-- Every screen watching this rig, and whether it is actually
+             speaking. The reason this panel exists at all: with playback
+             in the browser, a TV that lost its autoplay permission on an
+             overnight reload is silent and CANNOT SAY SO to anyone
+             standing at the board. Each dashboard reports its own state
+             (POST /api/audio/clients) and every other dashboard shows
+             it, so the person holding an iPad can see that the TV went
+             quiet without walking over to it. -->
+        <div class="config-field config-field--audio-clients">
+          <span class="config-field-label">Screens watching this rig</span>
+          <div id="audio-clients-list" class="audio-clients">
+            <div class="audio-client-empty">Checking…</div>
+          </div>
+          <span class="config-field-note">Self-reported by each open dashboard; a screen that stops checking in drops off after 45s.</span>
+        </div>
+      </div>
+
+
+      <!-- MAINTENANCE -- last section on the tab, and last on purpose.
+           The two BUTTONS here are the only controls on this page that
+           take the rig away from whoever is looking at it, so they sit
+           below every setting rather than among them, where a mis-aimed
+           click lands on a dropdown instead.
+
+           BOTH BUTTONS ASK FIRST, and the confirm() text says what comes
+           back: a plain Restart returns the SAME code, "Update and
+           restart" pulls first. That distinction is the whole feature --
+           until 2026-09-17 every relaunch pulled, including the ones
+           nobody asked for, so a crash mid-match could quietly move the
+           rig onto a commit pushed minutes earlier.
+
+           CAPTURE IS NOT RESTARTED AFTERWARDS, deliberately. The page
+           reloads into a stopped rig and the operator presses Start. A
+           rig that resumed capture on its own after a restart would open
+           three cameras in a room nobody is standing in, and the one
+           moment you want a human in the loop is just after a deploy.
+
+           "Update and restart" is HIDDEN, not disabled, when the
+           launcher already pulls every relaunch (always_update): a
+           disabled button invites a hunt for what would enable it, and
+           on such a rig the plain Restart button already does the job --
+           its note says so. app.js draws that from the config document,
+           the same answer the checkbox above is drawn from; the note
+           starts as "Checking..." because GET /api/config has not
+           answered yet. -->
+      <h2 class="config-section-title">Maintenance</h2>
+      <div class="panel-sub">What happens when this rig restarts &mdash; and the restart itself. Scoring stops, and capture does <strong>not</strong> start again on its own &mdash; press Start when the page comes back.</div>
+
+      <!-- THE SETTING FIRST, THEN THE ACTIONS. "Always update on restart"
+           is a rig setting like the ones in the sections above -- a key of
+           the same config document, written the same way, with PATCH
+           /api/config -- but it is acted on by the LAUNCHER (run.sh /
+           run.ps1) rather than by this process, which is why it sits here
+           beside the buttons that trigger a relaunch instead of under
+           Capture with the settings the running loop reads. It is also
+           what decides whether "Update and restart" below is shown at
+           all, so reading it first is the order the page is understood
+           in. -->
+      <!-- One box: the setting, then the actions it governs, then the
+           live note -- so the buttons read as part of this control rather
+           than dangling under the section. -->
+      <div class="config-grid">
+        <div class="config-field config-field--maintenance">
+          <label class="always-update-row" title="When on, every restart pulls the latest code from this rig's checked-out branch before relaunching. When off, a restart relaunches exactly the code already on the rig.">
+            <!-- A checkbox rather than the yes/no selects above: this one
+                 reads as a thing you switch on, not as a state a rig is in. -->
+            <input type="checkbox" id="always-update-toggle">
+            <span class="config-field-label">Always update on restart</span>
+          </label>
+          <span class="config-field-note">On, every restart pulls the latest code before relaunching; off, it runs the code already here. Applies to the next restart &mdash; nothing is pulled now.</span>
+          <div class="diag-actions">
+            <button id="btn-restart" class="action danger" type="button"
+                    title="Stops this process. The launcher loop starts it again with the code already on this machine.">Restart</button>
+            <button id="btn-update-restart" class="action danger" type="button" hidden
+                    title="Pulls the latest code from this machine's checked-out branch, then restarts. Nothing is pulled if the branch cannot fast-forward -- the rig comes back on the code it has.">Update and restart</button>
+          </div>
+          <span id="restart-note" class="config-field-note">Checking&hellip;</span>
+        </div>
+      </div>
+
+    </div>
+
+    <div id="tab-info" class="tab-panel">
+      <!-- Static facts about this rig. Deliberately NOT settings:
+           Not settings and never were -- two of them report what this
+           PROCESS is wired to (whether a capture loop shares it at all),
+           which changes with how it was launched and not with anything
+           anyone can type here. Kept because "manual recalibrate affects
+           live scoring: no" is the single fastest way to tell a
+           standalone server from the real combined one. -->
+      <h2 class="config-section-title">About this rig</h2>
+      <div class="panel-sub">Read-only &mdash; what this process is and what it is wired to, not settings.</div>
+      <table class="cfg-table">
+        <tbody id="diagnostics-tbody"><tr><td colspan="2">loading&hellip;</td></tr></tbody>
+      </table>
+      <h2 class="config-section-title">Publishing</h2>
+      <table class="cfg-table">
+        <tbody id="publish-tbody"><tr><td colspan="2">loading&hellip;</td></tr></tbody>
+      </table>
+
+      <div class="diag-actions">
+        <button id="btn-copy-diagnostics" class="action" type="button"
+                title="Copies every value here as one block of text, plus the camera, Autodarts and audio summaries -- paste it into a bug report instead of retyping rows.">Copy diagnostics</button>
+        <span class="config-field-note">Paste this into a bug report.</span>
+      </div>    </div>
+
+    <div id="tab-engines" class="tab-panel">
+      <!-- STUCK-IN-TAKEOUT ALERT. The status light beside it already shows
+           takeout amber, but takeout is a normal few seconds -- the light
+           cannot say "this one never ended". A wedged board reports no
+           further throws while its buffer keeps serving the finished
+           visit, so AD silently stops being a reference mid-session. Said
+           in words, at the top of the tab where the AD column is being
+           read, because the operator can fix it in seconds if told. -->
+      <div id="ad-takeout-warning" class="alert-banner" hidden></div>
+      <div class="scoring-header-row">
+        <div id="engine-tally-bar" class="panel-sub"></div>
+        <div id="board-status-lights" class="board-status-lights">
+          <span class="board-status-item" id="board-status-item-ad" title="">
+            <span class="board-status-dot" id="board-status-dot-ad"></span>
+            Autodarts
+          </span>
+          <!-- THE MISSED-DART TRIGGER SITS HERE, beside the board status
+               rather than in Config or among the view buttons on the
+               right. It was first placed next to the ring setting on the
+               reasoning that a missed dart has no row to attach to -- true
+               enough, but that optimises for what the control hangs off
+               instead of where the operator is standing. You notice a miss
+               by looking at a score that is short a dart, so the control
+               belongs in your eyeline at that moment. One you have to go
+               and find is one you will not press while the frames are
+               still in the ring, and the ring is the whole point.
+               Progress rides with it: bytes written against bytes total,
+               which is what says whether a slow capture is a slow disk or
+               a big buffer. A percentage throws that away. -->
+          <button id="frame-ring-missed-btn" class="action" type="button"
+                  title="Saves the frames still held in memory, for a dart that never scored. Only works while the throw is still inside the ring window.">Save a missed dart</button>
+          <span id="frame-ring-job" class="config-field-note" hidden></span>
+        </div>
+        <div class="scoring-header-buttons">
+          <button id="btn-show-all" class="action" type="button" style="display:none;">Show all throws</button>
+          <button id="btn-new-session-view" class="action" type="button" title="Visually clear this view -- nothing is deleted, hidden throws are still on disk (see &quot;Show all throws&quot;).">Clear</button>
+          <button id="btn-delete-recorded" class="action danger" type="button" title="Permanently deletes this rig&rsquo;s recorded data from disk &mdash; both the saved throw packages and the saved frame-ring captures, real files, not just this view. Asks first, naming how many of each and how much disk they take.">Delete recorded data</button>
+        </div>
+      </div>
+      <div id="view-filter-indicator" class="panel-sub" style="margin-top: -8px;"></div>
+      <!-- THE FREE-SPACE GUARD, WHERE THE RECORDING CONTROLS ARE. There
+           is a floor (min_free_disk_gb, 5 GB by default) below which the
+           capture daemon stops writing throw packages and a ring dump is
+           refused outright -- and until 2026-09-17 the only place either
+           number appeared was inside the refusal whoever happened to
+           press the button got back. The rig went quiet and the screen
+           said nothing. This line is fed by /api/state's own disk row, so
+           it is the same reading the Info tab shows and the same verdict
+           the writers act on; it says nothing at all while there is
+           room, and says exactly what has stopped when there is not. -->
+      <div id="recorded-data-note" class="panel-sub" hidden></div>
+      <table id="packages-table">
+        <colgroup>
+          <col class="col-num"><col class="col-view"><col class="col-captured"><col class="col-engine">
+          <col class="col-sector"><col class="col-match"><col class="col-lat"><col class="col-tip"><col class="col-xy">
+        </colgroup>
+        <thead><tr id="packages-thead-row"><th>#</th><th class="col-view"></th><th>captured</th><th>engine</th><th>sector</th><th>match</th><th>&Delta; lat ms</th><th>&Delta; tip mm</th><th>board xy (mm)</th></tr></thead>
+        <tbody id="packages-tbody"><tr><td colspan="9">loading&hellip;</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<!-- "AD Wrong" -> "...so which one WAS right?".
+     Lives outside <main> (fixed-position overlay, not part of the
+     sidebar/stage grid). Options are built at open time from the clicked
+     throw's own engine sections, so nothing here is hardcoded per-engine. -->
+<div id="cam-url-modal" class="modal-backdrop" hidden>
+  <div class="modal">
+    <div class="modal-title">Read this camera from a stream</div>
+    <div class="modal-sub" id="cam-url-modal-sub"></div>
+    <input type="text" id="cam-url-input" class="cam-url-input" spellcheck="false"
+           placeholder="http://<rig>:8420" autocomplete="off" />
+    <div class="modal-sub cam-url-hint">
+      Paste the address of the machine publishing the cameras, or a full
+      stream URL. A bare address uses that slot&rsquo;s matching camera.
+    </div>
+    <label class="cam-url-all" id="cam-url-all-row">
+      <input type="checkbox" id="cam-url-all" checked />
+      <span>Use this server for all 3 cameras</span>
+    </label>
+    <div class="modal-error" id="cam-url-error"></div>
+    <div class="modal-actions">
+      <button id="cam-url-cancel" class="action" type="button">Cancel</button>
+      <button id="cam-url-save" class="action primary" type="button">Use this stream</button>
+    </div>
+  </div>
+</div>
+
+<div id="ad-wrong-modal" class="modal-backdrop" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="ad-wrong-modal-title">
+    <div class="modal-title" id="ad-wrong-modal-title">Which was actually right?</div>
+    <div class="modal-sub" id="ad-wrong-modal-sub"></div>
+    <div id="ad-wrong-options"></div>
+    <div class="modal-manual" id="ad-wrong-manual" hidden>
+      <label>sector <select id="ad-wrong-manual-sector"></select></label>
+      <label>ring <select id="ad-wrong-manual-ring"></select></label>
+    </div>
+    <div class="modal-error" id="ad-wrong-modal-error"></div>
+    <div class="modal-actions">
+      <button id="ad-wrong-cancel" class="action" type="button">Cancel</button>
+      <button id="ad-wrong-submit" class="action" type="button">Mark AD wrong</button>
+    </div>
+  </div>
+</div>
+
+<!-- The only values the server computes for this page, in one block the
+     script below reads once (OD_BOOTSTRAP in app.js). Kept as
+     application/json rather than generated JavaScript so app.js stays a
+     static file with nothing substituted into it. -->
+<script id="bootstrap" type="application/json">@@OD_BOOTSTRAP_JSON@@</script>
+<script>
+@@OD_APP_JS@@
+</script>
+</body>
+</html>

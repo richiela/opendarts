@@ -1,0 +1,93 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opendarts"
+version = "0.81.1"
+description = "Camera-based automatic scoring for steel-tip darts"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+authors = [{ name = "Richie Lai" }]
+classifiers = [
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
+
+# license is declared as a file rather than a PEP 639 SPDX string
+# ("AGPL-3.0-or-later") deliberately: the SPDX form needs setuptools >= 77,
+# and the build-system pin above only requires >= 68. A build that resolved
+# an older setuptools would fail on the string form and succeed on this one.
+
+# Deliberately UNPINNED, with the tested set recorded below rather than
+# guessed at as version bounds. Upper bounds invented without testing
+# cause more breakage than they prevent -- they turn "might work" into
+# "refuses to install" -- and this project has no CI matrix to justify
+# any bound it would write. What it can honestly say is which versions
+# it has actually been run against:
+#
+#   Python 3.12.13, numpy 2.5.3, opencv-python-headless 5.0.0.93,
+#   fastapi 0.141.1, uvicorn 0.52.4, httpx 0.28.1, websockets 17.1
+#
+# requires-python is >=3.12 for the same reason: 3.12 is what the suite
+# runs on. Nothing here obviously needs it -- there are no match
+# statements and no 3.12-only syntax -- so an earlier version may well
+# work, but claiming support for something never executed would be a
+# guess wearing a version number.
+dependencies = [
+    "numpy",
+    # Headless everywhere: see requirements.txt.
+    "opencv-python-headless",
+    # Per-throw video clips (opendarts/capture/clip.py); bundles ffmpeg libs,
+    # no system dependency. See requirements.txt.
+    "av",
+    "fastapi",
+    "uvicorn",
+    # uvicorn's optional extras, named one by one rather than taken as
+    # uvicorn[standard], which also drags in watchfiles (a reloader this
+    # never uses), python-dotenv and PyYAML onto every rig. See
+    # requirements.txt, which lists the same set.
+    "websockets",
+    "httptools",
+    'uvloop; sys_platform != "win32"',
+]
+
+[project.urls]
+Homepage = "https://github.com/richiela/opendarts"
+Repository = "https://github.com/richiela/opendarts"
+Issues = "https://github.com/richiela/opendarts/issues"
+
+[project.optional-dependencies]
+# httpx is required by fastapi.testclient.TestClient, not by the app.
+# The same set as requirements-dev.txt adds on top of requirements.txt.
+test = [
+    "pytest",
+    "pytest-xdist",
+    "httpx",
+]
+
+# NOT a supported install path. OpenDarts runs from a checkout (see the
+# README): the voice clips, the Windows camera filter and data/ live beside
+# the package, not inside it, so a wheel would install code that cannot find
+# them. This metadata is here for the dependency lists and the test extra.
+[tool.setuptools.packages.find]
+# Only the importable package. tools/ and scripts/ are operator utilities
+# run from a checkout, not library code, and shipping them in a wheel
+# would imply an API they do not have.
+include = ["opendarts*"]
+
+# The dashboard page is three real files inside the package
+# (opendarts/live/dashboard/), not Python, so packages.find alone would
+# leave them out of any build. Listed here so a checkout and a build see
+# the same tree -- not a claim that a wheel is a supported install path
+# (see the note above); data/, the voices and the Windows filter still
+# live beside the package, not inside it.
+[tool.setuptools.package-data]
+"opendarts.live.dashboard" = ["*.html", "*.css", "*.js"]
+
+# NO [tool.pytest.ini_options] here on purpose. pytest.ini already exists
+# and takes precedence over pyproject.toml, so a section here would be
+# dead config that reads as authoritative -- the exact drift trap this
+# repo has been bitten by elsewhere. pytest.ini is the one place.

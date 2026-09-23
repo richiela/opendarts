@@ -1,0 +1,7 @@
+# Everything the product needs, plus what running the test suite needs.
+#   pip install -r requirements-dev.txt
+-r requirements.txt
+
+pytest
+pytest-xdist  # parallel runs -- `pytest tests/ -n auto --dist loadfile`. --dist loadfile (whole file per worker) is still the recommended form, but no longer load-bearing: the fixed per-file scratch dirs under <repo>/tmp/ that made plain -n auto race are gone (2026-09-17), every test scratch dir is its own tmp_path now.
+httpx  # required by fastapi.testclient.TestClient, not by the app itself

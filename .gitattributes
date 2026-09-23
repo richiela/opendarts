@@ -1,0 +1,34 @@
+# Windows scripts keep CRLF endings in the working tree, on every
+# platform, so a clone on a machine with core.autocrlf=false, or a copy
+# made from macOS/Linux, still gets the endings Windows tools expect.
+# Batch files are the sharp case: cmd.exe's label/goto resolution is not
+# reliable in a file with bare-LF endings, and the failure reads as a
+# Python problem rather than a line-ending one. (The repo's launcher is
+# run.ps1, not a batch file, so that Ctrl-C stops the restart loop instead
+# of raising cmd's "Terminate batch job" prompt.)
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Shell scripts are the mirror case: bash rejects CR as part of the
+# command name ("\r: command not found"), so these stay LF even when
+# checked out on Windows with autocrlf=true.
+*.sh text eol=lf
+
+# Binaries must never be line-ending converted. A DLL is committed here for
+# a Windows machine with no toolchain, and core.autocrlf=true on a Windows
+# checkout would corrupt it into something that fails to load -- with an
+# error that looks like a bad build rather than a bad checkout.
+*.dll binary
+*.exe binary
+*.zip binary
+*.mp3 binary
+*.wav binary
+*.aiff binary
+
+# Sources kept at LF in the tree and on checkout, so a Windows clone does
+# not show them as modified-but-unedited and block the next pull. That
+# already happened once.
+*.cpp text eol=lf
+*.def text eol=lf
+*.py  text eol=lf

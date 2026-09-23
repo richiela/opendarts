@@ -1,0 +1,922 @@
+  :root {
+    color-scheme: dark;
+    /* Palette sampled off the board this thing scores: sisal cream,
+       dart red, dart green, and a WARM near-black. The previous set was
+       cool slate (#0e1116/#151a21) with a blue accent -- the default
+       dark-dashboard palette, which is why it read as generic. Nothing
+       here is blue; the board's own reds and greens now belong to the
+       same family as the chrome around them instead of fighting it. */
+    /* #efe8d6 was cream on paper and white on screen -- at 89% lightness
+       the hue does not survive. Dropped to ~82% and saturated: the
+       warmth has to be visible to be worth having, and against a
+       near-black ground this still clears 12:1 contrast. --muted moved
+       the same direction; it carries most of the page's text and was
+       doing the most to keep the old grey cast. */
+    --bg: #0a0a09; --panel: #14130f; --panel-2: #1c1a15; --line: #302c23;
+    --text: #ecdcb0; --muted: #a1957a; --accent: #c0392b; --accent-2: #35704f;
+    --ok-bg: #16301f; --ok-fg: #5fbf84;
+    --bad-bg: #351915; --bad-fg: #e2705f;
+    --warn-bg: #33280f; --warn-fg: #d9a441;
+    --unk-bg: #232320; --unk-fg: #8f8878;
+    /* Per-dart identity colours, also off the board. */
+    --dart-1: #3e8e6a; --dart-2: #d2a24c; --dart-3: #c0503f;
+    --side-w: 220px;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 14px/1.45 -apple-system, "Segoe UI", sans-serif;
+    /* Every figure on this page is read as a quantity and compared
+       against the one above it -- lining, tabular figures everywhere by
+       default rather than opted into per-rule. */
+    font-variant-numeric: tabular-nums;
+    padding: 0;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  /* Sticky header + CSS-grid sidebar/stage body, 2026-08-12 (see
+     _render_dashboard_html's own docstring for the layout + the
+     button-honesty writeup). header.top below uses
+     `flex: 0 0 auto; position: sticky; top: 0; z-index: 10;` --
+     stays visible above the scrolling .stage even when its content
+     scrolls. main.layout below uses
+     `display: grid; grid-template-columns: var(--side-w) 1fr; gap: 10px;
+     padding: 10px;`. */
+  header.top {
+    flex: 0 0 auto;
+    display: grid;
+    /* A 4-slot header (brand | record-toggle | flexible middle |
+       right-aligned nav+status-pill+theme-toggle) was the starting
+       point. opendarts's header only has 2 real widget groups --
+       .brand and .top-end (ws-indicator + status-pill) -- no
+       record-toggle or theme-toggle exists here, so this collapses to 2
+       columns (auto 1fr), not a padded-out 4-track copy with an empty
+       cell: the 1fr column IS the flexible middle space, and .top-end
+       right-aligns inside it via justify-self:end -- the same "brand
+       left, flexible middle, right-aligned items" result, without a
+       phantom unused track. */
+    grid-template-columns: auto 1fr;
+    align-items: center;
+    gap: 16px;
+    padding: 10px 20px;
+    border-bottom: 1px solid var(--line); background: var(--panel);
+    position: sticky; top: 0; z-index: 10;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  /* A bullseye, not a two-letter tile. The old "D3" mark was a leftover
+     from a previous project name -- it read as a placeholder, and it
+     carried a name this product does not use. */
+  .brand .mark {
+    width: 28px; height: 28px; flex: none;
+    display: grid; place-items: center; color: var(--accent);
+  }
+  .brand strong {
+    font-size: 15px; font-weight: 600; letter-spacing: -0.01em;
+  }
+  .brand .sub {
+    color: var(--muted); font-size: 11px; margin-top: 1px;
+    text-transform: uppercase; letter-spacing: 0.09em;
+  }
+  .top-end { display: flex; align-items: center; gap: 10px; justify-self: end; }
+  .badge { display: inline-block; padding: 2px 9px; border-radius: 2px; font-size: 11px; letter-spacing: 0.02em; white-space: nowrap; }
+  /* The sound badge is a control (click to toggle spoken calls); the ws
+     badge is not, so this is scoped to the one that acts. */
+  #audio-indicator { cursor: pointer; user-select: none; }
+  #audio-indicator:focus-visible { outline: 2px solid var(--focus, #6aa9ff); outline-offset: 1px; }
+  .ok { background: var(--ok-bg); color: var(--ok-fg); }
+  .bad { background: var(--bad-bg); color: var(--bad-fg); }
+  .warn { background: var(--warn-bg); color: var(--warn-fg); }
+  .unknown { background: var(--unk-bg); color: var(--unk-fg); }
+  /* Stuck-in-takeout alert. Uses the SAME --bad-* tokens as every other
+     failure on the page rather than a second red, so "something is wrong"
+     reads identically wherever it appears. Full width at the top of the
+     tab: it explains why the AD column beneath it has gone quiet, so it
+     has to be read before that column, not beside it. */
+  .alert-banner {
+    background: var(--bad-bg); color: var(--bad-fg);
+    border: 1px solid #6b2b2b; border-radius: 6px;
+    padding: 8px 12px; margin-bottom: 10px; font-weight: 600;
+  }
+  .alert-banner[hidden] { display: none; }
+  /* The indicator dot pulses only while genuinely stuck -- motion is
+     reserved for the one state that needs chasing, and is dropped
+     entirely for anyone who asked not to see it. */
+  .board-status-dot.stuck { animation: stuck-pulse 1.4s ease-in-out infinite; }
+  @keyframes stuck-pulse { 50% { opacity: 0.35; } }
+  @media (prefers-reduced-motion: reduce) {
+    .board-status-dot.stuck { animation: none; }
+  }
+  /* Header status pill -- styled in
+     a rounded pill with a colored dot + primary state text +
+     separator + secondary detail text, replacing the old full-width
+     #trigger-banner row below the header (same information, tighter
+     presentation, actually IN the header). Dot color is set
+     inline by renderTrigger() below (per-state color, not a fixed CSS
+     class). */
+  /* Fixed width, deliberately
+     we should have a static pill and whatever goes in the primary and
+     secondary fit into that div without shifting things." Before this,
+     .status-pill sized itself to its content (flex, no width set), so
+     every state change visibly resized the pill and shoved the header
+     controls next to it sideways. 230px -- sized to the longest REGULAR
+     (non-error) content combination that actually occurs now, e.g.
+     "Throw" + "Capturing -- dart 3 of 3", with room to spare. The one
+     genuinely unbounded case (lastStartError's own message text, "last
+     start failed: <whatever the backend said>") is handled by
+     truncating with an ellipsis rather than growing the pill -- the
+     full text is still available via the pill's own `title` attribute,
+     already set by renderPill()'s apply() on every state change. */
+  .status-pill {
+    display: flex; align-items: center; gap: 6px;
+    background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 2px; padding: 5px 12px; font-size: 12px; color: var(--text);
+    white-space: nowrap;
+    width: 230px; flex: none; overflow: hidden;
+  }
+  .status-pill .dot {
+    width: 7px; height: 7px; border-radius: 50%; flex: none;
+    background: var(--unk-fg);
+  }
+  .status-pill .sep { color: var(--line); flex: none; }
+  /* Primary label (#status-text) never truncates -- every PRIMARY_INFO
+     label is short and bounded (longest: "No live capture", 16 chars) --
+     only the secondary detail (#status-detail), which carries the
+     genuinely unbounded content (error messages, phase counters), gets
+     min-width:0 + ellipsis so IT shrinks/truncates first, keeping the
+     primary state always fully readable even when the pill is full. */
+  .status-pill #status-text { flex: none; overflow: hidden; text-overflow: ellipsis; }
+  .status-pill .status-detail {
+    color: var(--muted); flex: 1 1 auto; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+
+  /* -- Body: sidebar (Controls) + stage (tabs), on a
+     `main.layout` / `.sidebar` / `.stage` structure (see the header
+     comment above). -- */
+  main.layout {
+    flex: 1 1 auto; min-height: 0;
+    display: grid;
+    grid-template-columns: var(--side-w) 1fr;
+    gap: 10px; padding: 10px;
+    overflow: hidden;
+  }
+  /* 3px, not 10px. Uniformly rounded panels floating on a dark field is
+     the house style of every generated dashboard; squaring them off is
+     the single cheapest way out of it. */
+  .sidebar, .stage {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 3px; min-height: 0;
+  }
+  .sidebar { padding: 0; display: flex; flex-direction: column; overflow: auto; }
+  .side-block { padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+  .side-block h2 {
+    margin: 0; font-size: 10px; text-transform: uppercase; letter-spacing: 0.14em;
+    color: var(--muted); font-weight: 600;
+  }
+  /* 4 real button slots (Start/Stop/Reset/Calibrate -- see this
+     function's docstring for which are real vs. honestly disabled), same
+     2-col grid .btn-grid uses. */
+  .btn-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .btn-grid button.action { width: 100%; }
+  button.action.primary { background: var(--ok-bg); border-color: #2f6f62; color: var(--ok-fg); }
+  /* Set apart from Clear, which sits immediately beside it and only
+     changes the view. Adjacent identical-looking buttons where one wipes
+     files off disk is a misclick waiting to happen. */
+  .action.danger { margin-left: 10px; }
+  /* Delete recorded data -- the one genuinely destructive control in this
+     dashboard, styled to look like it (same --bad-fg/--bad-bg tokens
+     the .bad badge and .action-line.bad already use, not a new color
+     invented for this one button). */
+  button.action.danger { background: var(--bad-bg); border-color: #6b2b2b; color: var(--bad-fg); }
+  button.action.danger:hover { border-color: var(--bad-fg); }
+  /* The free-space guard's line, immediately under the recorded-data
+     controls. It only appears when the answer is not "fine", so it is
+     coloured like the verdict it carries rather than like body text --
+     same --bad-fg/--warn-fg tokens the badges use, no new colour. */
+  #recorded-data-note { margin-top: -4px; }
+  .disk-floor-bad { color: var(--bad-fg); }
+  .disk-floor-warn { color: var(--warn-fg); }
+  .side-block-controls { gap: 14px; }
+  /* Action log -- added 2026-08-12, the project's real, live-confirmed
+     incident: clicking Calibrate with no visible confirmation caused 4
+     rapid duplicate clicks in ~4s. Every Start/Stop/Reset/Calibrate
+     click gets its own
+     persistent, timestamped line here the INSTANT it's sent ("requested
+     ...", amber/pending) and stays on screen -- updated in place to
+     ok/bad once the request resolves -- instead of only a transient
+     button-label change that's easy to miss and leaves no record a
+     second click even happened. Newest line on top, capped
+     (ACTION_LOG_MAX_LINES in the script below) so it can never grow
+     unbounded across a long session. A FIXED `height` (not `max-height`)
+     -- 2026-08-14, so the recent-actions log sits below the controls
+     without moving the buttons. Recent
+     actions sits in the same .sidebar flex column as
+     .side-block-controls (which has `flex: 1 1 auto`, see that rule's
+     own comment); with only a max-height, this box was near-0 tall when
+     empty and grew toward 120px as entries accumulated during a live
+     session, and since the sidebar's total height is fixed, that growth
+     came directly out of .side-block-controls's own flex-grow
+     allocation -- visibly shifting the Engines checklist (bottom-
+     anchored inside Controls via margin-top:auto) up as you used the
+     dashboard. A fixed height reserves the same footprint from the
+     very first render, empty or full, so Controls' size -- and the
+     Engine buttons' position -- never moves regardless of how many
+     actions have logged. */
+  .action-log {
+    display: flex; flex-direction: column; gap: 2px;
+    height: 120px; overflow-y: auto;
+    font-size: 10px; line-height: 1.3;
+  }
+  /* The log is a fixed-height box that spends most of its life empty.
+     Blank, it read as a rendering failure; this says which it is. */
+  .action-log:empty::before {
+    content: "Nothing yet -- Start, Stop, Reset and Calibrate appear here.";
+    color: var(--muted); font-size: 10px; line-height: 1.4; opacity: .75;
+  }
+  .action-line { padding: 2px 5px; border-radius: 4px; border: 1px solid var(--line); }
+  .action-line .t { color: var(--muted); margin-right: 4px; }
+  .action-line.pending { border-color: #4a3f1f; background: rgba(240,180,41,0.08); color: var(--warn-fg); }
+  .action-line.ok { border-color: #204030; background: rgba(74,222,128,0.06); color: var(--ok-fg); }
+  .action-line.bad { border-color: #402424; background: rgba(248,113,113,0.08); color: var(--bad-fg); }
+
+  .stage { padding: 12px 16px 18px; overflow: auto; min-width: 0; display: flex; flex-direction: column; }
+  nav.tabs {
+    flex: 0 0 auto;
+    display: flex; gap: 4px;
+    border-bottom: 1px solid var(--line);
+    margin-bottom: 14px;
+  }
+  nav.tabs button {
+    background: none; border: none; color: var(--muted); font: inherit; font-size: 13px;
+    padding: 8px 12px 10px; cursor: pointer; border-bottom: 2px solid transparent;
+  }
+  nav.tabs button:hover { color: var(--text); }
+  nav.tabs button.active {
+    color: var(--text); border-bottom-color: var(--accent);
+    border-bottom-width: 3px; font-weight: 700; letter-spacing: 0.01em;
+  }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+  .panel-sub { color: var(--muted); font-size: 12px; margin-bottom: 14px; }
+  /* Scoring tab specifically, +2pt (see #packages-table's own font-size
+     comment below for the rest of this same request) -- covers
+     #engine-tally-bar and #view-filter-indicator, both class="panel-sub". */
+  #tab-engines .panel-sub { font-size: 14px; }
+
+  /* -- Scoring tab: dart strip on top, board filling everything else ---
+     Deliberately NOT package-derived (see the panel's own HTML comment).
+     Board colours are the real dartboard's, not this dashboard's chrome
+     palette -- a dartboard that isn't dartboard-coloured is harder to
+     read at a glance, and this is the panel meant to be read from across
+     the room, which is also why the board gets every pixel the panel can
+     give it. The three dart colours are shared with DART_COLORS in the
+     script and appear on each slot's own left border. */
+  /* The panel itself has to be a flex column for the board to be able to
+     claim the leftover height -- .tab-panel.active is display:block, which
+     would leave .board-stage sized by content instead of by what's left. */
+  #tab-scoring.tab-panel.active {
+    display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto;
+  }
+  /* Constrained and centred, 2026-09-08, once real darts were on the
+     board and the mismatch became obvious: the score band ran the full
+     ~1030px stage while the board beneath it is square and capped near
+     600px. Two elements of the same screen on two different measures,
+     with each dart call stranded in a third of a very wide box. They
+     now share one column, so the band ends where the board ends. */
+  .scoring-live {
+    display: flex; flex-direction: column; gap: 10px;
+    flex: 1 1 auto; min-height: 0;
+    /* min(680px, 64vh), not a flat 680px. The board sizes itself as
+       min(column width, 64vh) -- so the moment the column is wider than
+       64vh the board stops growing and the band overhangs it again, which
+       is the exact misalignment this was meant to fix. Tying the column
+       to the same 64vh makes the board always column-width, so the two
+       edges line up at any window height instead of only at the one I
+       happened to be looking at. */
+    width: 100%; max-width: min(680px, 64vh); margin: 0 auto;
+  }
+  /* ONE banded scoreboard, not four rounded cards in a row. The card
+     grid is the single most generic thing a dashboard can do, and at
+     this size it left each value stranded in its own box of air. Hard
+     edges, shared rules, no gaps -- read as a broadcast score bar. */
+  .visit-strip {
+    display: grid; grid-template-columns: repeat(3, 1fr) auto; gap: 0; flex: none;
+    background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 3px; overflow: hidden;
+  }
+  /* The turn total. Its absence was the single biggest gap in this
+     screen: three dart calls were shown and the one number a player
+     actually reads -- what the turn is worth -- was nowhere on it. */
+  .visit-total {
+    display: flex; flex-direction: column; gap: 3px; justify-content: center;
+    padding: 12px 16px 13px; min-width: 96px;
+    background: rgba(192, 57, 43, 0.10);
+    border-left: 2px solid var(--accent);
+  }
+  .visit-total .vt-n {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted);
+  }
+  .visit-total .vt-v {
+    font-size: 40px; font-weight: 800; line-height: 1.05; letter-spacing: -0.04em;
+    color: var(--muted); font-variant-numeric: tabular-nums;
+  }
+  .visit-total.filled .vt-v { color: var(--text); }
+  .visit-meta {
+    display: flex; align-items: baseline; justify-content: space-between;
+    gap: 12px; flex: none; min-height: 1.2em;
+  }
+  /* The capture loop's raw visit id (visit_1788932304779). Real and
+     worth keeping -- it is how a throw gets referenced against the
+     packages on disk -- but it is an internal handle, not something a
+     player reads, so it stops competing with the score. */
+  .visit-id { font-size: 10px; opacity: 0.55; font-family: ui-monospace, monospace; }
+  /* Capped. Uncapped, the board took roughly three-quarters of the
+     viewport and pushed the dart calls -- the actual readout -- into a
+     thin strip at the top. It stays the largest element, just no longer
+     the only one. */
+  .board-stage {
+    position: relative; min-height: 0; min-width: 0;
+    flex: 1 1 auto; display: grid; place-items: center;
+    max-height: 64vh; padding: 4px 0 0;
+  }
+  #board-canvas { display: block; }
+
+  .visit-id {
+    font-size: 10px; color: var(--muted); font-family: ui-monospace, Menlo, monospace;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px;
+  }
+  /* A landed dart's marker colour runs along the top edge of its box, so
+     the box and the board marker are obviously the same dart. */
+  .visit-slot {
+    display: flex; flex-direction: column; gap: 3px;
+    padding: 12px 14px 13px;
+    border-right: 1px solid var(--line);
+    /* The dart's identity colour rides INSIDE the band as a top inset
+       rather than as a border, so an unfilled slot leaves no gap where
+       a coloured rule would otherwise sit. */
+    box-shadow: inset 0 3px 0 transparent;
+  }
+  .visit-slot:nth-child(1).filled { box-shadow: inset 0 3px 0 var(--dart-1); }
+  .visit-slot:nth-child(2).filled { box-shadow: inset 0 3px 0 var(--dart-2); }
+  .visit-slot:nth-child(3).filled { box-shadow: inset 0 3px 0 var(--dart-3); }
+  .visit-slot .vs-n {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted);
+  }
+  .visit-slot .vs-v {
+    font-size: 38px; font-weight: 800; line-height: 1.05; letter-spacing: -0.035em;
+    color: var(--muted); font-variant-numeric: tabular-nums;
+  }
+  .visit-slot.filled .vs-v { color: var(--text); }
+  .visit-slot .vs-sub { font-size: 10px; color: var(--muted); min-height: 1.2em; }
+  /* A dart that scored but whose engine reported not-ok / no board
+     position still gets a box -- honestly marked, never silently
+     dropped, so "3 darts thrown" and "3 boxes filled" can't disagree. */
+  .visit-slot.unscored { box-shadow: inset 0 3px 0 var(--warn-fg); }
+  .visit-slot.unscored .vs-v { color: var(--warn-fg); }
+  .visit-note { font-size: 11px; color: var(--muted); line-height: 1.4; }
+
+  /* -- Config tab: the capture-settings block moved out of the sidebar -- */
+  .config-section-title {
+    margin: 22px 0 10px; font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.08em; color: var(--muted); font-weight: 600;
+  }
+  /* One uniform grid module for every section: equal-width columns that
+     size themselves to the panel, so a box in Capture lines up with a box
+     in Network, Audio and Maintenance instead of each section picking its
+     own width. Wide panels span two columns (below) rather than inventing
+     a third width. */
+  .config-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 14px;
+  }
+  .config-field {
+    display: flex; flex-direction: column; gap: 6px;
+    padding: 12px;
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 3px;
+  }
+  .config-field-label { font-size: 12px; color: var(--text); font-weight: 600; }
+  /* A displayed-but-not-editable value, currently only the bind address.
+     Deliberately NOT a `disabled` input: a greyed-out box reads as "this
+     control is unavailable right now", which invites hunting for the
+     thing that would re-enable it. This value is never editable here by
+     design, so it is rendered as text. The padding/border match the
+     input rule below so the field still lines up in the flex row. */
+  .config-field-value {
+    font-size: 12px; color: var(--text); font-family: inherit;
+    padding: 6px 8px; border: 1px solid transparent; border-radius: 6px;
+  }
+  /* One rule for both control types. The text input used to inherit the
+     UA's own styling -- a white/grey box with a native border, sitting in
+     the same grid row as a dark select, which read as a different KIND of
+     control rather than the same control holding text. font-family is
+     spelled out because form controls do not inherit it: without that the
+     two matched on colour and still differed on typeface. */
+  .config-field select,
+  .config-field input {
+    background: var(--panel); color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 8px; font-family: inherit; font-size: 12px;
+    width: 100%;
+  }
+  /* Reserve the realistic worst case so a note that changes length cannot
+     move anything, 2026-09-12. These notes are live state, not static
+     copy: #ad-config-note swaps between "Checking Autodarts...", "On and
+     connected to <url>" and the two-line "On but NOT connected to <url>
+     -- no comparison is being recorded", and #store-packages-note grows a
+     whole sentence when a session is running. Every one of those changes
+     re-flowed the field, and because .config-grid is a flex row (items
+     stretched to the tallest) the field BESIDE it moved too. Three lines
+     at this size covers every string either renderer can produce with a
+     normal base_url; a longer server-supplied reason still grows, which
+     is the honest trade -- truncating a failure message to protect the
+     layout would hide the thing the operator came here to read. */
+  /* Host and port on one line, reading as the address they together
+     form. The host is a span and the port an input, so they need
+     aligning explicitly rather than by luck. */
+  .field-row { display: flex; align-items: center; gap: 6px; }
+  .field-row input { width: auto; flex: 0 1 8em; }
+  .field-sep { color: var(--muted); }
+  /* Audio, Maintenance and the screens list are ORDINARY single-column
+     cells (2026-09-21). All three used to `grid-column: span 2` on the
+     reasoning that each holds more than one control, but width was the
+     wrong axis: .config-field is already a flex COLUMN, so extra controls
+     become extra rows regardless, and spanning only bought blank space to
+     the right of a short setting while forcing a half-empty row and
+     pushing everything after them down the page. Single-column lets them
+     sit side by side, which is what the grid is for.
+
+     Nothing inside them needs the extra width: the audio On/Off + voice
+     pair already shrinks (`.field-row--pair` sets min-width: 0), and the
+     client rows already ellipsis their names. */
+  .always-update-row { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+  .always-update-row input { flex: 0 0 auto; width: auto; margin: 0; }
+  .always-update-row .config-field-label { font-weight: 600; }
+  /* The screens list is a single-column cell too -- see the note above the
+     audio rule. It still reads as the companion to Audio ("what this
+     screen does" / "what every other screen is doing") by sitting next to
+     it in the grid, which is exactly what it could not do while both were
+     spanning two columns. */
+  /* Label, slider, readout. The slider takes the slack; the percentage
+     is a fixed 3.2em so the row does not jitter sideways as the number
+     goes 5% -> 50% -> 100% while someone is dragging it. */
+  .field-row--volume { display: flex; align-items: center; gap: 8px; }
+  .field-row--volume .volume-label { color: var(--muted); font-size: 11px; }
+  .field-row--volume input[type=range] { flex: 1 1 auto; min-width: 0; }
+  .field-row--volume .volume-value {
+    flex: 0 0 3.2em; text-align: right; font-size: 11px; color: var(--muted);
+  }
+  /* One row per screen: state chip, name, how long since it checked in.
+     The age is deliberately present rather than implied -- "the TV last
+     reported 38 seconds ago" and "the TV is fine" are different claims,
+     and only one of them is true when a device has just dropped off the
+     Wi-Fi. */
+  .audio-clients { display: flex; flex-direction: column; gap: 4px; margin: 4px 0; }
+  .audio-client { display: flex; align-items: center; gap: 8px; font-size: 11px; }
+  .audio-client-name { flex: 1 1 auto; min-width: 0; color: var(--text);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .audio-client-age { flex: 0 0 auto; color: var(--muted); }
+  .audio-client-empty { font-size: 11px; color: var(--muted); }
+
+  /* The On/Off select is a fixed two-word control; the voice list takes
+     whatever is left. min-width: 0 is load-bearing: the shared
+     `.config-field select { width: 100% }` rule below would otherwise
+     refuse to shrink inside a flex row and push the pair over 420px. */
+  .field-row--pair { display: flex; align-items: center; gap: 6px; }
+  .field-row--pair select:first-child { flex: 0 0 5.5em; }
+  .field-row--pair select:last-child { flex: 1 1 auto; min-width: 0; }
+  /* Buttons share the width evenly. Written for the pair Render clips +
+     Test; Render went with the on-rig render pipeline (2026-09-15) and
+     Test is now alone, but the rule stays general rather than being
+     narrowed to one button -- a field-row of actions is a shape this
+     panel will want again. */
+  .field-row--actions { display: flex; gap: 6px; }
+  .field-row--actions button { flex: 1 1 0; }
+  .config-field-note {
+    font-size: 11px; color: var(--muted); line-height: 1.4; min-height: 4.2em;
+  }
+  /* The Autodarts note is the only one here that reports a live state
+     instead of describing a control, and "on but NOT connected" is the
+     state an operator has to catch -- muted grey is exactly how it read
+     before, i.e. not at all. Colour only, on the existing status tokens:
+     a .badge chip is a shape for a one-word state, not for a wrapped
+     sentence, and would read as a control inside a field of controls.
+     Off stays muted (no class) -- off is a choice, not a problem. */
+  .config-field-note.note-ok { color: var(--ok-fg); }
+  .config-field-note.note-bad { color: var(--bad-fg); }
+  /* The 4.2em reservation above exists to stop a note re-flowing its
+     NEIGHBOURS. Audio carries TWO notes, so reserving both adds 8em of
+     empty box under the controls -- and that got worse, not better, when
+     audio became a single-column cell and therefore a taller one. The
+     grid equalises row heights on its own, so dropping the reservation
+     here costs no alignment. Placed after the base rule, not before: an
+     override belongs downstream of the default it overrides, and a
+     compound selector ENDING in .config-field-note would otherwise be the
+     first thing a stylesheet scan matches. */
+  .config-field--audio .config-field-note { min-height: 0; }
+  /* Maintenance holds a setting AND its action buttons, so its notes sit
+     against buttons rather than in a column of like-sized fields, and
+     reserving height under them only pushes the buttons around. After the
+     base rule, for the reason above. */
+  .config-field--maintenance .config-field-note { min-height: 0; }
+  /* Same reservation, same reason to drop it: the Copy-diagnostics note
+     sits beside a button, not in a grid of equal-height fields. Left
+     reserved it was a 4.2em box centred against the button with its text
+     pinned to the top, so the two read as misaligned even though
+     .diag-actions centres them. */
+  .diag-actions .config-field-note { min-height: 0; }
+
+  /* Summary line (engine tally) and the Clear/Delete buttons on the SAME
+     horizontal plane, buttons right-aligned. */
+  /* flex-wrap, 2026-09-08. Six accuracy readouts and three buttons on
+     one non-wrapping line collided as soon as the window narrowed --
+     the tally ran under the buttons instead of reflowing. */
+  .scoring-header-row {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 10px 12px; margin-bottom: 8px; flex-wrap: wrap;
+  }
+  .scoring-header-row #engine-tally-bar { margin: 0; flex: 1 1 320px; min-width: 0; }
+  /* Each engine's accuracy as a discrete chip rather than a run-on line
+     of text separated by hard-coded margins. Chips wrap as units, so a
+     narrow window breaks BETWEEN engines instead of mid-readout. */
+  #engine-tally-bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .tally {
+    display: inline-flex; align-items: baseline; gap: 7px;
+    padding: 4px 10px; border-radius: 2px;
+    background: var(--panel-2); border: 1px solid var(--line);
+  }
+  .tally-name {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em;
+    color: var(--muted); font-weight: 700;
+  }
+  .tally-val { font-size: 12px; font-weight: 700; color: var(--text); }
+  .tally-pct { font-size: 11px; color: var(--muted); }
+  /* A perfect engine earns a green figure; anything short of it stays
+     neutral rather than being marked as a failure. */
+  .tally.perfect .tally-val { color: var(--ok-fg); }
+  /* Autodarts latency delta: positive means our answer arrived before
+     Autodarts' did, negative means after. */
+  .lat-ahead { color: var(--ok-fg); }
+  .lat-behind { color: var(--bad-fg); }
+  /* Autodarts board-status indicator light. Sits between the tally bar and the
+     buttons, on the same header
+     plane. Dot color is set inline by renderBoardStatus() in JS below,
+     from the standardized opendarts.live.board_status.BOARD_STATUS_*
+     vocabulary the server sends (never a source's own status
+     spelling) -- reuses the SAME --ok-fg/--bad-fg/--warn-fg/--unk-fg
+     tokens the status-pill's own dot already uses (see .status-pill .dot
+     above), so "green means ready" reads consistently across the whole
+     page rather than introducing a second color vocabulary. */
+  .board-status-lights { display: flex; gap: 14px; flex: none; }
+  .board-status-item {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 12px; color: var(--muted); white-space: nowrap;
+  }
+  .board-status-dot {
+    width: 8px; height: 8px; border-radius: 50%; flex: none;
+    background: var(--unk-fg);
+  }
+  .scoring-header-buttons { display: flex; gap: 8px; flex: none; }
+  /* Merged Cameras+Calibration card: one card per camera
+     holding the snapshot, fetch status, calibration badge/metric/note,
+     and raw hub detail -- tightened padding/gaps vs. the old two-tab
+     layout since there's no longer a second table to visually balance. */
+  /* align-items: flex-start, 2026-09-12. A flex row stretches every item
+     to the height of the tallest one, so opening ONE camera's Diagnostics
+     disclosure grew all three cards -- the two untouched cards gained the
+     same empty height, which reads as "clicking one opened all of them".
+     The <details> elements were never linked; the growth was pure flex
+     stretch. Each card now sizes to its own content. */
+  .cams { display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-start; }
+  .cam-card { background: var(--panel); border: 1px solid var(--line); border-radius: 3px; padding: 12px; width: 320px; margin: 0; }
+  .cam-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+  .cam-label { font-weight: 600; font-size: 14px; }
+  .cam-img { width: 100%; height: auto; background: #000; border-radius: 4px; display: block; min-height: 160px; }
+  /* Positioning context for the calibration overlay. The overlay is a
+     transparent PNG the same aspect as the stream beneath it, stretched
+     to the same box, so the two stay registered at any tile width. */
+  .cam-media { position: relative; width: 100%; }
+  .cam-overlay {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    display: block; pointer-events: none; border-radius: 4px;
+  }
+  .cam-overlay[hidden] { display: none; }
+  /* Broken-image fallback --
+     a real placeholder box updateCameraFeeds() swaps in for <img> on a
+     failed/refused camera fetch (cameras not started
+     is a normal, expected state now that cameras don't auto-open at
+     process startup), instead of the browser's native broken-image icon.
+     Sized/positioned to occupy the same slot the <img> would (min-height
+     matches .cam-img above) so the card doesn't visibly resize when a
+     tile flips between the two. `hidden` attribute (not just a CSS
+     class) is the default-off state in the initial HTML, before
+     JS's first updateCameraFeeds() call has run at all. */
+  /* "unknown" is a real answer here, not an error -- code_version is null
+     whenever this runs from a tarball rather than a git checkout. Muted so
+     it reads as absent-and-expected, never as a failure. */
+  .diag-unknown { color: var(--muted); font-style: italic; }
+  .diag-actions { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+  /* The preview status and the calibration metric are unrelated facts
+     sharing one row -- see the cam-subrow markup. The label is what keeps
+     them from reading as a single contradictory statement. */
+  .cam-subrow-label {
+    color: var(--muted); font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.08em; margin-right: 6px;
+  }
+  /* "not measured" is a real answer, not a failure -- a calibration loaded
+     from disk is valid, its error was simply measured in another session.
+     Muted and italic so it reads as absent-and-expected, matching how
+     .diag-unknown treats the same situation in the About this rig table. */
+  .calib-metric-absent .calib-metric-value { font-style: italic; font-size: 11px; }
+  .cam-placeholder { width: 100%; min-height: 160px; background: #000; border: 1px dashed var(--line); border-radius: 4px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; color: var(--muted); text-align: center; }
+  .cam-placeholder[hidden] { display: none; }
+  .cam-placeholder-label { font-size: 13px; font-weight: 600; }
+  .cam-placeholder-sub { font-size: 11px; }
+  /* Device selector, directly under the preview it points at.
+     A native <select> had NO styling here at all -- it inherited the
+     browser's own widget, which on a dark panel is a light-grey OS box
+     in a different typeface, and it grew with its longest option once
+     the device names arrived. Restyled to the panel's own vocabulary,
+     and given the full card width so a long name has somewhere to go.
+     appearance:none removes the OS arrow (the one part that cannot be
+     themed); .cam-device::after draws the replacement from two borders,
+     so there is no image or data URI to ship for a 6px chevron. */
+  .cam-device { position: relative; margin-top: 8px; }
+  .cam-device::after {
+    content: ''; position: absolute; right: 10px; top: 50%;
+    width: 6px; height: 6px; margin-top: -5px;
+    border-right: 1.5px solid var(--muted);
+    border-bottom: 1.5px solid var(--muted);
+    transform: rotate(45deg);
+    /* The arrow is decoration sitting on top of the control -- without
+       this, clicking it would hit the div and never open the select. */
+    pointer-events: none;
+  }
+  .cam-url-input {
+    width: 100%; padding: 8px 10px; font-size: 13px;
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 3px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .cam-url-input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .cam-url-hint { margin-top: 6px; }
+  /* A slot reading from the network is a genuinely different thing from
+     one reading local hardware, and the dropdown is the only place that
+     says so. Tinted rather than badged: the label already carries the
+     address, so this just stops the two reading as the same kind of
+     setting at a glance. */
+  .cam-device-select.is-remote {
+    border-color: var(--accent-2);
+    background: linear-gradient(0deg, rgba(53,112,79,0.18), rgba(53,112,79,0.18)), var(--panel-2);
+  }
+  .cam-device-select {
+    appearance: none; -webkit-appearance: none;
+    width: 100%; box-sizing: border-box;
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 3px;
+    /* Right padding clears the chevron so a long name never runs under it. */
+    padding: 5px 24px 5px 8px;
+    font-family: inherit; font-size: 11px; line-height: 1.4;
+    cursor: pointer;
+    /* Closed-state overflow: ellipsis beats a name silently clipped
+       mid-character, and the full text is still in the open list. */
+    text-overflow: ellipsis;
+  }
+  .cam-device-select:hover { border-color: var(--accent); }
+  .cam-device-select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  /* A stream slot keeps its GREEN on hover and focus. The shared rules
+     above paint both with --accent, which is the red this dashboard uses
+     for trouble -- so merely tabbing to a working feed's dropdown turned
+     it red and read as "this camera has failed". */
+  .cam-device-select.is-remote:hover { border-color: var(--accent-2); }
+  .cam-device-select.is-remote:focus-visible { outline-color: var(--accent-2); }
+  .cam-device-select:disabled { opacity: 0.5; cursor: not-allowed; }
+  /* Sits inside a red action line, so it must not read as another error:
+     bordered in the same red, filled with nothing, so it looks like the
+     offered way OUT of the state rather than more of the state. */
+  .calib-moved {
+    border-left: 3px solid var(--warn-fg);
+    padding-left: 8px;
+    margin-top: 6px;
+  }
+  /* Checked by DEFAULT: one machine publishes all three cameras in every
+     realistic setup, so filling one slot and leaving the other two on
+     local hardware is the rarer intent, not the common one. */
+  .cam-url-all {
+    display: flex; align-items: center; gap: 8px;
+    margin: 10px 0 2px; color: var(--muted); font-size: 13px; cursor: pointer;
+  }
+  .cam-url-all input { accent-color: var(--accent-2); cursor: pointer; }
+  .cam-url-all[hidden] { display: none; }
+  /* The options themselves: only the closed control inherits the page's
+     colours, so without this the open list renders as the OS default --
+     light rows under a dark control on exactly the machines this runs on. */
+  .cam-device-select option { background: var(--panel-2); color: var(--text); }
+  .cam-subrow { display: flex; justify-content: space-between; align-items: baseline; margin-top: 6px; gap: 8px; }
+  .cam-fetch-status { color: var(--muted); font-size: 11px; }
+  .calib-metric { display: flex; align-items: baseline; gap: 4px; white-space: nowrap; }
+  .calib-metric-value { font-size: 15px; font-weight: 700; }
+  .calib-metric-unit { color: var(--muted); font-size: 11px; }
+  .calib-note { color: var(--muted); font-size: 11px; min-height: 1.1em; margin-top: 2px; }
+  /* Was eight lines of raw key: value dump printed on every camera card,
+     unconditionally -- backend, requested/actual fps, open latency,
+     frame counts. Real operator data on a bad day, pure noise on a good
+     one, and it tripled the height of every card. Now behind a
+     disclosure that states what it is. */
+  .cam-diag { margin-top: 8px; border-top: 1px solid var(--line); padding-top: 6px; }
+  .cam-diag > summary {
+    cursor: pointer; list-style: none; color: var(--muted);
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.12em;
+    user-select: none;
+  }
+  .cam-diag > summary::-webkit-details-marker { display: none; }
+  .cam-diag > summary::before { content: "+ "; }
+  .cam-diag[open] > summary::before { content: "\2212 "; }
+  .cam-diag > summary:hover { color: var(--text); }
+  .cam-detail { margin-top: 6px; color: var(--muted); font-size: 11px; font-family: ui-monospace, monospace; line-height: 1.4; white-space: pre-wrap; word-break: break-word; }
+  button.action {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 3px; padding: 6px 12px; font: inherit; font-size: 12px; cursor: pointer;
+  }
+  button.action:hover { border-color: var(--accent); }
+  button.action:disabled { opacity: 0.5; cursor: default; }
+  /* The View column. Narrow and shrink-wrapped: it holds one button of
+     fixed width on the throw's first row and nothing on the others, so
+     giving it any more would take width from `match`, which is the cell
+     that actually overflowed (a corrected throw carries four badges there
+     and clipped the "truth:" one). white-space: nowrap keeps the button
+     from wrapping its own label when the table is squeezed. */
+  /* Width comes from its <col> (see #packages-table below); a cell width
+     here would be ignored under table-layout: fixed. */
+  th.col-view, td.col-view { white-space: nowrap; }
+  /* Per-row "AD Wrong"/"Unmark" toggle -- smaller than the tab-level
+     action buttons since it lives inside a table cell next to the
+     match/mismatch badge, not in a panel header. Shrunk further
+     2026-08-13 on top of the shorter label. */
+  .ad-wrong-btn { font-size: 10px; padding: 2px 6px; margin-left: 6px; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); font-size: 13px; }
+  th { color: var(--muted); font-weight: 600; }
+  /* Scoring table -- fixed layout, table FILLS the panel (inherits the
+     generic `table { width: 100% }` above -- no override), but each
+     column's SHARE of that width is now proportional to real measured
+     content instead of a guess. History, 2026-08-13, three rounds on
+     this same table before it was right:
+     1. Original percentages were guessed -- "board xy" at 32% was far
+        wider than a string like "(4.2, 102.9)" ever needs ("why is
+        there so much dead space on the right").
+     2. Overcorrected to a FIXED 800px width (not 100%) to stop the
+        table stretching past its content -- fixed the per-column waste,
+        but on a wide monitor now left one big blank margin instead
+        ("is the table fixed? theres a lot of dead space now").
+     3. Right answer: keep width:100% AND
+        use percentages proportional to real measured content, not
+        guessed ones -- gets both "no wasted margin" and "no lopsided
+        column" at once. Real per-column max scrollWidth, measured live
+        against the actual rendered table (both row types, every visible
+        row), not estimated: #=43px, captured=161px, engine=91px,
+        sector=95px, match=161px, tip=70px, xy=168px (789px total) --
+        percentages below are each column's real share of that 789.
+     table-layout:fixed means every column still gets its deliberate
+     share regardless of any one cell's content; anything genuinely too
+     long (see title= hover-tooltips on the no-result cells) truncates
+     instead of wrapping or stretching the table. Percentages sum to
+     100. */
+  #packages-table { table-layout: fixed; }
+  /* ONE <col> PER COLUMN, IN ORDER. With table-layout: fixed the widths
+     are assigned to columns by POSITION, so a column added to the header
+     without a <col> here silently takes its neighbour's width and pushes
+     the last column off the table -- which is exactly what adding View did
+     to board xy. tests/test_live_server.py pins the two counts together. */
+  #packages-table col.col-num { width: 5%; }
+  #packages-table col.col-captured { width: 15%; }
+  #packages-table col.col-engine { width: 15%; }
+  #packages-table col.col-sector { width: 12%; }
+  #packages-table col.col-match { width: 19%; }
+  #packages-table col.col-view { width: 6%; }
+  #packages-table col.col-lat { width: 8%; }
+  #packages-table col.col-tip { width: 8%; }
+  #packages-table col.col-xy { width: 12%; }
+  #packages-table td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* Scoring table row-GROUPS -- .ad-row is the group's reference
+     row (its own thicker top border visually starts each new throw
+     group, and it keeps the larger/bolder styling -- it's the one real
+     "new throw" event per group); .engine-row rows sit under it, small
+     and muted,
+     since they're relative-to-AD data about the SAME throw, not a
+     second independent one. */
+  /* Scoring section font sizes, +2pt across the board. */
+  #packages-table th, #packages-table .ad-row td { font-size: 17px; padding: 8px 10px; }
+  #packages-table th { font-size: 15px; padding: 6px 10px; }
+  #packages-table .ad-row td { border-top: 2px solid var(--line); font-weight: 600; }
+  #packages-table .engine-row td {
+    font-size: 13px; padding: 1px 10px; line-height: 1.5;
+    color: var(--muted); font-weight: 400; border-bottom: none;
+  }
+  #packages-table .engine-row:last-of-type td { border-bottom: 1px solid var(--line); }
+  #packages-table .engine-row td:nth-child(3) { padding-left: 26px; color: var(--text); }
+  /* The primary engine is a COMBINER: it has no detector of its own and
+     exists to aggregate the four below it. Rendered identically to them,
+     it read as one of five equal opinions, when it is in fact the
+     answer and they are its voters. Bigger, brighter, on its own tinted
+     band with an accent edge, and sitting at the indent level of the AD
+     row rather than the voters' -- so the eye reads AD, then the
+     answer, then the evidence. */
+  /* Size alone, deliberately. This row went through a tinted band, an
+     accent edge and an "aggregate" label before landing here, and every
+     one of them was decoration on top of a job that type weight already
+     does. A label repeated on every row teaches a fact the reader
+     learns once; the tint and edge just made the loudest thing on
+     screen out of something that only needs to be first. */
+  #packages-table .engine-row.primary td {
+    font-size: 17px; font-weight: 700; color: var(--text);
+    padding-top: 5px; padding-bottom: 5px;
+  }
+  #packages-table .engine-row.primary td:nth-child(3) { padding-left: 14px; }
+  #packages-table .engine-row.primary td:nth-child(3) { white-space: nowrap; }
+  /* Voters get pushed further in, so the hierarchy is legible from the
+     indent alone even in a screenshot with no colour. */
+  #packages-table .engine-row:not(.primary) td:nth-child(3) {
+    padding-left: 38px; color: var(--muted);
+  }
+  code { color: var(--accent); }
+  .cfg-table td:first-child { color: var(--muted); width: 260px; }
+  /* Section headers inside the About-this-rig table (This rig / Capacity /
+     Runtime / Wiring). A spanning row, not a real key/value pair -- so it
+     overrides the muted first-column colour and adds space above each
+     group but the first. */
+  .cfg-table tr.cfg-group td {
+    color: var(--fg); font-weight: 600; font-size: 11px;
+    letter-spacing: 0.04em; text-transform: uppercase;
+    padding-top: 16px; border-bottom: 1px solid var(--border);
+  }
+  .cfg-table tr.cfg-group:first-child td { padding-top: 4px; }
+  /* .cfg-note went with the Info tab it annotated (2026-09-13) -- it had
+     exactly one user, and what it said was wrong (see that tab's own
+     removal comment). Nothing inherited the class. */
+  /* Engine config -- left from the drag-to-reorder checklist that
+     configured primary/also-run. The controls were removed when the
+     aggregate engine became the permanent primary; these rules are kept
+     only for the engine LIST still rendered on the Engines tab. */
+  /* min-width:0 is required for a flex child to actually shrink/ellipsize
+     instead of forcing the row wider than its container (the sidebar's
+     own --side-w=220px is much narrower than this list was originally
+     designed for, back when it lived in the wider Config tab -- 2026-08-13
+     move, see the class-level comment above) -- without it, a longer
+     engine name pushed .primary-badge past the row's own right edge. */
+  #ws-indicator { font-size: 12px; }
+  #view-filter-indicator { color: var(--muted); font-size: 12px; }
+  /* "Which was actually right?" modal. Hand-rolled, no library -- same
+     self-contained plain-HTML/CSS/JS constraint as the rest of this
+     dashboard. Reuses the existing dark palette variables and
+     button.action styling rather than introducing a second visual
+     language; this is a utility dashboard, not a consumer product. The
+     `hidden` attribute is the real open/closed switch (same pattern as
+     .cam-placeholder above), not a CSS class, so the closed state is
+     correct in the initial HTML before any JS has run. */
+  .modal-backdrop {
+    position: fixed; inset: 0; z-index: 100;
+    background: rgba(0,0,0,0.6);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .modal-backdrop[hidden] { display: none; }
+  .modal {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 3px;
+    padding: 16px 18px; width: 420px; max-width: calc(100vw - 32px);
+    max-height: calc(100vh - 64px); overflow-y: auto;
+  }
+  .modal-title { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
+  /* Determinate progress, not a spinner. A render is ~64 discrete steps
+     and the server reports exactly which one it is on, so showing real
+     progress costs nothing and answers "is it stuck" honestly -- a
+     spinner cannot distinguish slow from hung. */
+  .progress-track {
+    width: 100%; height: 10px; background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 999px; overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%; width: 0%; background: var(--ok, #4ba35f);
+    transition: width 120ms linear;
+  }
+  .progress-label {
+    display: flex; justify-content: space-between; gap: 12px;
+    font-size: 12px; color: var(--muted); margin-top: 8px;
+  }
+  .modal-sub { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
+  .modal-opt {
+    display: flex; align-items: baseline; gap: 8px;
+    padding: 7px 9px; margin-bottom: 5px;
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 3px;
+    font-size: 13px; cursor: pointer;
+  }
+  .modal-opt:hover { border-color: var(--accent); }
+  .modal-opt .opt-name { font-weight: 600; }
+  .modal-opt .opt-seg { color: var(--muted); font-size: 12px; }
+  .modal-manual { display: flex; gap: 10px; align-items: center; margin: 2px 0 10px 26px; }
+  .modal-manual[hidden] { display: none; }
+  .modal-manual label { color: var(--muted); font-size: 12px; }
+  .modal-manual select {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 4px; padding: 3px 6px; font: inherit; font-size: 12px;
+  }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+  .modal-error { color: var(--bad-fg); font-size: 12px; min-height: 1.2em; }
