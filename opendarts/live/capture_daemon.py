@@ -236,6 +236,7 @@ since that's where the stale copy actually lives.
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import logging
 import signal
@@ -290,6 +291,8 @@ from opendarts.capture.calibration_package import (
     save_calibration_package,
     save_calibration_package_background,
 )
+from opendarts.capture import clip
+from opendarts.capture.lazy_frame import LazyFrame, LazyFrames, handles_of
 from opendarts.capture.board_disc import (
     get_calibrated_board_disc_masks,
     set_calibrated_board_disc_masks,
@@ -329,9 +332,10 @@ from opendarts.engines.registry import (
 )
 from opendarts.engines.zeus import ZEUS_SUB_ENGINE_NAMES
 from opendarts.geometry.board import sector_ring_to_token
-from opendarts.live import diagnostics_gate, local_capture
+from opendarts.live import board_photo, calibration_progress, diagnostics_gate, local_capture
 from opendarts.live.ad_ground_truth import DEFAULT_AD_BASE, DEFAULT_MATCH_WINDOW_SEC
 from opendarts.live.build_info import build_info
+from opendarts.live.heap_trim import release_freed_heap
 from opendarts.live.ad_ws_listener import AdWsListener
 from opendarts.pipeline import CalibrationAttempt, CameraCalibration, calibrate_camera
 
@@ -1833,8 +1837,14 @@ def bootstrap_calibrations(
             "racing a manual Refresh, interleaving writes to shared "
             "live-derived state)"
         )
+    # How far along it is, for the screens waiting on it
+    # (opendarts.live.calibration_progress -- a report only).
+    calibration_progress.PROGRESS.start(
+        list(range(len(getattr(hub, "configs", None) or []))) if hub is not None else None)
+    _progress_ok = False
+    _progress_error: str | None = None
     try:
-        return _bootstrap_calibrations_unlocked(
+        result = _bootstrap_calibrations_unlocked(
             snapshot_dir,
             hub=hub,
             n_frames=n_frames,
@@ -1849,8 +1859,25 @@ def bootstrap_calibrations(
             calibration_package_out=calibration_package_out,
             calibration_package_blocking=calibration_package_blocking,
         )
+        _progress_ok = bool(result)
+        if not result:
+            _progress_error = "no camera could be calibrated"
+        return result
+    except Exception as exc:
+        _progress_error = str(exc)
+        raise
     finally:
+        calibration_progress.PROGRESS.finish(_progress_ok, _progress_error)
         _BOOTSTRAP_CALIBRATIONS_LOCK.release()
+        # On success everything the calibration allocated is unreferenced
+        # by now -- `_bootstrap_calibrations_unlocked()`'s frame is already
+        # torn down -- but glibc keeps the freed heap. See
+        # opendarts.live.heap_trim for the measurement. (On a RAISE the
+        # in-flight traceback still pins that frame, and its nested
+        # helpers' closures, so this trim frees little; the caller that
+        # swallows the exception trims again -- see AppState.
+        # _refresh_calibration_blocking().)
+        release_freed_heap("calibration")
 
 
 # How long run_capture_loop_body()'s own Start-time auto-calibrate will
@@ -2525,6 +2552,7 @@ def _bootstrap_calibrations_unlocked(
     solve_time_s: dict[int, float] = {}
 
     _t = time.monotonic()
+    calibration_progress.PROGRESS.stage("capture")
     frames_by_cam = _capture(n_frames)
     capture_time_s += time.monotonic() - _t
 
@@ -3026,6 +3054,7 @@ def _bootstrap_calibrations_unlocked(
     # hide a whole phase.
     setup_wall_s = time.monotonic() - _bootstrap_t0
     _t_orientation = time.monotonic()
+    calibration_progress.PROGRESS.stage("orientation")
     if ORIENTATION_METHOD == ORIENTATION_METHOD_RING_CORRELATION:
         _resolve_orientation_via_ring_correlation()
     orientation_wall_s = time.monotonic() - _t_orientation
@@ -4001,9 +4030,13 @@ def _bootstrap_calibrations_unlocked(
     max_workers = max(len(remaining), 1)
     _t_rounds = time.monotonic()
     with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="calib-cam") as pool:
+        calibration_progress.PROGRESS.stage("solve")
         while remaining:
             round_num += 1
             cams_this_round = sorted(remaining)
+            calibration_progress.PROGRESS.stage("solve", f"round {round_num}" if round_num > 1 else None)
+            for _cam in cams_this_round:
+                calibration_progress.PROGRESS.camera(_cam, "working")
             # round 1 detects only `frames_by_cam_detect` (default the
             # first 10 of each camera's raw frames), not the full
             # `frames_by_cam` raw capture -- see DECOUPLED CAPTURE-VS-
@@ -4023,6 +4056,7 @@ def _bootstrap_calibrations_unlocked(
                 stay_in_remaining = future.result()
                 if not stay_in_remaining:
                     remaining.discard(cam) # main-thread-only mutation, see docstring above
+                    calibration_progress.PROGRESS.camera(cam, "done" if cam in best_calibration else "failed")
                     camera_end_time[cam] = time.monotonic() # TIMING, see _bootstrap_t0 above
 
             # MODE A (spec R2.1), 2026-08-29 -- runs exactly once, right
@@ -4091,6 +4125,9 @@ def _bootstrap_calibrations_unlocked(
                 thread_name_prefix="calib-bestn",
             ) as bestn_pool:
                 for _attempt_num in range(2, n_reprojection_attempts + 1):
+                    calibration_progress.PROGRESS.stage(
+                        "refine", f"attempt {_attempt_num - 1} of {n_reprojection_attempts - 1}",
+                        (_attempt_num - 2) / max(1, n_reprojection_attempts - 1))
                     _t = time.monotonic()
                     attempt_frames = _capture(n_frames_detect)
                     capture_time_s += time.monotonic() - _t # SECTION TIMING, see _bootstrap_t0 above
@@ -4359,6 +4396,7 @@ def _bootstrap_calibrations_unlocked(
     # successful calibration -- and says so. `motion_threshold_time_s`
     # keeps its calibration-package key (`motion_threshold_duration_s`).
     _t_motion = time.monotonic() # SECTION TIMING, see _bootstrap_t0 above
+    calibration_progress.PROGRESS.stage("finish")
     try:
         from opendarts.capture.board_disc import board_disc_mask
 
@@ -5936,6 +5974,13 @@ def fetch_current_frames(
             "hub= LocalCameraHub -- see docstring. There is no alternative "
             "frame source; the caller must open the hub."
         )
+    # DETECTION DECODES SMALL (detect_from_small_decode, see
+    # opendarts/capture/lazy_frame.py): the hub's frames come back as a
+    # LazyFrames -- the same mapping shape, decoding a frame only when its
+    # pixels are read -- so the lifecycle judges each tick from the small
+    # grey pictures the pump already made and only a commit decodes.
+    if getattr(hub, "small_decode", False):
+        return hub.grab_frames()
     # Pure in-memory cache read (see PERFORMANCE FIX docstring section
     # above) -- hub.grab_all() already returns dict[int, np.ndarray],
     # exactly this function's return shape; no PNG write/read round trip.
@@ -6028,10 +6073,10 @@ def _attach_ad_ground_truth_from_ws(
     package_dir: Path,
     ad_ws_listener: "AdWsListener | None",
     window_sec: float,
-    throw_capture: Any = None,
     on_event: Any = None,
     session_id: "str | None" = None,
-) -> None:
+    verdict: "_OracleVerdict | None" = None,
+) -> bool:
     """Matches a just-saved package against `ad_ws_listener`'s own in-
     memory buffer of recent AD throws (`AdWsListener.match()`) and writes
     `ad_ground_truth.json` -- see this module's own "AD GROUND TRUTH"
@@ -6057,9 +6102,16 @@ def _attach_ad_ground_truth_from_ws(
     function's own contract quietly assumed it never would. Mirrors
     _emit()'s own "a bad sink must never take down the capture loop"
     discipline immediately above it in this file.
+
+    Returns whether an attach was started. `verdict`, when given, receives
+    the oracle's answer (the AdGroundTruth, or None if the attach failed)
+    the moment it is known -- it is what a "mismatch" video-record mode
+    waits on to decide this package's clip (see _write_package_clip()).
+    It is never set when no attach was started; the caller knows that
+    from the return value.
     """
     if ad_ws_listener is None:
-        return
+        return False
     # AD switched off live: write NOTHING rather than a record saying we
     # looked and found nothing. `matched: false` with a reason like
     # "ws_no_buffered_events" is a statement about a failed lookup, and a
@@ -6068,9 +6120,10 @@ def _attach_ad_ground_truth_from_ws(
     # actually matters. Absence is the honest encoding of "not asked".
     if getattr(ad_ws_listener, "oracle_base_url", None) is not None:
         if ad_ws_listener.oracle_base_url() is None:
-            return
+            return False
 
     def _run() -> None:
+        gt = None
         try:
             captured_at = None
             expect_ordinal = None
@@ -6143,19 +6196,12 @@ def _attach_ad_ground_truth_from_ws(
                 on_event,
                 {"type": "PACKAGE_SAVED", "path": str(package_dir), "session": session_id},
             )
-            # THE AUTOMATIC MISSCORE TRIGGER. This is the only point in
-            # the live path where our answer and the oracle's are both in
-            # hand, so it is the only place the comparison can be made
-            # without inventing a second one -- and a second one would
-            # eventually disagree with the dashboard's own
-            # `_match_fields_for_section()`, which is the read-time
-            # version of exactly this question.
-            #
-            # Deliberately AFTER save_ad_ground_truth(): a capture that
-            # fired before the ground truth was on disk would leave a dump
-            # referring to a package that does not yet record why it was
-            # taken.
-            _capture_misscore_on_oracle_disagreement(package_dir, gt, throw_capture)
+            # THE ORACLE'S ANSWER, handed to whoever decides this package's
+            # clip (the "mismatch" video-record mode, _write_package_clip()).
+            # This is the only point in the live path where our answer and
+            # the oracle's are both in hand. Deliberately AFTER
+            # save_ad_ground_truth(): a recording made on disagreement must
+            # never refer to a package that does not yet record why.
         except Exception: # noqa: BLE001 -- enrichment must NEVER affect capture reliability
             log.exception(
                 "AD ground-truth (ws) attach failed for %s -- the throw package itself "
@@ -6163,83 +6209,163 @@ def _attach_ad_ground_truth_from_ws(
                 "button can backfill this later if needed",
                 package_dir,
             )
+        finally:
+            if verdict is not None:
+                verdict.set(gt)
 
     threading.Thread(
         target=_run, name=f"opendarts-ad-ground-truth-{package_dir.name}", daemon=True
     ).start()
+    return True
 
 
-def _capture_misscore_on_oracle_disagreement(
-    package_dir: Path, gt: Any, throw_capture: Any,
-) -> None:
-    """Write the frames around this throw when the oracle called it
-    differently than we did.
+class _OracleVerdict:
+    """The oracle's answer for one package, handed from the ground-truth
+    attach thread to the clip writer (a one-shot slot)."""
+
+    def __init__(self) -> None:
+        self._done = threading.Event()
+        self._gt: Any = None
+
+    def set(self, gt: Any) -> None:
+        self._gt = gt
+        self._done.set()
+
+    def wait(self, timeout_s: float) -> Any:
+        """The AdGroundTruth, or None if the attach failed or did not
+        answer within `timeout_s`."""
+        return self._gt if self._done.wait(timeout_s) else None
+
+
+#: How long a "mismatch" package waits for the oracle before settling for
+#: the stills clip. The attach itself polls for up to AD_ORDINAL_GRACE_SEC;
+#: the rest is margin. The package's data is already on disk -- only its
+#: frames wait (the ring holds far longer than this).
+ORACLE_VERDICT_WAIT_S = AD_ORDINAL_GRACE_SEC + 2.0
+
+
+def _oracle_disagreement(package_dir: Path, gt: Any) -> "str | None":
+    """Why this throw should be RECORDED -- the oracle called it
+    differently than we did -- or None.
 
     WHY AUTOMATIC. A misscore that nobody is standing next to is the
     common case on a test rig, and the ring is emptying while nobody
     notices -- by the time a human reads the dashboard the frames are
-    gone. The oracle already answered; comparing two strings costs
-    nothing; and the window is ~270MB, which is a fraction of a second of
-    writing against a 436GB disk.
+    gone. The oracle already answered, and comparing two strings costs
+    nothing.
 
     SILENT ON EVERY OTHER OUTCOME, on purpose. No oracle, no match, a
     package we could not score, or an agreement are all ordinary states,
-    not events -- firing a capture on "AD did not answer" would fill the
-    disk with dumps of throws nothing was ever wrong with.
+    not events -- recording on "AD did not answer" would fill the disk
+    with clips of throws nothing was ever wrong with.
 
-    Never raises: this runs on the ground-truth attach thread, whose whole
-    contract is that enrichment must never affect capture reliability.
-    """
-    if throw_capture is None or gt is None or not getattr(gt, "matched", False):
-        return
-    # Only the "mismatch" mode records on disagreement: "all" already
-    # recorded this throw's clip at commit, and "never" has no ring. See
-    # opendarts.live.config video_record_mode.
-    if getattr(throw_capture, "record_mode", "mismatch") != "mismatch":
-        return
+    Never raises: a failure here only means the stills clip."""
+    if gt is None or not getattr(gt, "matched", False):
+        return None
     try:
         result_path = package_dir / "result.json"
         if not result_path.exists():
-            return
+            return None
         result = json.loads(result_path.read_text())
         if not result.get("ok"):
             # A throw we could not score is not a MISSCORE -- it is a
             # different failure, with its own evidence already in the
             # package, and treating the two the same would bury the ones
             # where we confidently said the wrong thing.
-            return
+            return None
         ours = (result.get("sector"), result.get("ring"))
         theirs = (gt.sector, gt.ring)
         if ours == theirs:
-            return
+            return None
         log.info(
             "oracle disagreement on %s: we called %s/%s, the oracle called %s/%s "
             "-- recording the throw's video clip automatically",
             package_dir.name, ours[0], ours[1], theirs[0], theirs[1],
         )
-        outcome = throw_capture.record_throw_clip(
-            package_dir,
-            None,
-            reason=(
-                f"oracle disagreement: opendarts called {ours[0]}/{ours[1]}, "
-                f"the oracle called {theirs[0]}/{theirs[1]}"
-            ),
-            source="oracle",
+        return (
+            f"oracle disagreement: opendarts called {ours[0]}/{ours[1]}, "
+            f"the oracle called {theirs[0]}/{theirs[1]}"
         )
-        if not outcome.get("ok"):
-            # A REFUSAL IS LOGGED HERE TOO, not only inside the service.
-            # This one has no operator watching a dashboard line, so the
-            # log is the only place it can be seen at all -- and "the ring
-            # had already aged that throw out" is exactly the fact that
-            # tells someone to raise frame_ring_seconds.
-            log.warning(
-                "automatic misscore capture for %s did NOT happen: %s",
-                package_dir.name, outcome.get("reason"),
+    except Exception: # noqa: BLE001 -- a failed check is just no recording
+        log.exception("oracle disagreement check failed for %s", package_dir)
+        return None
+
+
+def _write_package_clip(
+    package_dir: Path,
+    scored: "clip.ScoredFrames",
+    cameras: list[int],
+    throw_capture: Any,
+    *,
+    verdict: "_OracleVerdict | None",
+    anchor_wall_s: "float | None",
+    on_event: Any = None,
+    session_id: "str | None" = None,
+) -> None:
+    """Write a just-saved package's ONE clip, point its meta.json at it,
+    and -- in "mismatch" mode only -- tell the dashboard (PACKAGE_SAVED;
+    see the comment at the emit) -- the last step of the package save, run
+    once the recording decision is known.
+
+    The decision is the video-record mode's (opendarts.live.config
+    video_record_mode, carried on `throw_capture`): "all" records every
+    throw; "mismatch" waits for the oracle (`verdict`, filled by the
+    ground-truth attach; None when no attach was started) and records
+    only a disagreement; "never", no throw-capture service, or no answer
+    in time gets the two-frame stills clip. A wanted recording that cannot
+    be had also ends in the stills clip -- see
+    ThrowCaptureService.write_package_clip.
+
+    Never raises: this runs after THROW_DETECTED and after the package's
+    data is on disk, so a failure here is logged loudly and costs this one
+    package its frames, nothing else."""
+    try:
+        mode = getattr(throw_capture, "record_mode", None) if throw_capture is not None else None
+        record, reason = False, ""
+        if mode == "all":
+            record, reason = True, "record all darts"
+        elif mode == "mismatch" and verdict is not None:
+            disagreement = _oracle_disagreement(package_dir, verdict.wait(ORACLE_VERDICT_WAIT_S))
+            if disagreement is not None:
+                record, reason = True, disagreement
+        if throw_capture is not None:
+            throw_capture.write_package_clip(
+                package_dir, scored, cameras,
+                record=record, anchor_wall_s=anchor_wall_s, reason=reason,
             )
-    except Exception: # noqa: BLE001 -- enrichment must NEVER affect capture reliability
+        else:
+            video, _ = clip.write_throw_clip(package_dir, scored, cameras)
+            clip.point_meta_at_clip(package_dir, video)
+        # Announce the clip only when the package list could not have known
+        # the outcome in advance (2026-09-26). Every PACKAGE_SAVED makes the
+        # server re-read the package and broadcast PACKAGES_UPDATED, and the
+        # classic dashboard rebuilds its whole Engines table on each one.
+        #   * "mismatch": only now does the list learn that a disputed dart
+        #     got its recording -- announced as before.
+        #   * "all": every dart is recorded, and no screen gates on the
+        #     row's has_video in this mode (the "Save frames" button is
+        #     gated on the mode itself, the stills are fetched and retried
+        #     by the screens). The server's cached row still has to say
+        #     has_video for /api/packages, so it is refreshed quietly:
+        #     `refresh_only` re-reads the package and broadcasts nothing.
+        #   * "never" / no service: the stills clip; nothing the list shows
+        #     changes, so nothing to say.
+        if mode == "mismatch":
+            _emit(
+                on_event,
+                {"type": "PACKAGE_SAVED", "path": str(package_dir), "session": session_id},
+            )
+        elif mode == "all":
+            _emit(
+                on_event,
+                {"type": "PACKAGE_SAVED", "path": str(package_dir), "session": session_id,
+                 "refresh_only": True},
+            )
+    except Exception: # noqa: BLE001 -- see docstring
         log.exception(
-            "automatic misscore capture check failed for %s -- the package and its "
-            "ground truth are unaffected", package_dir,
+            "PACKAGE CLIP WRITE FAILED for %s -- its data files are saved, but it has "
+            "NO readable frames. This is a real REPLAY gap for this one throw.",
+            package_dir,
         )
 
 
@@ -6651,10 +6777,10 @@ def handle_ready_to_capture(
     # (`min_free_disk_gb` in data/config.json).
     min_free_disk_gb: "float | None" = None,
     # The throw-capture service (opendarts.capture.throw_capture), or None
-    # -- every pre-existing caller and every test. When present, and only
-    # when an oracle actually answered, a disagreement between our call
-    # and the oracle's automatically writes the frames around this throw
-    # out of the ring. See _capture_misscore_on_oracle_disagreement().
+    # -- every pre-existing caller and every test. Its video-record mode
+    # decides whether the package's one clip is a recording out of its
+    # frame ring; None means the two-frame stills clip. See
+    # _write_package_clip().
     throw_capture: Any = None,
 ) -> Path:
     """Real detection + scoring + package save for one completed throw --
@@ -7143,6 +7269,25 @@ def handle_ready_to_capture(
     # own. Same key name as TRIGGER_STATE's own field so a consumer can
     # measure capture(TRIGGER_STATE)->answer(THROW_DETECTED) using one
     # convention on both sides instead of inferring it from `ts`.
+    # What the scoring page's board photo needs to draw this dart the way
+    # it looks from the oche: its lean and its flight colour, both read off
+    # what scoring already produced (see opendarts.live.board_photo). Each
+    # is omitted when it cannot be worked out, and neither may ever cost a
+    # throw its score.
+    board_view_fields: dict[str, Any] = {}
+    if result.ok and result.board_xy_mm is not None:
+        try:
+            axis = board_photo.dart_axis(engine_result.diagnostics, calibrations)
+            if axis is not None:
+                board_view_fields["dart_axis"] = axis
+                colour = board_photo.flight_color(
+                    current_frames, bg_images, calibrations,
+                    tuple(result.board_xy_mm), axis,
+                )
+                if colour is not None:
+                    board_view_fields["flight_color"] = colour
+        except Exception:  # noqa: BLE001 -- decoration; never the score's problem
+            log.warning("board view: dart axis/colour failed", exc_info=True)
     _emit(
         on_event,
         {
@@ -7170,8 +7315,13 @@ def handle_ready_to_capture(
             # Named for what it actually is rather than dressed up as a
             # 0-1 confidence that nothing in this system computes.
             "max_ray_disagreement_mm": result.max_ray_disagreement_mm,
+            **board_view_fields,
         },
     )
+    # No board photo here (2026-09-26). It used to be rendered from the
+    # first dart's bg, but ~0.2 s of CPU inside dart 1's burst is exactly
+    # when the Pi has none to spare; run_capture_loop_body() now renders
+    # it after each takeout instead, from the same empty board.
 
     def _save_and_followups() -> None:
         """2026-09-01 -- everything that used to run
@@ -7186,7 +7336,10 @@ def handle_ready_to_capture(
         Runs in the EXACT SAME relative order today's synchronous code
         did (save -> capture_diagnostics.json ->
         PACKAGE_SAVED emit -> AD-ground-truth attach -> also-run
-        dispatch) -- moved as one atomic unit, not individually
+        dispatch; since 2026-09-26 the package's one clip is started
+        between the attach and the dispatch, on its own thread, and --
+        in "mismatch" video-record mode -- re-emits PACKAGE_SAVED once
+        meta.json points at it -- see _write_package_clip()) -- moved as one atomic unit, not individually
         reordered, so every existing ordering assumption downstream code
         already relies on (e.g. `_dispatch_also_run_engines_in_
         background()`'s own docstring: "writes into the throw's
@@ -7263,14 +7416,10 @@ def handle_ready_to_capture(
                 # pulled somewhere else.
                 host=_origin_host(),
                 build=_origin_build(),
-                # The camera's own JPEG bytes for these exact arrays, paired
-                # by identity at the tick they were fetched (the capture
-                # loop's _FrameJpegIndex) -- lets the package's clip be a
-                # stream copy rather than an FFV1 encode. None/partial is
-                # normal and only costs file size; the clip writer also
-                # re-checks every pairing by decoding it before keeping it.
-                bg_jpegs=trigger.bg_jpegs,
-                dart_jpegs=trigger.last_frame_jpegs,
+                # The data files only: the package's ONE clip is written
+                # just below, once its recording decision is known -- see
+                # _write_package_clip().
+                defer_clips=True,
             )
             # Core package-save duration only (matches the peer's own
             # "package save" bucket) -- deliberately measured before the
@@ -7278,18 +7427,6 @@ def handle_ready_to_capture(
             # additional, separate I/O this function also does but that
             # isn't part of save_throw_package() itself.
             save_duration_s = time.monotonic() - _t_save
-            # "all" video-record mode: record this throw's clip into the
-            # package (throw_capture.record_throw_clip), DEFERRED so the
-            # after-window has landed in the ring first. Only "all" fires
-            # here -- "mismatch" records from the oracle-disagreement path,
-            # "never" has no ring. Fire-and-forget; it never blocks the loop
-            # and a failure leaves a valid bg+dart-PNG package.
-            if throw_capture is not None and getattr(
-                throw_capture, "record_mode", "mismatch"
-            ) == "all":
-                throw_capture.schedule_throw_clip(
-                    dest_dir, reason="record all darts", source="all",
-                )
             # capture_diagnostics.json (2026-08-16, "persist real
             # diagnostics" task -- see docs/DESIGN.md and opendarts.capture.
             # throw_package's own docstring section, and
@@ -7364,10 +7501,54 @@ def handle_ready_to_capture(
             # with the write the way triggering it from the OLD
             # synchronous call site while THIS save was still backgrounded
             # would have been).
-            _attach_ad_ground_truth_from_ws(
-                dest_dir, ad_ws_listener, ad_match_window_sec, throw_capture,
-                on_event=on_event, session_id=session_id,
+            verdict = _OracleVerdict()
+            if not _attach_ad_ground_truth_from_ws(
+                dest_dir, ad_ws_listener, ad_match_window_sec,
+                on_event=on_event, session_id=session_id, verdict=verdict,
+            ):
+                verdict = None  # no oracle will answer -- nothing to wait for
+            # THE PACKAGE'S ONE CLIP (2026-09-26), after its data: a
+            # recording out of the frame ring, or the two frames scoring
+            # used, then meta.json pointed at it (and, in "mismatch" mode,
+            # PACKAGE_SAVED again -- see _write_package_clip()).
+            # The camera JPEGs and ring generations are paired with these
+            # exact arrays by identity at the tick they were fetched (the
+            # capture loop's _FrameJpegIndex); a camera without them just
+            # gets an FFV1 and/or two-frame clip. Its own thread, like the
+            # attach above: it may wait on the next ring frame or on the
+            # oracle, and nothing below should. Inline when the caller
+            # asked for a synchronous save.
+            clip_cameras = sorted(set(bg_frames) & set(current_frames) & set(calibrations))
+            clip_job = functools.partial(
+                _write_package_clip,
+                dest_dir,
+                clip.ScoredFrames(
+                    bg={c: bg_frames[c] for c in clip_cameras},
+                    commit={c: current_frames[c] for c in clip_cameras},
+                    bg_jpegs=dict(trigger.bg_jpegs or {}),
+                    commit_jpegs=dict(trigger.last_frame_jpegs or {}),
+                    bg_generations=dict(trigger.bg_generations or {}),
+                    commit_generations=dict(trigger.last_frame_generations or {}),
+                ),
+                clip_cameras,
+                throw_capture,
+                verdict=verdict,
+                # The capture instant, as the misscore anchor defines it
+                # (throw_capture.anchor_wall_s_for_package): the stamp minus
+                # the sync path that preceded it.
+                anchor_wall_s=(
+                    datetime.fromisoformat(captured_at_utc).timestamp()
+                    - handle_total_duration_s
+                ),
+                on_event=on_event,
+                session_id=session_id,
             )
+            if background_save:
+                threading.Thread(
+                    target=clip_job, name=f"throw-clip-{dest_dir.name}", daemon=True,
+                ).start()
+            else:
+                clip_job()
 
             if also_run:
                 bg_images = {
@@ -7970,41 +8151,94 @@ class _FrameJpegIndex:
     Every hub-less or JPEG-less path (tests' fake hubs, macOS without
     synthetic JPEG) records nothing and every lookup comes back empty --
     exactly the pre-existing FFV1 behaviour.
+
+    LAZY FRAMES (detect_from_small_decode). A fetched LazyFrames already
+    carries each frame's bytes and generation, read under the hub's lock
+    with the frame, so they are recorded straight from it -- and keyed by
+    the LazyFrame, since its pixels do not exist yet. A lookup by array (the
+    decoded commit frames and bg) matches the LazyFrame that decoded to
+    exactly that array. Nothing here ever decodes a frame.
+
+    THE FRAME'S RING GENERATION RIDES ALONG (2026-09-26). A hub with
+    ``grab_paired()`` also says which pump generation published the frame
+    -- the frame ring set holding exactly it -- read under the same lock
+    as the frame and its bytes, and kept by the same identity rule. That
+    number is how a package's clip takes its frames out of the ring by
+    NAME instead of searching the ring for pixels that match (see
+    opendarts.capture.clip.write_window_clips). A frame whose pairing was
+    not proven has no generation either, and its package simply gets the
+    two-frame clip.
     """
 
     def __init__(self, keep_ticks: int = 3) -> None:
-        self._ticks: "deque[dict[int, tuple[np.ndarray, bytes]]]" = deque(maxlen=keep_ticks)
-        self._pinned: dict[int, tuple[np.ndarray, bytes]] = {}
+        # id(arr) -> (arr, its JPEG or None, its ring generation or None)
+        self._ticks: "deque[dict[int, tuple[np.ndarray, bytes | None, int | None]]]" = (
+            deque(maxlen=keep_ticks))
+        self._pinned: dict[int, tuple[np.ndarray, "bytes | None", "int | None"]] = {}
 
     def record(self, hub: Any, frames: dict[int, np.ndarray]) -> None:
-        entries: dict[int, tuple[np.ndarray, bytes]] = {}
+        entries: dict[int, tuple[np.ndarray, "bytes | None", "int | None"]] = {}
+        if isinstance(frames, LazyFrames):
+            for cam, handle in frames.handles().items():
+                jpeg, generation = frames.jpeg(cam), frames.generation(cam)
+                if jpeg is None and generation is None:
+                    continue
+                entries[id(handle)] = (
+                    handle, bytes(jpeg) if jpeg is not None else None,
+                    int(generation) if generation is not None else None)
+            self._ticks.append(entries)
+            return
+        paired = getattr(hub, "grab_paired", None)
         grab = getattr(hub, "grab_with_jpeg", None)
-        if grab is not None:
+        if paired is not None or grab is not None:
             for cam, arr in frames.items():
                 try:
-                    got, jpeg = grab(cam)
+                    if paired is not None:
+                        got, jpeg, generation = paired(cam)
+                    else:
+                        (got, jpeg), generation = grab(cam), None
                 except Exception:  # noqa: BLE001 -- bytes are an optimisation, never a failure
                     continue
-                if jpeg is not None and got is arr:
-                    entries[id(arr)] = (arr, bytes(jpeg))
+                if got is not arr or (jpeg is None and generation is None):
+                    continue
+                entries[id(arr)] = (
+                    arr, bytes(jpeg) if jpeg is not None else None,
+                    int(generation) if generation is not None else None)
         self._ticks.append(entries)
 
-    def _find(self, arr: np.ndarray) -> "tuple[np.ndarray, bytes] | None":
+    def _find(self, arr: np.ndarray) -> "tuple[np.ndarray, bytes | None, int | None] | None":
         key = id(arr)
         for entries in (self._pinned, *reversed(self._ticks)):
             hit = entries.get(key)
             if hit is not None and hit[0] is arr:
                 return hit
+        # A decoded array whose LazyFrame was recorded (a handful of
+        # entries, so a scan).
+        for entries in (self._pinned, *reversed(self._ticks)):
+            for hit in entries.values():
+                if isinstance(hit[0], LazyFrame) and hit[0].is_pixels(arr):
+                    return hit
         return None
 
     def lookup(self, frames: "dict[int, np.ndarray] | None") -> dict[int, bytes]:
         """``{cam: bytes}`` for every frame in `frames` whose own bytes are
         known; cameras without a proven pairing are simply absent."""
         out: dict[int, bytes] = {}
-        for cam, arr in (frames or {}).items():
+        for cam, arr in handles_of(frames).items():
             hit = self._find(arr) if arr is not None else None
-            if hit is not None:
+            if hit is not None and hit[1] is not None:
                 out[cam] = hit[1]
+        return out
+
+    def lookup_generations(self, frames: "dict[int, np.ndarray] | None") -> dict[int, int]:
+        """``{cam: ring generation}`` for every frame in `frames` whose
+        publishing generation is known -- the same identity rule as
+        lookup(); cameras without one are simply absent."""
+        out: dict[int, int] = {}
+        for cam, arr in handles_of(frames).items():
+            hit = self._find(arr) if arr is not None else None
+            if hit is not None and hit[2] is not None:
+                out[cam] = hit[2]
         return out
 
     def pin(self, *frame_sets: "dict[int, np.ndarray] | None") -> None:
@@ -8012,14 +8246,14 @@ class _FrameJpegIndex:
         reference) alive past the tick window. Replaces the previous pin
         set, so a reference the lifecycle has let go of is let go of here
         too."""
-        pinned: dict[int, tuple[np.ndarray, bytes]] = {}
+        pinned: dict[int, tuple[np.ndarray, "bytes | None", "int | None"]] = {}
         for frames in frame_sets:
-            for arr in (frames or {}).values():
+            for arr in handles_of(frames).values():
                 if arr is None:
                     continue
                 hit = self._find(arr)
                 if hit is not None:
-                    pinned[id(arr)] = hit
+                    pinned[id(hit[0])] = hit
         self._pinned = pinned
 
 
@@ -8039,6 +8273,28 @@ def _lifecycle_step(
     if tick is None:
         return None
     return adapter.apply(tick, lifecycle.lifecycle, current_frames)
+
+
+def _calibration_key(calibration_store: Any, calibrations: Any) -> tuple:
+    """Cheap identity of the calibration in force: which calibration objects
+    the store holds, plus its package id. A recalibration replaces the
+    objects, so this changes without hashing any arrays -- it runs every
+    tick. Without a store (tests), the loop's own startup calibrations."""
+    if calibration_store is None:
+        return tuple(sorted((c, id(v)) for c, v in (calibrations or {}).items()))
+    cals, package_id = calibration_store.get_with_package_id()
+    return (package_id, tuple(sorted((c, id(v)) for c, v in cals.items())))
+
+
+def _lifecycle_phase_is_idle(lifecycle: Any) -> bool:
+    """Whether the lifecycle has settled back into IDLE -- past a clear's
+    cooldown or a Reset's warmup, so its reference is a quiet empty
+    board. A driver without a live Lifecycle (tests' scripted seam) has
+    no phases to wait out and counts as settled."""
+    from opendarts.lifecycle.state import Phase
+
+    phase = getattr(getattr(lifecycle, "lifecycle", None), "phase", None)
+    return phase is None or phase is Phase.IDLE
 
 
 def run_capture_loop_body(
@@ -8457,6 +8713,16 @@ def run_capture_loop_body(
         poll_interval_s=poll_interval_s,
         label="startup background",
     )
+    # A board photo straight away, from the first frames after Start, so
+    # the Scoring tab's Photo view has a board before anyone has thrown.
+    # Each takeout replaces it with the freshly cleared board (see
+    # _board_photo_due below); if there are darts in the board at Start,
+    # they are in this one only until then.
+    if on_event is not None and calibrations:
+        board_photo.RENDERER.submit(
+            bg_frames, calibrations,
+            lambda jpeg: _emit(on_event, {"type": "BOARD_PHOTO", "jpeg": jpeg, "visit_id": None}),
+        )
     session_id = time.strftime("%Y%m%d-%H%M%S")
     # `trigger` is rebuilt by the lifecycle adapter every tick; this is
     # only the pre-first-tick value the UI/heartbeat see. `bg_frames` is
@@ -8492,6 +8758,24 @@ def run_capture_loop_body(
         },
     )
     log.info("trigger state: %s (session %s)", trigger.state.name, session_id)
+
+    # THE BOARD PHOTO AFTER A TAKEOUT (2026-09-26). Set by a takeout or a
+    # manual Reset; the photo is then taken on the first tick the
+    # lifecycle is back in IDLE -- the end of its post-clear cooldown
+    # (clear_cooldown_frames, ~0.3 s), or of the warmup a Reset restarts.
+    # The CLEARED tick itself already adopted a fresh reference, but it is
+    # the very frame the takeout was accepted on, with the arm possibly
+    # still retreating; the cooldown re-adopts every tick precisely to
+    # absorb that, so its last reference is the cleaner empty board. The
+    # renderer skips the photo when that board matches the last one.
+    _board_photo_due = False
+    # A recalibration mid-session (the dashboard's Calibrate) also makes the
+    # photo due: it is warped with the calibration, so after one the photo on
+    # screen no longer matches where the darts are drawn. Scoring re-reads
+    # the store on every dart; the photo reads it the same way, and a change
+    # of calibration objects (or package id) since the last photo marks it
+    # due. The renderer never skips across a calibration change.
+    _photo_calibration_key = _calibration_key(calibration_store, calibrations)
 
     # Heartbeat -- found live 2026-08-12: state transitions were only
     # ever pushed to the dashboard's WebSocket (_emit), never logged, so
@@ -9014,6 +9298,7 @@ def run_capture_loop_body(
                     "reason": "reset",
                 },
             )
+            _board_photo_due = True
             _emit(
                 on_event,
                 {
@@ -9074,6 +9359,11 @@ def run_capture_loop_body(
                     # commit, which the lifecycle may just have replaced.
                     trigger.last_frame_jpegs = frame_jpegs.lookup(trigger.last_frame)
                     trigger.bg_jpegs = frame_jpegs.lookup(bg_frames)
+                    # Which ring set holds each of those frames -- how the
+                    # package's clip takes them out of the ring by number.
+                    trigger.last_frame_generations = frame_jpegs.lookup_generations(
+                        trigger.last_frame)
+                    trigger.bg_generations = frame_jpegs.lookup_generations(bg_frames)
                 frame_jpegs.pin(bg_frames, trigger.true_baseline_frames)
         if _live_step is not None and _live_step.cleared_darts:
             previous_visit_id = visit_id
@@ -9093,6 +9383,23 @@ def run_capture_loop_body(
                     "reason": "takeout",
                 },
             )
+            _board_photo_due = True
+        if _calibration_key(calibration_store, calibrations) != _photo_calibration_key:
+            _board_photo_due = True
+        if _board_photo_due and _live_step is not None and _lifecycle_phase_is_idle(lifecycle):
+            _board_photo_due = False
+            _photo_calibrations = calibration_store.get() if calibration_store is not None else calibrations
+            _photo_calibration_key = _calibration_key(calibration_store, calibrations)
+            if on_event is not None and _photo_calibrations and bg_frames:
+                board_photo.RENDERER.submit(
+                    bg_frames, _photo_calibrations,
+                    lambda jpeg, _vid=visit_id: _emit(on_event, {
+                        "type": "BOARD_PHOTO",
+                        "jpeg": jpeg,
+                        "visit_id": _vid,
+                    }),
+                    skip_if_unchanged=True,
+                )
         _t_lifecycle_end = time.perf_counter() if _diag_on else None
         _lifecycle_elapsed = (_t_lifecycle_end - _t_lifecycle_start) if _diag_on else 0.0
         _post_elapsed: float | None = None
@@ -9306,7 +9613,8 @@ def run_capture_loop_body(
             # `cam in current_frames` filter handle_ready_to_capture()
             # itself applies internally for its own `bg_images`, so this
             # is a byte-accurate stand-in for what got saved to disk as
-            # this throw's own bg/commit frames (its stills clip) -- never an
+            # this throw's own bg/commit frames (its clip's two pointer
+            # frames) -- never an
             # approximation of it.
             #
             # own_tip_line_px_out was passed in as a FRESH {} right above

@@ -340,6 +340,19 @@
     max-height: 64vh; padding: 4px 0 0;
   }
   #board-canvas { display: block; }
+  /* Photo | Diagram, per screen. Tucked into the stage's corner, over
+     the board's empty surround, so it costs the board no space. */
+  .board-view-switch {
+    position: absolute; top: 6px; right: 0; z-index: 1;
+    display: inline-flex; border: 1px solid var(--line); border-radius: 999px;
+    background: var(--panel); overflow: hidden;
+  }
+  .board-view-switch button {
+    appearance: none; border: 0; background: transparent; color: var(--muted);
+    font: inherit; font-size: 12px; padding: 4px 11px; cursor: pointer;
+  }
+  .board-view-switch button[aria-pressed="true"] { background: var(--panel-2); color: var(--text); }
+  .board-view-switch button:focus-visible { outline: 2px solid var(--accent-2); outline-offset: -2px; }
 
   .visit-id {
     font-size: 10px; color: var(--muted); font-family: ui-monospace, Menlo, monospace;
@@ -367,7 +380,16 @@
     color: var(--muted); font-variant-numeric: tabular-nums;
   }
   .visit-slot.filled .vs-v { color: var(--text); }
-  .visit-slot .vs-sub { font-size: 10px; color: var(--muted); min-height: 1.2em; }
+  /* line-height MUST equal the min-height reserve (both 1.2em), or the
+     board below jumps. An empty sub collapses to its 1.2em min-height, but
+     a filled one with no line-height set inherits the body's 1.45 and
+     renders a ~1.45em line -- taller than the reserve. So the first dart of
+     a visit (which fills slot 1's sub) grew the strip a few px and nudged
+     the flex-sized board down; darts 2-3 filled to the same taller row and
+     sat still; a take-out cleared it and the next first dart did it again.
+     Pinning line-height to 1.2 makes filled and empty exactly one 1.2em
+     line, so the strip height never changes and the board holds still. */
+  .visit-slot .vs-sub { font-size: 10px; line-height: 1.2; color: var(--muted); min-height: 1.2em; }
   /* A dart that scored but whose engine reported not-ok / no board
      position still gets a box -- honestly marked, never silently
      dropped, so "3 darts thrown" and "3 boxes filled" can't disagree. */

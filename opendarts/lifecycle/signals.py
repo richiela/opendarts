@@ -84,6 +84,10 @@ def to_small_mask(mask_full: np.ndarray, small_shape: tuple[int, int]) -> np.nda
     return small.astype(bool)
 
 
+#: The 8 neighbours of a pixel, not the pixel itself (see change_mask).
+_NEIGHBOURS_ONLY = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], np.uint8)
+
+
 def change_mask(
     a: np.ndarray, b: np.ndarray, cfg: SignalConfig = DEFAULT_SIGNAL_CONFIG
 ) -> np.ndarray:
@@ -98,6 +102,29 @@ def change_mask(
             cv2.MORPH_RECT, (cfg.open_kernel, cfg.open_kernel)
         )
         binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+    # Two exact shortcuts for the component filter, which was over half of
+    # a tick's cost on the Pi 5 (a 320x180 connectedComponentsWithStats
+    # is ~0.25 ms, and the keep[labels] lookup another ~0.15 ms, twice
+    # per camera per tick). Both return exactly the mask the filter
+    # below would, for every input:
+    #
+    #   * After a 3x3 OPEN, every set pixel lies in a set 3x3 square
+    #     (the opening is the union of the squares centred on the eroded
+    #     pixels), clipped to 2x2 at worst in a corner -- erosion treats
+    #     outside the image as set, dilation as unset. So in an image at
+    #     least 2 px each way every component already has >= 4 pixels and
+    #     a min_blob_px <= 4 drops nothing.
+    #   * With min_blob_px == 2 the filter only drops components of ONE
+    #     pixel, i.e. set pixels with no set 8-neighbour -- one dilation
+    #     with the centre left out of the kernel finds those.
+    if (cfg.min_blob_px > 1 and cfg.open_kernel == 3 and cfg.min_blob_px <= 4
+            and min(binary.shape[:2]) >= 2):
+        return binary.astype(bool)
+    if cfg.min_blob_px == 2:
+        neighbours = cv2.dilate(
+            binary, _NEIGHBOURS_ONLY, borderType=cv2.BORDER_CONSTANT, borderValue=0
+        )
+        return (binary != 0) & (neighbours != 0)
     if cfg.min_blob_px > 1 and np.any(binary):
         n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
         if n > 1:

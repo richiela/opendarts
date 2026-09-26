@@ -1019,6 +1019,89 @@ def test_bootstrap_calibrations_lock_releases_after_a_real_call_including_on_exc
     assert 0 in result3
 
 
+# ---------------------------------------------------------------------------
+# Memory after a calibration, 2026-09-25 -- see opendarts.live.heap_trim.
+# A calibration's raw frame pool (~1 GB at peak on the rig) must be
+# unreachable once bootstrap_calibrations() is done, whether it returned or
+# raised, and the freed heap must be handed back to the OS.
+# ---------------------------------------------------------------------------
+
+
+def _tracked_frame_capture(refs):
+    """A `_capture_calibration_frames_local` stand-in that records a weakref
+    to every frame it hands out, so a test can prove nobody kept them."""
+    import weakref
+
+    def fake_local(hub, n, **kwargs):
+        frames = [np.zeros((10, 10, 3), dtype=np.uint8) for _ in range(n)]
+        refs.extend(weakref.ref(f) for f in frames)
+        return {0: frames}
+
+    return fake_local
+
+
+def _square_points():
+    return np.zeros((4, 3)), np.array([[10.0, 10.0], [20.0, 10.0], [20.0, 20.0], [10.0, 20.0]])
+
+
+def test_bootstrap_calibrations_keeps_no_frame_alive_and_trims_the_heap(tmp_path, monkeypatch):
+    import gc
+
+    refs: list = []
+    trims: list[tuple[str, int]] = []
+
+    def recording_trim(reason):
+        # What is still alive AT the trim is what it can give back.
+        gc.collect()
+        trims.append((reason, sum(r() is not None for r in refs)))
+
+    monkeypatch.setattr(capture_daemon, "_capture_calibration_frames_local", _tracked_frame_capture(refs))
+    _install_fake_orientation_pipeline(monkeypatch, lambda image_bgr, cam, **k: _square_points())
+    monkeypatch.setattr(capture_daemon, "calibrate_camera", lambda *a, **k: _fake_attempt_with_reprojection(1.0))
+    monkeypatch.setattr(capture_daemon, "release_freed_heap", recording_trim)
+
+    result = capture_daemon.bootstrap_calibrations(
+        tmp_path, hub=object(), n_frames=3, # type: ignore[arg-type]
+    )
+    gc.collect()
+
+    assert 0 in result
+    assert refs, "the fake capture was never called"
+    assert [r for r in refs if r() is not None] == []
+    assert trims == [("calibration", 0)]
+
+
+def test_bootstrap_calibrations_that_raises_keeps_no_frame_alive_once_the_exception_is_gone(
+    tmp_path, monkeypatch
+):
+    """While the exception lives its traceback pins the failed call's
+    frames (that is why the server trims again after swallowing it); once
+    it is dropped, nothing else may be holding the pool."""
+    import gc
+
+    refs: list = []
+    trims: list[str] = []
+    monkeypatch.setattr(capture_daemon, "_capture_calibration_frames_local", _tracked_frame_capture(refs))
+    _install_fake_orientation_pipeline(monkeypatch, lambda image_bgr, cam, **k: _square_points())
+
+    def failing_calibrate(*a, **k):
+        raise RuntimeError("simulated solve failure")
+
+    monkeypatch.setattr(capture_daemon, "calibrate_camera", failing_calibrate)
+    monkeypatch.setattr(capture_daemon, "release_freed_heap", trims.append)
+
+    with pytest.raises(RuntimeError, match="simulated solve failure") as excinfo:
+        capture_daemon.bootstrap_calibrations(
+            tmp_path, hub=object(), n_frames=3, # type: ignore[arg-type]
+        )
+    del excinfo
+    gc.collect()
+
+    assert refs, "the fake capture was never called"
+    assert [r for r in refs if r() is not None] == []
+    assert trims == ["calibration"]
+
+
 def test_bootstrap_calibrations_retries_with_more_frames_until_target_met(tmp_path, monkeypatch):
     """The real point of this whole change: a camera that does NOT clear
     the target on round 1 must capture MORE frames (not restart from

@@ -82,6 +82,8 @@ airtight.
 """
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
 from opendarts.engines.base import EngineResult
@@ -129,6 +131,20 @@ PRIOR_DART_DROP_MIN_FULL_DISAGREEMENT_MM = 5.0
 # n=13 total data points here, small; re-measure if a future corpus pull
 # produces a real case landing inside this gap).
 MIN_DISAGREEMENT_FOR_VOTE_OVERRIDE_MM = 0.7
+
+# 2026-09-26 -- the override needs cameras that agree on WHERE the dart is,
+# not only on which bed it is in. Of the 10 overrides in the corpus then
+# (1,120 throws, owner-verified), the 4 good ones each had 2 cameras whose
+# own Z=0 points were 2.3-6.1mm apart. Of the 6 bad ones, 2 were a single
+# camera out-voting nobody and 4 had 2 cameras 6.2-24.9mm apart -- one of
+# them a double bull called 25, its two "outer bull" cameras 13mm apart on
+# opposite sides of the bull, their average dead centre. Spread alone
+# cannot split 6.1 (good) from 6.2 (bad), so the limit sits in the wide
+# gap above them instead: it blocks the gross disagreements (13mm and
+# up) and leaves that one bad case, which did not change the primary
+# call. Re-measure when a larger corpus is at hand.
+MIN_CAMERAS_FOR_VOTE_OVERRIDE = 2
+MAX_VOTE_OVERRIDE_SPREAD_MM = 10.0
 
 
 def _single_ray_board_xy(
@@ -237,9 +253,20 @@ def _per_camera_vote_override(
         return result
 
     agreeing = sorted(votes[majority_bed])
-    xs = [vote_xy[c][0] for c in agreeing]
-    ys = [vote_xy[c][1] for c in agreeing]
+    if len(agreeing) < MIN_CAMERAS_FOR_VOTE_OVERRIDE:
+        return result
+    points = [vote_xy[c] for c in agreeing]
+    spread = max(math.dist(p, q) for p in points for q in points)
+    if spread > MAX_VOTE_OVERRIDE_SPREAD_MM:
+        return result
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
     new_xy = (float(np.mean(xs)), float(np.mean(ys)))
+    if sector_ring_for_point(*new_xy) != majority_bed:
+        # The average of points in one bed can land in another (two votes
+        # either side of the bull average to its centre); never report a
+        # position that contradicts the call.
+        return result
     new_sector, new_ring = majority_bed
     old_sector, old_ring = result.sector, result.ring
     return ScoreResult(

@@ -561,6 +561,40 @@ def test_save_calibration_package_background_registers_in_flight_before_thread_s
     )
 
 
+def test_save_calibration_package_background_releases_its_frames_and_trims_when_done(tmp_path):
+    """The background save is the last holder of a calibration's raw frame
+    pool (~1 GB at peak on the rig). Once it has finished, the frames must
+    be unreachable even while the Thread object itself is still referenced,
+    and the freed heap handed back -- see opendarts.live.heap_trim."""
+    import gc
+    import unittest.mock as mock
+    import weakref
+
+    frames = _synthetic_frames(3)
+    refs = [weakref.ref(f) for f in frames]
+    trims: list[tuple[str, int]] = []
+
+    def recording_trim(reason):
+        # What matters is what is still alive AT the trim -- a trim that
+        # runs while the closure still holds the pool frees nothing.
+        gc.collect()
+        trims.append((reason, sum(r() is not None for r in refs)))
+
+    with mock.patch.object(calib_pkg, "release_freed_heap", recording_trim):
+        thread = calib_pkg.save_calibration_package_background(
+            tmp_path / "calibration_packages", "calib_release",
+            {0: frames}, {0: _fake_calibration()},
+        )
+        del frames
+        thread.join(timeout=30)
+    gc.collect()
+
+    assert not thread.is_alive()
+    assert (tmp_path / "calibration_packages" / "calib_release").exists()
+    assert [r for r in refs if r() is not None] == []
+    assert trims == [("calibration package save", 0)]
+
+
 def test_concurrent_background_saves_do_not_delete_each_others_in_flight_package(tmp_path):
     """End-to-end reproduction of the real race the guard was built for:
     package A's background save is still encoding (slow, held open via

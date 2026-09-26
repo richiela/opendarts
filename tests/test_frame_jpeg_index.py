@@ -89,3 +89,71 @@ def test_an_equal_but_different_array_gets_no_bytes():
     frames = hub.grab_all()
     idx.record(hub, frames)
     assert idx.lookup({c: a.copy() for c, a in frames.items()}) == {}
+
+
+# -- the ring generation rides along ---------------------------------------
+
+
+class _PairedHub(_Hub):
+    """grab_paired(): the frame, its bytes (None for a pixels-only slot)
+    and the ring generation that published it, read together."""
+
+    def __init__(self):
+        super().__init__()
+        self.generations: dict[int, int] = {}
+
+    def publish(self, tick: int, cams=(0, 1, 2), jpeg_cams=(0, 1, 2)):
+        super().publish(tick, cams)
+        for c in cams:
+            self.generations[c] = tick
+            if c not in jpeg_cams:
+                self.jpegs.pop(c, None)
+
+    def grab_paired(self, i):
+        return self.frames.get(i), self.jpegs.get(i), self.generations.get(i)
+
+
+def test_generations_are_paired_with_the_frame_fetched_at_the_same_tick():
+    hub, idx = _PairedHub(), _FrameJpegIndex()
+    hub.publish(7, jpeg_cams=(0, 1))          # cam2 is a pixels-only slot
+    frames = hub.grab_all()
+    idx.record(hub, frames)
+    assert idx.lookup_generations(frames) == {0: 7, 1: 7, 2: 7}
+    # a pixels-only slot gets its generation but, as before, no bytes
+    assert idx.lookup(frames) == {0: b"jpeg-t7-c0", 1: b"jpeg-t7-c1"}
+
+
+def test_a_pump_cycle_between_fetch_and_pairing_yields_no_generation():
+    """Same rule as the bytes: a frame not provably the one the hub named
+    gets no number, so its package gets the stills clip -- never a clip
+    taken from the wrong ring set."""
+    hub, idx = _PairedHub(), _FrameJpegIndex()
+    hub.publish(1)
+    frames = hub.grab_all()
+    hub.publish(2, cams=(1,))
+    idx.record(hub, frames)
+    assert idx.lookup_generations(frames) == {0: 1, 2: 1}
+
+
+def test_a_pinned_reference_keeps_its_generation():
+    """The bg is adopted many ticks before the dart that scores against
+    it; the clip needs its generation on that later tick."""
+    hub, idx = _PairedHub(), _FrameJpegIndex(keep_ticks=2)
+    hub.publish(1)
+    reference = hub.grab_all()
+    idx.record(hub, reference)
+    idx.pin(reference)
+    for tick in range(2, 10):
+        hub.publish(tick)
+        idx.record(hub, hub.grab_all())
+        idx.pin(reference)
+    assert idx.lookup_generations(reference) == {0: 1, 1: 1, 2: 1}
+
+
+def test_a_hub_without_grab_paired_gives_bytes_but_no_generations():
+    hub, idx = _Hub(), _FrameJpegIndex()
+    hub.publish(1)
+    frames = hub.grab_all()
+    idx.record(hub, frames)
+    assert idx.lookup_generations(frames) == {}
+    assert len(idx.lookup(frames)) == 3

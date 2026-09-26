@@ -168,7 +168,7 @@ def _attach_ad_gt(
 def test_root_returns_200_html(package_root):
     app = create_app(package_root=package_root, enable_background_poll=False)
     client = TestClient(app)
-    resp = client.get("/")
+    resp = client.get("/?ui=classic")
     assert resp.status_code == 200
     assert "text/html" in resp.headers["content-type"]
     assert "opendarts live dashboard" in resp.text
@@ -196,7 +196,7 @@ def test_root_html_has_four_real_tabs(package_root):
     gone rather than unlinked."""
     app = create_app(package_root=package_root, enable_background_poll=False)
     client = TestClient(app)
-    html = client.get("/").text
+    html = client.get("/?ui=classic").text
 
     for tab in ("scoring", "engines", "config", "info"):
         assert f'data-tab="{tab}"' in html
@@ -283,7 +283,7 @@ def test_root_html_has_a_real_placeholder_element_per_camera(package_root):
     JavaScript manages to run.
     """
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     assert 'id="cam-placeholder-0"' in html
     assert 'class="cam-placeholder"' in html
@@ -309,7 +309,7 @@ def test_camera_feed_error_handler_swaps_in_the_placeholder_not_just_status_text
     is still what stands between the operator and a broken-image
     icon."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     assert "function updateCameraFeeds()" in html
     start_idx = html.index("function updateCameraFeeds()")
@@ -336,7 +336,7 @@ def test_camera_feed_load_handler_restores_the_real_image(package_root):
     on CAMERA_FEED_TICK_MS and binds onload/onerror fresh per attempt --
     this proves the onload side actually reverses what onerror did."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     start_idx = html.index("function updateCameraFeeds()")
     end_idx = html.index("\n}", start_idx)
@@ -375,7 +375,7 @@ def test_camera_feed_load_handler_restores_the_real_image(package_root):
 
 def test_root_html_has_a_sticky_header(package_root):
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     assert '<header class="top">' in html
     # The sticky/flex-0 CSS rule for header.top -- proves this isn't just
@@ -390,7 +390,7 @@ def test_root_html_has_od_style_grid_layout(package_root):
     stage) -- the `display: grid; grid-template-columns: var(--side-w)
     1fr;` pattern, not a flat single-column page."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     assert '<main class="layout">' in html
     assert "main.layout {" in html
@@ -400,7 +400,7 @@ def test_root_html_has_od_style_grid_layout(package_root):
 
 def test_root_html_has_sidebar_with_controls_heading(package_root):
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     assert '<aside class="sidebar">' in html
     assert '<section class="side-block">' in html
@@ -416,7 +416,7 @@ def test_sidebar_start_stop_reset_calibrate_are_all_real_and_enabled(package_roo
     capability that doesn't exist" rule, applied in the OTHER direction
     now: a real capability must not be left looking disabled either)."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     for btn_id, label in (
         ("btn-start", "Start"),
@@ -444,7 +444,7 @@ def test_sidebar_calibrate_button_is_wired_to_the_refresh_endpoint(package_root)
     real POST /api/calibration/refresh endpoint, moved here (not
     duplicated) from its old home inside the Cameras tab."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     marker = 'id="btn-refresh-calib"'
     assert marker in html
@@ -471,7 +471,7 @@ def test_import_ad_omitted_not_faked(package_root):
     Checked against the html with HTML COMMENTS STRIPPED: what must be
     absent is rendered UI, not words in an explanatory comment."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
     rendered = re.sub(r"<!--.*?-->", "", html, flags=re.DOTALL)
 
     assert "Import" not in rendered
@@ -486,7 +486,7 @@ def test_root_html_has_stage_holding_the_tabs(package_root):
     (the right column), not floating at the top level the way the old
     flat <main> used to hold them."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     stage_start = html.index('<section class="stage">')
     stage_end = html.index("</section>", stage_start)
@@ -519,7 +519,7 @@ def test_all_preserved_tab_functionality_survives_the_relocation(package_root):
     single broad smoke test tying them together post-relocation, not a
     replacement for those."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     # Status pill, still in the header, still wired.
     assert 'class="status-pill" id="status-pill"' in html
@@ -640,6 +640,31 @@ def test_refresh_calibration_local_mode_degrades_gracefully_without_a_hub(packag
 
     assert data["calibrations"] == {}
     assert "calibration_error" in data
+
+
+def test_refresh_calibration_failure_trims_the_heap_after_dropping_the_exception(
+    package_root, monkeypatch
+):
+    """A failed calibration's frames stay pinned by its traceback until the
+    exception is gone, so bootstrap_calibrations()'s own trim cannot free
+    them -- the refresh path must trim again once it has swallowed it. See
+    opendarts.live.heap_trim."""
+    app = create_app(package_root=package_root, enable_background_poll=False)
+    state = app.state.opendarts_state
+    state.hub = object() # non-None, and no .configs, so the readiness poll is skipped
+
+    def failing_bootstrap(*a, **k):
+        raise RuntimeError("simulated refusal")
+
+    trims: list[str] = []
+    monkeypatch.setattr(server_module, "bootstrap_calibrations", failing_bootstrap)
+    monkeypatch.setattr(server_module, "release_freed_heap", trims.append)
+
+    data = state._refresh_calibration_blocking() # noqa: SLF001 -- test needs the blocking call directly
+
+    assert data["calibration_error"] == "simulated refusal"
+    assert data["raw_calibrations"] == {}
+    assert trims == ["failed calibration"]
 
 
 # --------------------------------------------------------------------------
@@ -2257,7 +2282,7 @@ def test_websocket_events_hello_count_reflects_the_true_total_past_the_20_cap(
 
 def test_root_html_has_status_pill_wired_to_all_real_throw_states(package_root):
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     assert 'class="status-pill" id="status-pill"' in html
     assert 'id="status-dot"' in html
@@ -2307,7 +2332,7 @@ def test_status_pill_manual_calibrate_flag_has_a_correctly_ordered_lifecycle(pac
     Starting's own color.
     """
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     # Declared false (renderPill()'s own default, before any click).
     assert "let manualCalibrating = false;" in html
@@ -2605,7 +2630,7 @@ def test_status_pill_primary_axis_covers_every_real_capture_loop_state(package_r
     JS with the real labels the pill renders -- not just implied by the
     old single-axis TRIGGER_STATE_INFO this replaced."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     assert "PRIMARY_INFO" in html
     for key, label in (
@@ -2628,7 +2653,7 @@ def test_status_pill_waiting_state_covers_both_starting_and_manual_calibrate(pac
     it still says Throw" bug) -- this guards both reasons stay wired to
     the same WAITING label, not just the Start-time one."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     assert "manualCalibrating" in html
     assert "PRIMARY_INFO.WAITING" in html
@@ -2646,7 +2671,7 @@ def test_status_pill_phase_axis_still_covers_every_real_throw_state(package_root
     ThrowState names) must still all be mapped -- same regression guard
     the old TRIGGER_STATE_INFO-based test had, now against PHASE_DETAIL."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     assert "PHASE_DETAIL" in html
     for state_name in (
@@ -2667,7 +2692,7 @@ def test_status_pill_renders_capture_loop_lifecycle_ahead_of_stale_trigger_state
     browser in this suite): the shipped renderPill() checks `cl.running`
     and `cl.starting` before ever consulting PHASE_DETAIL."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
     assert "function renderPill()" in html
     idx_running_check = html.index("if (cl && !cl.running)")
     idx_starting_check = html.index("if (cl && cl.starting)")
@@ -3046,7 +3071,7 @@ def test_action_log_and_shared_busy_state_are_wired_into_every_control_button(pa
     structure" pattern for JS-behavior tests that can't run a real
     browser."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     assert 'id="action-log"' in html
     assert "function logAction(" in html
@@ -3080,7 +3105,7 @@ def test_auto_calibrate_confirmation_wired_into_websocket_handler(package_root):
     updating the pill's Starting detail AND logging a real action-log
     line -- not silently ignoring the extra field."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
     assert "msg.source === 'startup'" in html
     assert "startingCalibDetail" in html
     assert "'Calibrate (auto, on Start)'" in html
@@ -3189,7 +3214,7 @@ def test_scoring_tab_html_has_ad_comparison_columns(package_root):
     # by engineSectionsFor()'s row-per-engine structure and the AD row's
     # own "AD" engine-column label.
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     assert "AD sector" not in html
     assert "AD ring" not in html
@@ -3212,7 +3237,7 @@ def test_scoring_tab_captured_time_renders_in_browser_local_time(package_root):
     (not a UTC-string-slice) rather than trying to fake a browser time
     zone in this backend-only test suite."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     assert "function fmtCaptured" in html
     assert "new Date(iso)" in html
@@ -3234,7 +3259,7 @@ def test_scoring_tab_ad_wrong_button_shown_only_when_theres_a_miss(package_root)
     still always shows (badge + Unmark). White-box source check, same style
     as the rest of this file's shipped-JS-behavior tests."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     assert "function fmtAdWrongCell(p, sections)" in html
     assert "sector_match === false" in html  # a real miss needs AD to have answered
@@ -3255,7 +3280,7 @@ def test_scoring_tab_manual_ad_refresh_button_removed(package_root):
     package-save time by capture_daemon._attach_ad_ground_truth_from_ws();
     batch repair lives in dev/ad/backfill_ad_ground_truth.py."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     assert 'id="btn-refresh-ad"' not in html
     assert 'id="ad-refresh-status"' not in html
@@ -3299,7 +3324,7 @@ def test_scoring_tab_manual_ad_refresh_button_removed(package_root):
 
 def test_scoring_tab_html_has_start_new_session_view_controls(package_root):
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     assert 'id="btn-new-session-view"' in html
     # 2026-08-13, the verbiage was replaced by a small Clear
@@ -3336,7 +3361,7 @@ def test_new_session_view_buttons_are_purely_client_side_no_network_call(package
     button's actual onclick handler body out of the rendered page and
     asserts neither references any /api endpoint."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     def _handler_body(marker: str) -> str:
         start = html.index(marker)
@@ -3376,7 +3401,7 @@ def test_client_side_filter_predicate_matches_shipped_js(package_root):
     from datetime import datetime, timezone
 
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
     shipped_predicate = "Date.parse(p.captured_at_utc) >= viewFilterSinceMs"
     assert shipped_predicate in html, (
         "the shipped JS filter predicate changed -- update this test's "
@@ -3417,7 +3442,7 @@ def test_ingest_packages_is_the_single_entry_point_for_every_live_data_path(pack
     throws still show up live while filtered" without any other test
     catching it."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     assert "ingestPackages(await pkgResp.json())" in html
     assert html.count("ingestPackages(msg.packages)") == 2 # HELLO + PACKAGES_UPDATED
@@ -3439,7 +3464,7 @@ def test_check_package_count_and_resync_wired_to_both_hello_and_packages_updated
     a fresh HELLO (a new tab landing between loadInitial() and the
     first HELLO) just as much as on a PACKAGES_UPDATED push."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     assert html.count("checkPackageCountAndResync(msg.count)") == 2 # HELLO + PACKAGES_UPDATED
 
@@ -3541,7 +3566,7 @@ def test_no_delete_or_file_removal_code_path_for_view_filter_feature(package_roo
 
     app = create_app(package_root=package_root, enable_background_poll=False)
     client = TestClient(app)
-    html = client.get("/").text
+    html = client.get("/?ui=classic").text
 
     def _handler_body(marker: str) -> str:
         start = html.index(marker)
@@ -3632,7 +3657,7 @@ def test_api_logs_returns_tail_of_real_file(package_root, monkeypatch, tmp_path)
 
 def test_scoring_table_has_row_number_column(package_root):
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
     assert "<th>#</th>" in html
     # colspan history, because this number has moved three times and the
     # reason matters more than the value: 8 -> 7 on 2026-08-13, when the
@@ -3660,7 +3685,7 @@ def test_scoring_table_has_one_col_width_per_header_column(package_root):
     the table."""
     import re
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
     table = html[html.index('id="packages-table"'):]
     table = table[:table.index("</table>")]
     cols = re.findall(r"<col class=\"(col-[\w-]+)\">", table)
@@ -3683,7 +3708,7 @@ def test_row_number_formula_is_chronological_oldest_is_1(package_root):
     Python against a fake newest-first list -- exactly the shape
     renderScoringTable() passes to renderPackages()."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
     assert "const n = packages.length;" in html
     assert "(n - i)" in html, (
         "the shipped row-number formula changed -- update this test's "
@@ -3710,7 +3735,7 @@ def test_row_numbers_are_scoped_to_the_currently_visible_set_not_full_history(pa
     'dart 5' means to someone watching a live session. Proven structurally (the real call site),
     not just asserted in a comment."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
     assert "renderPackages(visible, emptyMessage)" in html
     assert "renderPackages(all," not in html
 
@@ -3935,7 +3960,7 @@ def test_api_packages_surfaces_operator_fields_default_false_none_when_never_mar
 
 def test_scoring_tab_html_has_ad_wrong_controls_and_tally_bar(package_root):
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     assert 'id="engine-tally-bar"' in html
     assert "ad-wrong-btn" in html
@@ -3954,7 +3979,7 @@ def test_engine_tally_scoped_to_visible_packages_python_mirror(package_root):
     way as this file's other HTML/JS-structure tests: assert the literal
     shipped scoping, then mirror the count logic in Python."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
     assert "renderEngineTally(visible)" in html
 
     def _compute_tally(visible: list) -> dict:
@@ -4321,7 +4346,7 @@ def test_dashboard_ships_the_which_was_right_modal(package_root):
     asserts the real shipped markup/handlers, the same convention the
     rest of this file's frontend tests use."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     for needle in [
         'id="ad-wrong-modal"',
@@ -4360,7 +4385,7 @@ def test_dashboard_js_opens_the_modal_on_mark_and_posts_only_on_confirm(package_
     straight away (nothing to ask); the modal's own Confirm is what sends
     the confirmed_* fields."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     # The row button no longer fetches directly -- it opens the modal.
     assert "openAdWrongModal(session, throwId);" in html
@@ -4385,7 +4410,7 @@ def test_ad_row_shows_the_confirmed_truth_and_fails_ad_when_it_differs(package_r
     human confirms a DIFFERENT segment it gets an explicit FAIL plus a
     badge naming the confirmed answer and its source."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     assert "if (p.ad_operator_confirmed_ring) {" in html
     assert "const adDiffers = (p.ad_operator_confirmed_sector !== p.ad_sector)" in html
@@ -4405,7 +4430,7 @@ def test_engine_tally_prefers_operator_truth_python_mirror(package_root):
     test_engine_tally_scoped_to_visible_packages_python_mirror above:
     assert the literal shipped condition, then mirror it in Python."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
     assert "const adWasAsked = (p.ad_matched === true || p.ad_matched === false);" in html
     assert ("if (adWasAsked && (p.ad_matched !== false || p.ad_operator_confirmed_ring)) {"
             in html)
@@ -4803,7 +4828,7 @@ class TestDeleteRecordedData:
         """The empty case never reaches a confirm() -- an "are you sure"
         over nothing is a dialog that teaches people to click through
         dialogs."""
-        html = self._client(package_root, tmp_path / "captures").get("/").text
+        html = self._client(package_root, tmp_path / "captures").get("/?ui=classic").text
         handler = _delete_handler_source(html)
         assert "nothing to delete" in handler
         assert "no throw packages and no captures" in handler
@@ -4870,7 +4895,7 @@ class TestDeleteRecordedData:
 
         client = self._client(package_root, capture_root)
         snapshot = client.get("/api/recorded-data").json()
-        html = client.get("/").text
+        html = client.get("/?ui=classic").text
 
         helpers = html[html.index("function countLabel("):
                        html.index("document.getElementById('btn-delete-recorded')")]
@@ -4902,7 +4927,7 @@ class TestDeleteRecordedData:
 
         client = self._client(package_root, capture_root)
         snapshot = client.get("/api/recorded-data").json()
-        html = client.get("/").text
+        html = client.get("/?ui=classic").text
         helpers = html[html.index("function countLabel("):
                        html.index("document.getElementById('btn-delete-recorded')")]
         script = tmp_path / "phrase.js"
@@ -4923,7 +4948,7 @@ class TestDeleteRecordedData:
         reach window.confirm() before the destructive POST. The COUNTING
         fetch is deliberately allowed to come first: it reads and deletes
         nothing, and it is where the numbers in the question come from."""
-        html = self._client(package_root, tmp_path / "captures").get("/").text
+        html = self._client(package_root, tmp_path / "captures").get("/?ui=classic").text
         handler = _delete_handler_source(html)
         assert "window.confirm(" in handler
         assert handler.index("window.confirm(") < handler.index("/api/packages/delete-all")
@@ -4934,7 +4959,7 @@ class TestDeleteRecordedData:
         """The label is the only description most operators will ever read
         of what this button takes, and it took captures silently for as
         long as it said "packages"."""
-        html = self._client(package_root, tmp_path / "captures").get("/").text
+        html = self._client(package_root, tmp_path / "captures").get("/?ui=classic").text
         start = html.index('id="btn-delete-recorded"')
         button = html[start:html.index("</button>", start)]
         assert ">Delete recorded data" in button
@@ -5083,7 +5108,7 @@ def test_detection_speed_options_are_ordered_fast_to_safe_without_ad_labels(pack
     """Values 1..5 in order, 1 the fastest and 5 the safest, and no
     extra captions anywhere in the control."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    full_html = TestClient(app).get("/").text
+    full_html = TestClient(app).get("/?ui=classic").text
 
     # Scope to THIS select first. The camera-timeout select above it also
     # has an <option value="5"> ("5 min"), so an unscoped search finds
@@ -5132,7 +5157,7 @@ def test_calibrate_click_puts_camera_badges_into_a_calibrating_state(package_roo
     click handler calls it alongside the overlay reset, and the failure
     path re-reads real state instead of stranding the badge."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     assert "function setCalibratingBadges()" in html
     assert 'class="badge warn">calibrating' in html
@@ -5163,7 +5188,7 @@ def test_ad_latency_column_is_coloured_by_who_answered_first(package_root):
     green, a negative one red. Exactly zero stays neutral: rounding can
     arrive there from either direction."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     start = html.index("function fmtLatency(")
     fn = html[start:html.index("\n}", start)]
@@ -5272,7 +5297,7 @@ def test_ad_status_note_lives_inside_the_oracle_field(package_root):
     is right, renderAdConfig() fills it, and it is in the wrong place.
     """
     client, _hub = _client_with_hub(package_root)
-    html = client.get("/").text
+    html = client.get("/?ui=classic").text
 
     # Inside the Autodarts card, after its select -- not in any container
     # that follows the closing </div> of the config-grid.
@@ -5307,7 +5332,7 @@ def test_config_field_notes_reserve_space_so_a_changing_note_cannot_move_the_pag
     beside it moved too -- the whole tab shifted under the operator while
     they were reaching for a control."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     rule_start = html.index(".config-field-note {")
     rule = html[rule_start:html.index("}", rule_start)]
@@ -5327,7 +5352,7 @@ def test_config_text_input_is_styled_like_the_selects_beside_it(package_root):
     different kind of control rather than the same control holding
     text."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     start = html.index(".config-field select")
     selector = html[start:html.index("{", start)]
@@ -5349,7 +5374,7 @@ def test_camera_cards_do_not_stretch_to_each_other(package_root):
     two untouched cards gained the same empty height and it read as
     "clicking one opened all of them"."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     start = html.index(".cams {")
     rule = html[start:html.index("}", start)]
@@ -5368,7 +5393,7 @@ def test_the_test_button_is_gated_on_this_browser_having_the_clips(package_root)
     The ASSIGNMENT, not a mention -- a test matching the identifier
     anywhere would pass on a comment about it."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     import re as _re
 
@@ -5386,7 +5411,7 @@ def test_config_tab_does_not_claim_cameras_refresh_every_three_seconds(package_r
     snapshot poll to describe any more, and how the picture arrives was
     never something the operator could act on."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
     # Comments stripped first: the engineering note that records WHY the
     # line went away has to be free to quote it.
     import re as _re
@@ -5401,7 +5426,7 @@ def test_camera_device_options_carry_no_uncertainty_marker(package_root):
     asking the operator to resolve a doubt they cannot resolve from this
     page. The device number beside it was exact the whole time."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     fn_start = html.index("function cameraDeviceOptionsHtml(")
     fn = html[fn_start:html.index("\n}", fn_start)]
@@ -5419,7 +5444,7 @@ def test_camera_assignment_selector_lives_on_the_preview_card(package_root):
     page, and the only question it answers -- 'is this slot pointed at the
     right camera' -- is answerable only while looking at the picture."""
     client, _hub = _client_with_hub(package_root)
-    html = client.get("/").text
+    html = client.get("/?ui=classic").text
     assert 'id="cam-device-0"' in html
     assert "cam-device-select" in html
     # Standalone section and Save button are gone: the preview IS the
@@ -5440,7 +5465,7 @@ def test_camera_selector_is_styled_and_sits_below_the_preview(package_root):
     still looks broken.
     """
     client, _hub = _client_with_hub(package_root)
-    html = client.get("/").text
+    html = client.get("/?ui=classic").text
 
     assert ".cam-device-select {" in html, "the selector has no style rule"
     # appearance:none is load-bearing -- the OS arrow is the one part of a
@@ -5521,7 +5546,7 @@ def test_one_paste_can_fill_every_camera_slot(package_root):
     in every realistic setup, so the box is checked by default.
     """
     client, _hub = _client_with_hub(package_root)
-    html = client.get("/").text
+    html = client.get("/?ui=classic").text
 
     assert 'id="cam-url-all"' in html, "no all-cameras control in the modal"
     assert "checked" in html[html.index('id="cam-url-all"'):html.index('id="cam-url-all"') + 120]
@@ -5803,7 +5828,7 @@ def test_ad_config_honest_when_no_listener_is_wired(package_root, no_config_writ
 
 def test_root_html_exposes_the_ad_oracle_controls(package_root):
     client, _ = _ad_client(package_root)
-    html = client.get("/").text
+    html = client.get("/?ui=classic").text
     assert 'id="ad-enabled-toggle"' in html
     assert 'id="ad-base-url"' in html
 
@@ -5826,7 +5851,7 @@ def test_packages_table_omits_the_ad_row_when_ad_was_never_asked(package_root):
     """
     html = TestClient(
         create_app(package_root=package_root, enable_background_poll=False)
-    ).get("/").text
+    ).get("/?ui=classic").text
     assert "const adAsked = (p.ad_matched === true);" in html
     assert "let html = !adAsked ? '' : (" in html
     # the old "no data yet" BADGE is gone from the markup, not merely
@@ -5842,7 +5867,7 @@ def test_packages_table_promotes_the_primary_row_when_there_is_no_ad_row(package
     throw above it."""
     html = TestClient(
         create_app(package_root=package_root, enable_background_poll=False)
-    ).get("/").text
+    ).get("/?ui=classic").text
     assert "sections.map((s, si)" in html
     assert "(!adAsked && si === 0 ? (n - i) : '')" in html
     assert "(!adAsked && si === 0 ? fmtCaptured(p.captured_at_utc) : '')" in html
@@ -6023,7 +6048,7 @@ def test_engine_tally_skips_throws_with_no_reference_to_grade_against(package_ro
     Same convention as the other tally mirrors here: assert the literal
     shipped condition, then mirror it in Python."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
     assert ("if (s.sector_match === null || s.sector_match === undefined) continue;"
             in html)
 
@@ -6045,7 +6070,7 @@ def test_engine_tally_still_counts_an_engine_that_ran_and_failed(package_root):
     it had its shot and missed, so it stays in the denominator."""
     html = TestClient(
         create_app(package_root=package_root, enable_background_poll=False)
-    ).get("/").text
+    ).get("/?ui=classic").text
     # The guard keys on null/undefined only, never on ok/timed_out.
     assert "s.sector_match === null || s.sector_match === undefined" in html
     assert "bump(s.name, s.sector_match === true);" in html
@@ -6129,7 +6154,7 @@ def test_a_calibrated_camera_is_not_taken_off_its_stream(package_root):
     used to skip the stream entirely for any camera whose overlay was on,
     handing the tile to a 3-second still."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
     fn_start = html.index("function updateCameraFeeds()")
     fn = html[fn_start:html.index("\n}", fn_start)]
     assert "camOverlayOn" not in fn, (
@@ -6141,7 +6166,7 @@ def test_a_calibrated_camera_is_not_taken_off_its_stream(package_root):
 
 def test_the_overlay_is_layered_over_the_stream_not_swapped_into_it(package_root):
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
     assert 'id="cam-overlay-0"' in html and 'class="cam-overlay"' in html
     assert 'id="cam-img-0"' in html
     # Positioned over the picture, and never intercepting a click.
@@ -6158,7 +6183,7 @@ def test_the_overlay_is_not_on_a_timer(package_root):
     """It changes only when calibration is re-derived. A 3-second poll for
     a picture of a stationary board was work with nothing to find."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    js = TestClient(app).get("/").text.split("<script>")[-1].split("</script>")[0]
+    js = TestClient(app).get("/?ui=classic").text.split("<script>")[-1].split("</script>")[0]
 
     import re as _re
 
@@ -6175,7 +6200,7 @@ def test_the_overlay_hides_when_there_is_no_live_picture_under_it(package_root):
     """A layer floating over a black "No signal" placeholder claims a
     calibration is being confirmed against a camera that is not running."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    js = TestClient(app).get("/").text.split("<script>")[-1].split("</script>")[0]
+    js = TestClient(app).get("/?ui=classic").text.split("<script>")[-1].split("</script>")[0]
     fn_start = js.index("function refreshCalibrationOverlays()")
     fn = js[fn_start:js.index("\n}", fn_start)]
     assert "camStreamState[c] !== 'live'" in fn
@@ -6417,7 +6442,7 @@ def test_calibrate_action_line_reports_how_long_it_took(package_root):
     ready", ~2s) and a slow failure are different problems, and the
     duration is what distinguishes them."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    js = TestClient(app).get("/").text.split("<script>")[-1].split("</script>")[0]
+    js = TestClient(app).get("/?ui=classic").text.split("<script>")[-1].split("</script>")[0]
 
     start = js.index("btn-refresh-calib').onclick")
     handler = js[start:js.index("\n};", start)]
@@ -6552,7 +6577,7 @@ def test_dashboard_diagnostics_uses_only_helpers_that_exist():
 
 def test_diagnostics_table_and_copy_button_are_rendered():
     app = create_app(package_root=Path(tempfile.mkdtemp()), enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     assert 'id="diagnostics-tbody"' in html
     assert 'id="btn-copy-diagnostics"' in html
@@ -6577,7 +6602,7 @@ def test_camera_tile_paints_the_placeholder_before_js_runs(package_root):
     """
     html = TestClient(
         create_app(package_root=package_root, enable_background_poll=False)
-    ).get("/").text
+    ).get("/?ui=classic").text
 
     for cam in range(3):
         img_start = html.index(f'id="cam-img-{cam}"')
@@ -6600,7 +6625,7 @@ def test_camera_subrow_labels_the_preview_so_it_cannot_read_as_calibration(packa
     running."""
     html = TestClient(
         create_app(package_root=package_root, enable_background_poll=False)
-    ).get("/").text
+    ).get("/?ui=classic").text
 
     assert '<span class="cam-subrow-label">preview</span>' in html
     for cam in range(3):
@@ -6619,7 +6644,7 @@ def test_absent_reprojection_says_why_when_the_calibration_is_good(package_root)
     """
     html = TestClient(
         create_app(package_root=package_root, enable_background_poll=False)
-    ).get("/").text
+    ).get("/?ui=classic").text
 
     assert "'not measured'" in html, "an absent-but-valid reprojection must explain itself"
     assert "calib-metric-absent" in html, "and be styled as absent rather than as a failure"
@@ -6914,7 +6939,7 @@ def test_the_cache_cannot_grow_without_bound(monkeypatch):
 def test_the_info_tab_has_a_publishing_section(package_root):
     client = TestClient(create_app(package_root=package_root,
                                    enable_background_poll=False))
-    html = client.get("/").text
+    html = client.get("/?ui=classic").text
     assert '<h2 class="config-section-title">Publishing</h2>' in html
     assert 'id="publish-tbody"' in html
     # Between the rig's own facts and the Copy-diagnostics button, so a
@@ -6932,7 +6957,7 @@ def test_publishing_is_refreshed_not_loaded_once(package_root):
     app."""
     client = TestClient(create_app(package_root=package_root,
                                    enable_background_poll=False))
-    html = client.get("/").text
+    html = client.get("/?ui=classic").text
     block = html[html.index("renderDiagnostics(state.config);"):]
     block = block[:block.index("}") + 1]
     assert "refreshPublishing()" in block
@@ -6946,7 +6971,7 @@ def test_a_format_mismatch_is_called_out_rather_than_left_to_the_reader(package_
     them is how this went unnoticed for an afternoon."""
     client = TestClient(create_app(package_root=package_root,
                                    enable_background_poll=False))
-    html = client.get("/").text
+    html = client.get("/?ui=classic").text
     fn = html[html.index("function renderPublishing"):]
     fn = fn[:fn.index("function fourccMatches")]
     assert "fourccMatches" in fn, "the requested/actual formats must be compared"
@@ -6959,7 +6984,7 @@ def test_the_fourcc_comparison_knows_the_two_spellings(package_root):
     comparison would flag every healthy rig as mismatched."""
     client = TestClient(create_app(package_root=package_root,
                                    enable_background_poll=False))
-    html = client.get("/").text
+    html = client.get("/?ui=classic").text
     fn = html[html.index("function fourccMatches"):]
     fn = fn[:fn.index("async function refreshPublishing")]
     for pair in ("'BGR24'", "'BGR3'", "'MJPEG'", "'MJPG'"):
@@ -6971,7 +6996,7 @@ def test_not_publishing_says_what_it_means_for_autodarts(package_root):
     consequence and the row should state it."""
     client = TestClient(create_app(package_root=package_root,
                                    enable_background_poll=False))
-    html = client.get("/").text
+    html = client.get("/?ui=classic").text
     fn = html[html.index("function renderPublishing"):]
     fn = fn[:fn.index("function fourccMatches")]
     assert "not publishing" in fn
@@ -6987,7 +7012,7 @@ def test_publishing_renders_the_windows_backend_too(package_root):
     Linux shape would show a Windows rig a row of 'unknown'."""
     client = TestClient(create_app(package_root=package_root,
                                    enable_background_poll=False))
-    html = client.get("/").text
+    html = client.get("/?ui=classic").text
     fn = html[html.index("function renderPublishing"):]
     fn = fn[:fn.index("function fourccMatches")]
 
@@ -7256,7 +7281,7 @@ def test_the_engines_tab_note_is_silent_while_there_is_room(
     client = TestClient(create_app(package_root=package_root,
                                    enable_background_poll=False))
     cfg = client.get("/api/state").json()["config"]
-    el = _run_note_renderer(tmp_path, client.get("/").text, cfg)
+    el = _run_note_renderer(tmp_path, client.get("/?ui=classic").text, cfg)
     assert el["hidden"] is True
     assert el["textContent"] == ""
 
@@ -7274,7 +7299,7 @@ def test_the_engines_tab_note_says_what_has_stopped_below_the_floor(
     client = TestClient(create_app(package_root=package_root,
                                    enable_background_poll=False))
     cfg = client.get("/api/state").json()["config"]
-    el = _run_note_renderer(tmp_path, client.get("/").text, cfg)
+    el = _run_note_renderer(tmp_path, client.get("/?ui=classic").text, cfg)
     assert el["hidden"] is False
     assert el["textContent"] == (
         "Only 2.00 GB free — below the 5.00 GB floor. Throw packages are not "
@@ -7290,7 +7315,7 @@ def test_the_info_tab_renders_disk_in_gb_with_a_threshold(package_root):
     knowing whether that is most of the disk or the last of it."""
     client = TestClient(create_app(package_root=package_root,
                                    enable_background_poll=False))
-    html = client.get("/").text
+    html = client.get("/?ui=classic").text
     assert "function fmtDisk" in html
     fn = html[html.index("function fmtDisk"):]
     fn = fn[:fn.index("function diagVal")]
@@ -7307,7 +7332,7 @@ def test_the_disk_row_is_not_double_escaped(package_root):
     is worse than no badge."""
     client = TestClient(create_app(package_root=package_root,
                                    enable_background_poll=False))
-    html = client.get("/").text
+    html = client.get("/?ui=classic").text
     block = html[html.index("const preRendered"):]
     block = block[:block.index("}") + 1] if "}" in block[:400] else block[:400]
     assert "'disk'" in block
@@ -7328,7 +7353,7 @@ def test_the_disk_row_is_not_double_escaped(package_root):
 def test_the_top_bar_has_a_sound_indicator(package_root):
     client = TestClient(create_app(package_root=package_root,
                                    enable_background_poll=False))
-    html = client.get("/").text
+    html = client.get("/?ui=classic").text
     assert 'id="audio-indicator"' in html
     # In the header, beside the connection badge -- not buried in Config,
     # which is the tab you go to when you already suspect something.
@@ -7341,7 +7366,7 @@ def test_the_indicator_distinguishes_blocked_from_off(package_root):
     user chose, blocked is the user asking for sound and not getting it."""
     client = TestClient(create_app(package_root=package_root,
                                    enable_background_poll=False))
-    html = client.get("/").text
+    html = client.get("/?ui=classic").text
     fn = html[html.index("function renderAudioIndicator"):]
     fn = fn[:fn.index("function renderAudioPanel")]
     assert "sound off" in fn
@@ -7358,7 +7383,7 @@ def test_the_indicator_reads_the_same_state_as_the_panel(package_root):
     silent room."""
     client = TestClient(create_app(package_root=package_root,
                                    enable_background_poll=False))
-    html = client.get("/").text
+    html = client.get("/?ui=classic").text
     fn = html[html.index("function renderAudioIndicator"):]
     fn = fn[:fn.index("function renderAudioPanel")]
     assert "audioSettings.enabled" in fn
@@ -7468,7 +7493,7 @@ def test_the_engines_table_is_only_rebuilt_while_it_can_be_seen(package_root):
     """One row per engine per throw, rebuilt whole twice per throw -- on a TV
     showing the Scoring tab nobody sees it."""
     html = TestClient(create_app(package_root=package_root,
-                                 enable_background_poll=False)).get("/").text
+                                 enable_background_poll=False)).get("/?ui=classic").text
     body = html[html.index("function renderScoringTable()"):]
     body = body[:body.index("\nfunction computeEngineTally")]
     assert "if (packagesTableShowing()) {" in body
@@ -7479,7 +7504,7 @@ def test_the_engines_table_is_only_rebuilt_while_it_can_be_seen(package_root):
 
 def test_config_only_polls_run_only_while_their_tab_is_showing(package_root):
     html = TestClient(create_app(package_root=package_root,
-                                 enable_background_poll=False)).get("/").text
+                                 enable_background_poll=False)).get("/?ui=classic").text
     assert "setInterval(refreshCameraStatus," not in html
     assert "setInterval(refreshAudioClients," not in html
     assert "if (tabShowing('config') || tabShowing('info')) refreshCameraStatus();" in html

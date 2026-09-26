@@ -219,7 +219,13 @@ def test_handle_ready_to_capture_emits_a_second_package_saved_when_also_run_comp
     separate thread, unaffected by this parameter) -- so this test now
     explicitly waits for the SECOND PACKAGE_SAVED specifically, matching
     its own name and original intent, rather than accepting the first one
-    it sees."""
+    it sees.
+
+    **2026-09-26 update**: the package's one clip is written after its
+    data, inline here too (background_save=False), but it re-announces
+    the package only in "mismatch" video-record mode -- there is no
+    throw-capture service here, so it says nothing and the also-run
+    completion is still the SECOND PACKAGE_SAVED."""
     bg = {0: np.full((4, 4, 3), 50, dtype=np.uint8)}
     frame = {0: np.full((4, 4, 3), 200, dtype=np.uint8)}
     calibrations = {0: _fake_calibration_attempt().calibration}
@@ -237,7 +243,7 @@ def test_handle_ready_to_capture_emits_a_second_package_saved_when_also_run_comp
         return len(hits) >= 2
 
     assert _wait_until(_second_package_saved_arrived), (
-        f"no second PACKAGE_SAVED event arrived for the also-run completion; "
+        f"no PACKAGE_SAVED event arrived for the also-run completion; "
         f"events so far: {events}"
     )
     hits = [e for e in events if e.get("type") == "PACKAGE_SAVED"]

@@ -114,6 +114,10 @@
           <span class="visit-id" id="visit-id-label" title="The capture loop's own visit id for the turn in progress"></span>
         </div>
         <div class="board-stage">
+          <div class="board-view-switch" id="board-view-switch" role="group" aria-label="Board view">
+            <button type="button" data-view="photo" aria-pressed="true">Photo</button>
+            <button type="button" data-view="diagram" aria-pressed="false">Diagram</button>
+          </div>
           <canvas id="board-canvas"></canvas>
         </div>
       </div>
@@ -137,6 +141,9 @@
            What is left is the one fact with a consequence: a calibration
            does not re-derive itself. -->
       <div class="panel-sub">Calibration persists across restarts and is recalculated only when you press Calibrate in the sidebar.</div>
+      <!-- The rig's dashboard switch (opendarts/live/dashboard_choice.py):
+           / serves the new dashboard or this one. -->
+      <div class="panel-sub">This rig is serving the classic dashboard. <button id="btn-new-ui" class="action" type="button" title="Every screen that opens this rig gets the new dashboard; it can be switched back from there.">Switch to the new dashboard</button></div>
       <!-- "What's actually live right now" -- distinct from the per-camera
            cards above (this dashboard's own last-refresh display) and from
            CALIBRATION_STATUS's ts, neither of which survive a process

@@ -146,7 +146,7 @@ def test_the_state_endpoint_carries_the_note(client):
 
 
 def test_the_dashboard_has_somewhere_to_show_it(client):
-    html = client.get("/").text
+    html = client.get("/?ui=classic").text
     assert 'id="calib-moved-note"' in html
     assert "Cameras moved" in html
 

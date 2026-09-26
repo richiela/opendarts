@@ -465,7 +465,7 @@ def test_the_audio_controls_are_one_box(package_root):
     import re as _re
 
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
     at = html.index('id="audio-enabled-select"')
     starts = [m.start() for m in
               _re.finditer(r'<(?:label|div) class="config-field(?:\s[^"]*)?"', html)
@@ -498,7 +498,7 @@ def test_there_is_no_blocked_banner_to_dismiss(package_root):
     tried to use it, is noise standing in for a design decision.
     """
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
     assert "audio-blocked-banner" not in html
     assert "audio-blocked" not in html, (
         "the blocked-sound banner is back. Arming happens on the first "
@@ -521,7 +521,7 @@ def test_the_ios_silent_switch_workaround_is_present(package_root):
     the AudioContext follows it.
     """
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
     assert "unlockAudioSession" in html
     assert "data:audio/wav;base64," in html, (
         "the silent unlock clip is gone -- an iPad with its silent switch "
@@ -537,7 +537,7 @@ def test_nothing_in_the_page_still_calls_the_deleted_audio_routes(package_root):
     """Removing a route and leaving the fetch is valid JavaScript and a
     control that silently does nothing -- this page's own recurring bug."""
     app = create_app(package_root=package_root, enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
     for gone in ("'/api/audio'", "/api/audio/test", "btn-audio-prerender",
                  "render-modal", "/api/audio/prerender"):
         assert gone not in html, f"{gone} survived the move into the browser"

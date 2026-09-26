@@ -49,6 +49,8 @@ from typing import Any
 
 import numpy as np
 
+from opendarts.capture.lazy_frame import pixels_of
+
 log = logging.getLogger("opendarts.live.vcam_publish")
 
 MAGIC = 0x4344564F          # 'ODVC'
@@ -236,7 +238,8 @@ class VirtualCameraPublisher:
                 payload = jpeg
                 fmt, stride = FORMAT_MJPEG, len(jpeg)
             else:
-                payload = np.ascontiguousarray(frame).tobytes()
+                # A LazyFrame (small-decode slot) decodes only here.
+                payload = np.ascontiguousarray(pixels_of(frame)).tobytes()
                 fmt, stride = FORMAT_BGR24, self.width * 3
             self._seq = (self._seq + 1) & 0xFFFFFFFF      # -> odd, write starting
             self._write_header(self._seq, fmt, stride)
@@ -365,6 +368,10 @@ class VirtualCameraSet:
                 if self.publishers[idx].publish(frame, jpegs.get(idx)):
                     published += 1
         return published
+
+    #: The hub hands this sink LazyFrames rather than decoding for it:
+    #: a slot with its JPEG is forwarded as the JPEG, geometry only.
+    publish_all.accepts_lazy_frames = True
 
     def stats(self) -> "list[dict[str, Any]]":
         """Per-slot publish/consume counters, for the diagnostics surface."""

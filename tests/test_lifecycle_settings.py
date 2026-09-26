@@ -225,7 +225,7 @@ def test_without_a_store_it_is_saved_but_reported_as_not_applied(tmp_path):
 
 
 def test_dashboard_html_has_detection_time_select(tmp_path):
-    html = TestClient(create_app(package_root=tmp_path, enable_background_poll=False)).get("/").text
+    html = TestClient(create_app(package_root=tmp_path, enable_background_poll=False)).get("/?ui=classic").text
     assert 'id="idle-timeout-select"' in html
     assert 'id="detection-time-select"' in html
     assert "patchConfig({lifecycle_settings: settings}" in html

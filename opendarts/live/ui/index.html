@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#060810">
+<title>@@OD_HOST_LABEL@@ · opendarts</title>
+<style>
+@@OD_UI_CSS@@
+</style>
+</head>
+<body data-view="play">
+
+<header class="bar">
+  <a class="brand" href="#play" aria-label="opendarts — Play">
+    <span class="wm">OPEN<b>DARTS</b></span>
+    <span class="rig-id"><span id="rig-name">—</span></span>
+  </a>
+  <nav class="views" aria-label="Views">
+    <a href="#play" data-view="play" aria-current="page">PLAY</a>
+    <a href="#throws" data-view="throws">THROWS</a>
+    <a href="#rig" data-view="rig">RIG</a>
+  </nav>
+  <div class="bar-end">
+    <button type="button" class="status" id="status" data-tone="idle" aria-label="Rig status and session controls">
+      <span class="status-tag"><i></i><span id="status-tag">STAND BY</span></span>
+      <span class="status-dot" aria-hidden="true"></span>
+      <span class="status-text"><span id="status-label">Connecting</span><span id="status-detail"></span></span>
+    </button>
+    <div class="readout" aria-label="Rig readout">
+      <span id="ro-oracle" data-tone="idle">ORACLE <b>—</b></span>
+      <span id="ro-cams">CAMS <b>—</b></span>
+      <span><b id="ro-clock">--:--:--</b></span>
+    </div>
+    <button type="button" class="speaker" id="screen" data-state="off" aria-label="This screen: sound and display">
+      <svg class="i-on" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z" fill="currentColor"/><path d="M15.5 8.8a4.5 4.5 0 0 1 0 6.4M18 6.3a8 8 0 0 1 0 11.4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+      <svg class="i-off" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z" fill="currentColor"/><path d="M16 9.5l5 5m0-5l-5 5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+      <span id="screen-label"></span>
+    </button>
+  </div>
+</header>
+
+<main>
+
+  <!-- =============================== SHOW: PLAY =============================== -->
+  <section id="play" class="play" data-phase="connecting" aria-label="Play">
+    <div class="play-board">
+      <div class="board-wrap">
+        <canvas id="board" aria-label="The board, with this visit's darts"></canvas>
+        <div class="veil" id="board-veil" data-tone="idle">
+          <div class="offair">
+            <span class="kicker" id="veil-kicker">STAND BY</span>
+            <h1 id="veil-title">Connecting</h1>
+            <p id="veil-detail"></p>
+            <span class="spinner" id="veil-spin" aria-hidden="true"></span>
+            <button type="button" class="go" id="veil-start" hidden><span>START SCORING ▸</span></button>
+          </div>
+        </div>
+      </div>
+      <p class="credits" id="board-credits"></p>
+    </div>
+    <aside class="play-side">
+      <div class="turn" id="turn">
+        <div class="turn-head"><button type="button" class="missed" id="missed-open" hidden>Missed a dart?</button></div>
+        <ol class="darts">
+          <li><button type="button" class="dart" data-i="0" disabled><span class="n">1</span><span class="call">No dart yet</span><span class="pts"></span><span class="sub"></span></button></li>
+          <li><button type="button" class="dart" data-i="1" disabled><span class="n">2</span><span class="call">No dart yet</span><span class="pts"></span><span class="sub"></span></button></li>
+          <li><button type="button" class="dart" data-i="2" disabled><span class="n">3</span><span class="call">No dart yet</span><span class="pts"></span><span class="sub"></span></button></li>
+        </ol>
+        <div class="total" id="total-slab"><span class="lab">VISIT<small id="turn-count">NO DARTS YET</small></span><strong id="turn-total">0</strong></div>
+        <p class="turn-note" id="turn-note"></p>
+      </div>
+    </aside>
+    <div class="ticker" id="earlier"><span class="tag2">EARLIER</span><ol class="run" id="recent-turns"></ol></div>
+  </section>
+
+  <!-- =============================== LAB: THROWS =============================== -->
+  <section id="throws" class="throws" hidden aria-label="Throws">
+    <header class="throws-head">
+      <div class="banner warn" id="throws-banner" hidden></div>
+      <div class="throws-top">
+        <div><h1 class="title">Throws</h1><p class="sub" id="throws-sub">—</p></div>
+        <div class="throws-tools">
+          <div class="tabs" id="throw-filters" role="group" aria-label="Show">
+            <button type="button" data-filter="all" aria-pressed="true">All<span class="n"></span></button>
+            <button type="button" data-filter="disagree" aria-pressed="false" title="Our call differs from Autodarts, or from what a person recorded">Disagreements<span class="n"></span></button>
+            <button type="button" data-filter="split" aria-pressed="false" title="The engines did not all agree">Split vote<span class="n"></span></button>
+            <button type="button" data-filter="corrected" aria-pressed="false" title="A person recorded what actually landed">Corrected<span class="n"></span></button>
+            <button type="button" data-filter="noread" aria-pressed="false" title="No engine could place the dart">No read<span class="n"></span></button>
+          </div>
+          <div class="seg" id="throw-density" role="group" aria-label="Rows">
+            <button type="button" data-v="list" aria-pressed="true" title="One line per throw">List</button>
+            <button type="button" data-v="matrix" aria-pressed="false" title="Every engine's call, side by side">Engines</button>
+          </div>
+          <button type="button" class="btn" id="throws-missed" title="Save the last seconds of every camera, for a dart that never scored">Save missed dart</button>
+          <button type="button" class="btn ghost" id="clear-view" title="Start a clean list from now. Nothing is deleted.">Clear view</button>
+          <button type="button" class="btn ghost" id="show-all" hidden>Show all</button>
+          <details class="menu">
+            <summary class="btn ghost" aria-label="More">•••</summary>
+            <div class="menu-pop"><button type="button" class="menu-item danger" id="delete-recorded">Delete recorded data…</button></div>
+          </details>
+        </div>
+      </div>
+      <div class="gauges" id="tally" aria-label="Accuracy against the known answer"></div>
+      <p class="view-note" id="view-note"></p>
+      <p class="view-note" id="missed-job"></p>
+    </header>
+    <div class="throws-body">
+      <div class="throw-list tl-list" id="throw-list" role="list"></div>
+      <aside class="throw-detail" id="throw-detail" aria-live="polite"></aside>
+    </div>
+  </section>
+
+  <!-- ================================ LAB: RIG ================================ -->
+  <section id="rig" class="rig" hidden aria-label="Rig">
+    <nav class="rig-index" aria-label="Rig sections">
+      <a href="#rig/cameras" data-sec="cameras">Cameras</a><a href="#rig/scoring" data-sec="scoring">Scoring</a><a href="#rig/recording" data-sec="recording">Recording</a>
+      <a href="#rig/autodarts" data-sec="autodarts">Autodarts</a><a href="#rig/displays" data-sec="displays">Displays</a><a href="#rig/screens" data-sec="screens">Screens</a><a href="#rig/system" data-sec="system">System</a>
+    </nav>
+    <div class="rig-body" id="rig-body">
+      <div class="banner" id="restart-banner" hidden>
+        <b>Saved changes wait for a restart</b><span id="restart-keys"></span>
+        <button type="button" class="btn" id="restart-now">Restart now</button>
+      </div>
+
+      <section class="group" id="rig-cameras">
+        <header class="group-head">
+          <div><h2 class="title">Cameras</h2><p class="sub" id="calib-summary">—</p></div>
+          <div class="right">
+            <div class="seg" id="cam-overlay-toggle" role="group" aria-label="Preview"><button type="button" data-v="on">Overlay</button><button type="button" data-v="off">Plain</button></div>
+            <button type="button" class="btn signal" id="btn-calibrate" title="Re-solve calibration now and save it. Keep the board clear.">Calibrate</button>
+          </div>
+        </header>
+        <p class="note warn calib-moved" id="calib-moved" hidden></p>
+        <div class="cams-row" id="cams"></div>
+      </section>
+
+      <section class="group" id="rig-scoring">
+        <header class="h"><b>Scoring</b><span>applies on the next frame</span></header>
+        <div class="setting">
+          <span class="k" id="lbl-speed">Detection speed</span>
+          <p class="d">Still frames a landed dart must hold before it is scored. Fewer is faster; more rejects wobbles and bounce-outs.</p>
+          <div class="c">
+            <div class="seg" id="set-speed" role="group" aria-labelledby="lbl-speed"><button type="button" data-v="1">1</button><button type="button" data-v="2">2</button><button type="button" data-v="3">3</button><button type="button" data-v="4">4</button><button type="button" data-v="5">5</button></div>
+            <div class="seg-ends"><span>fastest</span><span>safest</span></div>
+          </div>
+          <p class="note" id="note-speed"></p>
+        </div>
+        <div class="setting">
+          <label class="k" for="set-idle">Stop when idle</label>
+          <p class="d">Close the cameras after this long without a dart.</p>
+          <div class="c"><span class="unit-input"><select id="set-idle"><option value="300">5</option><option value="600">10</option><option value="900">15</option><option value="1800">30</option><option value="2700">45</option><option value="3600">60</option><option value="0">Never</option></select><span id="idle-unit">MIN</span></span></div>
+          <p class="note" id="note-idle"></p>
+        </div>
+        <div class="setting">
+          <span class="k">Engines</span>
+          <p class="d">Set in <code>data/config.json</code> · takes effect at restart.</p>
+          <div class="c"><span class="s-value" id="engine-summary">—</span></div>
+        </div>
+      </section>
+
+      <section class="group" id="rig-recording">
+        <header class="h"><b>Recording</b><span>what the rig keeps</span></header>
+        <div class="setting">
+          <label class="k" for="set-store">Save throws</label>
+          <p class="d">Keep every scored dart as a replayable package. Scoring works either way; review, corrections and accuracy need it.</p>
+          <div class="c"><input type="checkbox" class="switch" id="set-store"></div>
+          <p class="note" id="note-store"></p>
+        </div>
+        <div class="setting">
+          <label class="k" for="set-clips">Video clips</label>
+          <p class="d">A short clip per camera around each dart.</p>
+          <div class="c"><select id="set-clips"><option value="all">Every dart</option><option value="mismatch">When Autodarts disagrees</option><option value="never">Never</option></select></div>
+          <p class="note" id="note-clips"></p>
+        </div>
+        <div class="setting">
+          <label class="k" for="set-ring">Throw buffer</label>
+          <p class="d">Seconds of every camera kept in memory, so a missed dart can still be saved afterwards.</p>
+          <div class="c"><span class="unit-input"><input type="number" id="set-ring" min="0" max="60" step="1" inputmode="numeric"><span>SEC</span></span></div>
+          <p class="note" id="note-ring"></p>
+        </div>
+        <div class="setting">
+          <label class="k" for="set-floor">Keep free on disk</label>
+          <p class="d">Saving stops before the disk drops below this. A negative number turns the guard off.</p>
+          <div class="c"><span class="unit-input"><input type="number" id="set-floor" step="1" inputmode="decimal"><span>GB</span></span></div>
+          <p class="note" id="note-floor"></p>
+        </div>
+        <div class="setting">
+          <span class="k">On this rig</span>
+          <p class="d" id="disk-summary">—</p>
+          <div class="c"><button type="button" class="btn danger" id="btn-delete-recorded2">Delete…</button></div>
+        </div>
+      </section>
+
+      <section class="group" id="rig-autodarts">
+        <header class="h"><b>Autodarts</b><span>a second opinion, never the call</span></header>
+        <div class="setting">
+          <label class="k" for="set-ad"><span class="dot" id="ad-dot" data-tone="idle"></span>Compare</label>
+          <p class="d">Every throw is compared after it is scored — never delaying it.</p>
+          <div class="c"><input type="checkbox" class="switch" id="set-ad"></div>
+          <p class="note" id="note-ad"></p>
+        </div>
+        <div class="setting">
+          <label class="k" for="set-ad-url">Address</label>
+          <p class="d">Scheme included. Saves when you leave the field.</p>
+          <div class="c"><input type="text" id="set-ad-url" spellcheck="false" autocomplete="off" placeholder="http://localhost:3180"></div>
+          <p class="note" id="note-ad-url"></p>
+        </div>
+        <div class="setting stacked">
+          <span class="k">Virtual cameras</span>
+          <div class="c"><p class="d" style="margin-bottom:6px">The copies of this rig's cameras that Autodarts reads.</p><ul class="vcams" id="vcam-list"><li class="muted">Checking…</li></ul></div>
+        </div>
+        <p class="note" id="ad-board"></p>
+      </section>
+
+      <section class="group" id="rig-displays">
+        <header class="h"><b>Displays</b><span>screens that only show — set up from here</span></header>
+        <p class="displays-how">On a TV, open <code id="display-url">/?display</code> once. It appears below; everything about it is set from here, and it changes the moment you do.</p>
+        <div class="displays" id="displays-list"></div>
+      </section>
+
+      <section class="group" id="rig-screens">
+        <header class="h"><b>Screens</b><span>every open page reports whether it can be heard</span></header>
+        <ul class="screens" id="screens-list"><li class="muted">Checking…</li></ul>
+        <div class="setting"><span class="k">This screen</span><p class="d">Sound, voice, board view and theme are kept per device.</p><div class="c"><button type="button" class="btn" id="screens-open">This screen…</button></div></div>
+      </section>
+
+      <section class="group" id="rig-system">
+        <header class="h"><b>System</b><span id="sys-host"></span></header>
+        <div class="sys-grid">
+          <dl class="kv" id="sys-rig"></dl>
+          <div class="meters">
+            <div class="meter" id="meter-cpu"><span class="meter-name">CPU</span><span class="meter-track"><span class="meter-fill"></span></span><span class="meter-val">—</span></div>
+            <div class="meter" id="meter-mem"><span class="meter-name">Memory</span><span class="meter-track"><span class="meter-fill"></span></span><span class="meter-val">—</span></div>
+            <div class="meter" id="meter-disk"><span class="meter-name">Disk</span><span class="meter-track"><span class="meter-fill"></span></span><span class="meter-val">—</span></div>
+          </div>
+        </div>
+        <div class="setting">
+          <label class="k" for="set-port">Address</label>
+          <p class="d">Where this dashboard answers. The interface is read-only here — a wrong one would take the dashboard with it.</p>
+          <div class="c"><span class="unit-input addr"><span id="host-label">—</span><span>:</span><input type="number" id="set-port" min="1" max="65535" inputmode="numeric"></span></div>
+          <p class="note" id="note-port"></p>
+        </div>
+        <div class="setting">
+          <span class="k">Dashboard</span>
+          <p class="d">What this rig serves at its address. Classic is the previous dashboard, kept for now.</p>
+          <div class="c"><div class="seg" id="set-dashboard" role="group"><button type="button" data-v="new">New</button><button type="button" data-v="classic">Classic</button></div></div>
+          <p class="note" id="note-dashboard"></p>
+        </div>
+        <div class="setting">
+          <label class="k" for="set-always">Update on restart</label>
+          <p class="d">Pull the latest code for this rig's branch before relaunching.</p>
+          <div class="c"><input type="checkbox" class="switch" id="set-always"></div>
+          <p class="note" id="note-always"></p>
+        </div>
+        <div class="setting">
+          <span class="k">Restart</span>
+          <p class="d" id="note-restart">Scoring stops, and does not start again on its own.</p>
+          <div class="c btn-row"><button type="button" class="btn solid" id="btn-restart">Restart</button><button type="button" class="btn" id="btn-update-restart" hidden>Update and restart</button></div>
+        </div>
+        <div class="setting">
+          <span class="k">A problem?</span>
+          <p class="d">Everything on this page as one block of text, for a bug report.</p>
+          <div class="c btn-row"><button type="button" class="btn" id="btn-copy-diag">Copy diagnostics</button><a class="btn ghost" id="link-logs" href="/api/logs/run_product?n=500" target="_blank" rel="noopener">Log ↗</a></div>
+        </div>
+        <details class="advanced">
+          <summary>Advanced</summary>
+          <div class="setting">
+            <span class="k">Relearn the layout</span>
+            <p class="d">Forget where the cameras sit on the ring. Rarely needed — a calibration that finds they moved does this itself.</p>
+            <div class="c"><button type="button" class="btn" id="btn-relearn">Relearn…</button></div>
+          </div>
+        </details>
+      </section>
+    </div>
+  </section>
+  <!-- the rig's connection, said plainly on pages that have no scoreboard veil -->
+  <div class="conn" id="conn-strip" hidden><b id="conn-title"></b><span id="conn-detail"></span></div>
+</main>
+
+<!-- ======================= CALIBRATING: the whole screen ======================= -->
+<div class="calib" id="calib" hidden role="dialog" aria-modal="true" aria-labelledby="calib-title">
+  <div class="calib-box">
+    <span class="kicker" id="calib-kicker">CALIBRATING</span>
+    <h1 id="calib-title">Keep the board clear</h1>
+    <p class="calib-sub" id="calib-sub">No darts in the board, no hands in front of it.</p>
+    <div class="calib-bar" aria-hidden="true"><i id="calib-fill"></i></div>
+    <div class="calib-meta"><span id="calib-stage">Starting…</span><b id="calib-pct">0%</b></div>
+    <ol class="calib-steps" id="calib-steps"></ol>
+    <div class="calib-cams" id="calib-cams"></div>
+    <div class="calib-foot"><span id="calib-time"></span><button type="button" class="calib-hide" id="calib-hide">Hide — it carries on</button></div>
+  </div>
+</div>
+
+<!-- ================================ SHEETS ================================ -->
+
+<dialog class="sheet" id="sheet-session" aria-labelledby="sess-title">
+  <div class="sheet-box">
+    <header class="sheet-head">
+      <div class="sess-state"><span class="dot" id="sess-dot" data-tone="idle"></span><div><h2 id="sess-title">—</h2><p id="sess-detail"></p></div></div>
+      <button type="button" class="x" data-close aria-label="Close">✕</button>
+    </header>
+    <div class="sess-actions">
+      <button type="button" class="btn signal" id="sess-start">Start scoring</button>
+      <button type="button" class="btn" id="sess-stop">Stop</button>
+      <button type="button" class="btn" id="sess-calibrate" title="Re-solve calibration now. Keep the board clear.">Calibrate</button>
+      <button type="button" class="btn" id="sess-reset" title="Take the board as it is now as empty, and start the visit again.">Reset visit</button>
+    </div>
+    <div class="activity"><p class="h" style="margin:16px 0 4px"><b>Activity on this screen</b></p><ul id="sess-activity"></ul></div>
+  </div>
+</dialog>
+
+<dialog class="sheet" id="sheet-screen" aria-labelledby="scr-title">
+  <div class="sheet-box">
+    <header class="sheet-head">
+      <div><h2 id="scr-title">This screen</h2><p id="scr-device"></p></div>
+      <button type="button" class="x" data-close aria-label="Close">✕</button>
+    </header>
+    <div class="sheet-body">
+      <div class="setting"><label class="k" for="scr-sound">Speak each dart</label><span></span><div class="c"><input type="checkbox" class="switch" id="scr-sound"></div><p class="note" id="scr-note"></p></div>
+      <div class="setting"><label class="k" for="scr-voice">Voice</label><span></span><div class="c"><select id="scr-voice"><option>Loading…</option></select></div></div>
+      <div class="setting"><label class="k" for="scr-volume">Volume</label><span></span><div class="c volume"><input type="range" id="scr-volume" min="0" max="100" step="5"><span id="scr-volume-val">80%</span><button type="button" class="btn small" id="scr-test">Test</button></div></div>
+      <div class="setting"><span class="k">Board</span><span></span><div class="c"><div class="seg" id="scr-boardview" role="group"><button type="button" data-v="photo">Photo</button><button type="button" data-v="diagram">Diagram</button></div></div></div>
+      <div class="setting"><label class="k" for="scr-overlay">Camera overlay</label><span></span><div class="c"><input type="checkbox" class="switch" id="scr-overlay"></div></div>
+      <div class="setting"><span class="k">Lab paper</span><span></span><div class="c"><div class="seg" id="scr-theme" role="group"><button type="button" data-v="light">Paper</button><button type="button" data-v="dark">Blueprint</button><button type="button" data-v="auto">Auto</button></div></div></div>
+      <div class="setting"><span class="k">Text size</span><span></span><div class="c"><div class="seg" id="scr-text" role="group"><button type="button" data-v="normal">Normal</button><button type="button" data-v="large">Large</button><button type="button" data-v="huge">Huge</button></div></div><p class="note">Throws, for a screen read from across the room.</p></div>
+      <div class="setting"><span class="k">Wall display</span><span></span><div class="c"><button type="button" class="btn" id="scr-fullscreen">Full screen</button></div><p class="note">For a TV nobody touches, open <code>?kiosk=1&amp;sound=on</code>.</p></div>
+    </div>
+  </div>
+</dialog>
+
+<dialog class="sheet sheet-wide" id="sheet-truth" aria-labelledby="truth-title">
+  <div class="sheet-box">
+    <header class="sheet-head">
+      <div><h2 id="truth-title">What actually landed?</h2><p id="truth-sub"></p></div>
+      <button type="button" class="x" data-close aria-label="Close">✕</button>
+    </header>
+    <div class="truth">
+      <div class="truth-pick">
+        <p class="lbl">The engines and the oracle said</p>
+        <div class="chips" id="truth-candidates"></div>
+        <p class="lbl">Or pick it</p>
+        <div class="chips" id="truth-rings"></div>
+        <div class="truth-answer" id="truth-answer"></div>
+        <p class="note bad" id="truth-error"></p>
+      </div>
+      <div><div class="truth-board cropbox"><canvas id="truth-canvas" aria-label="Tap where the dart actually is"></canvas></div><p class="figcap"><span>Fig. — tap where it is</span><span>● scored ◆ oracle</span></p></div>
+    </div>
+    <footer class="sheet-foot">
+      <button type="button" class="btn ghost" id="truth-review" hidden>Review this throw ↗</button>
+      <button type="button" class="btn ghost" id="truth-clear" hidden>Remove correction</button>
+      <span class="grow"></span>
+      <button type="button" class="btn" data-close>Cancel</button>
+      <button type="button" class="btn signal" id="truth-save" disabled>Record it</button>
+    </footer>
+  </div>
+</dialog>
+
+<dialog class="sheet" id="sheet-missed" aria-labelledby="missed-title">
+  <div class="sheet-box">
+    <header class="sheet-head"><div><h2 id="missed-title">Missed a dart?</h2><p id="missed-reach"></p></div><button type="button" class="x" data-close aria-label="Close">✕</button></header>
+    <div class="sheet-body"><label class="field">What happened (optional)<textarea id="missed-reason" rows="2" placeholder="a dart landed and nothing was scored"></textarea></label><p class="note bad" id="missed-error"></p></div>
+    <footer class="sheet-foot"><span class="grow"></span><button type="button" class="btn" data-close>Cancel</button><button type="button" class="btn signal" id="missed-save">Save the buffer</button></footer>
+  </div>
+</dialog>
+
+<dialog class="sheet" id="sheet-stream" aria-labelledby="stream-title">
+  <div class="sheet-box">
+    <header class="sheet-head"><div><h2 id="stream-title">Read from a stream</h2><p id="stream-sub"></p></div><button type="button" class="x" data-close aria-label="Close">✕</button></header>
+    <div class="sheet-body">
+      <label class="field">Address<input type="text" id="stream-url" spellcheck="false" autocomplete="off" placeholder="http://other-rig:8420"></label>
+      <p class="note">Another rig's address is enough — the camera path is filled in.</p>
+      <label class="check" id="stream-all-row" hidden><input type="checkbox" id="stream-all" checked> Use this rig for all cameras</label>
+      <p class="note bad" id="stream-error"></p>
+    </div>
+    <footer class="sheet-foot"><span class="grow"></span><button type="button" class="btn" data-close>Cancel</button><button type="button" class="btn signal" id="stream-save">Use this stream</button></footer>
+  </div>
+</dialog>
+
+<dialog class="sheet" id="sheet-confirm" aria-labelledby="confirm-title">
+  <div class="sheet-box">
+    <header class="sheet-head"><h2 id="confirm-title"></h2></header>
+    <div class="confirm-body" id="confirm-body"></div>
+    <footer class="sheet-foot"><span class="grow"></span><button type="button" class="btn" data-close>Cancel</button><button type="button" class="btn signal" id="confirm-ok">Confirm</button></footer>
+  </div>
+</dialog>
+
+<div class="blocker" id="blocker" hidden><div class="offair"><span class="spinner"></span><h1 id="blocker-title"></h1><p id="blocker-detail"></p></div></div>
+<div class="toasts" id="toasts" aria-live="polite"></div>
+
+<script id="bootstrap" type="application/json">@@OD_BOOTSTRAP_JSON@@</script>
+<script>
+@@OD_UI_JS@@
+</script>
+</body>
+</html>

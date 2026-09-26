@@ -129,6 +129,7 @@ from typing import Any
 
 import numpy as np
 
+from opendarts.capture.lazy_frame import pixels_of
 from opendarts.live import v4l2_register
 
 log = logging.getLogger("opendarts.live.v4l2_publish")
@@ -398,8 +399,10 @@ class V4L2LoopbackPublisher:
             if self.fmt == "BGR24":
                 # ascontiguousarray is a no-op on a normal capture frame and
                 # a copy on a slice; either way tobytes() below needs it
-                # contiguous, and asking is cheaper than assuming.
-                os.write(self._fd, np.ascontiguousarray(frame).tobytes())
+                # contiguous, and asking is cheaper than assuming. A
+                # LazyFrame (small-decode slot) decodes here: this mode
+                # needs its pixels.
+                os.write(self._fd, np.ascontiguousarray(pixels_of(frame)).tobytes())
             elif jpeg is not None:
                 # The geometry check above is what makes this safe: the
                 # bytes decoded to this frame, and this frame matches the
@@ -410,7 +413,7 @@ class V4L2LoopbackPublisher:
                 import cv2
 
                 ok, encoded = cv2.imencode(
-                    ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
+                    ".jpg", pixels_of(frame), [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
                 )
                 if not ok:
                     self._write_errors += 1
@@ -509,6 +512,10 @@ class V4L2LoopbackSet:
         """Take the hub's frame dict. THE HUB CALLS THIS ON THE PUMP THREAD,
         and the encode happens here -- see the module docstring for the
         worker that was measured and removed.
+
+        Values may be LazyFrames (opendarts.capture.lazy_frame): MJPEG mode
+        forwards the slot's JPEG and reads only the frame's geometry, so
+        the hub need not decode full pixels for this sink.
         """
         if self._closed:
             # A pump cycle can already be in flight when publishing is
@@ -528,6 +535,9 @@ class V4L2LoopbackSet:
                 if self.publishers[idx].publish(frame, jpegs.get(idx)):
                     published += 1
         return published
+
+    #: The hub hands this sink LazyFrames rather than decoding for it.
+    publish_all.accepts_lazy_frames = True
 
     def stats(self) -> "list[dict[str, Any]]":
         """Per-slot publish counters, for the diagnostics surface."""

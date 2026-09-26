@@ -25,6 +25,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from opendarts.capture.lazy_frame import as_frames, decode_all, prefetch
 from opendarts.capture.trigger_state import MAX_DARTS_PER_TURN, ThrowState, ThrowTriggerState
 from opendarts.lifecycle.state import Action, Lifecycle, Phase, Tick
 
@@ -58,10 +59,12 @@ class LifecycleTriggerAdapter:
         """The reference as ``true_baseline_frames`` -- same dict object as
         long as no camera's reference frame changed, so identity-based
         'did the baseline move' checks in the loop stay meaningful."""
-        fulls = lc.refs.bg_full()
-        ids = tuple(sorted((cam, id(f)) for cam, f in fulls.items()))
+        # Identity of the HANDLES: a lazy reference is not decoded just to
+        # ask whether it moved.
+        handles = lc.refs.full_handles()
+        ids = tuple(sorted((cam, id(f)) for cam, f in handles.items()))
         if ids != self._baseline_ids:
-            self._baseline = fulls
+            self._baseline = as_frames(handles)
             self._baseline_ids = ids
         return self._baseline
 
@@ -98,6 +101,14 @@ class LifecycleTriggerAdapter:
             if tick.action is not Action.COMMIT:
                 self._pending_since = None
 
+        # A board change is pending: the reference is frozen until it
+        # commits or resolves (nothing adopts in the dart branch), so this
+        # is the moment to start decoding it -- off this thread, so the
+        # commit adds only its own frame's decode. No-op for arrays and for
+        # a reference already decoded or in flight.
+        if tick.phase is Phase.PENDING_DART:
+            prefetch(lc.refs.full_handles())
+
         baseline = self._baseline_for(lc)
         state = self.map_state(tick)
         trigger = ThrowTriggerState(
@@ -109,12 +120,16 @@ class LifecycleTriggerAdapter:
         cleared: int | None = None
         if tick.action is Action.COMMIT and tick.commit is not None:
             started = self._pending_since if self._pending_since is not None else now
-            trigger.last_frame = dict(tick.commit.frames)
+            # Full pixels for scoring, both sets decoded in parallel when
+            # lazy (the reference is normally done already, see prefetch
+            # above); plain copies of the dicts otherwise, as before.
+            commit_frames, commit_bg = decode_all(tick.commit.frames, tick.commit.bg)
+            trigger.last_frame = commit_frames
             trigger.settle_started_monotonic = started
             trigger.settle_duration_s = round(now - started, 3)
             trigger.camera_settled_at_monotonic = {cam: now for cam in tick.commit.dart_cams}
             self._pending_since = None
-            reference = dict(tick.commit.bg)
+            reference = commit_bg
         else:
             reference = lc.refs.bg_full()
             if tick.action is Action.CLEARED:

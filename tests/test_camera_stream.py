@@ -290,7 +290,7 @@ def test_dashboard_streams_the_preview_and_layers_the_overlay_over_it(tmp_path):
     that actually closes a stream -- must exist.
     """
     app = create_app(package_root=tmp_path / "pkgs", enable_background_poll=False)
-    html = TestClient(app).get("/").text
+    html = TestClient(app).get("/?ui=classic").text
 
     assert "/stream.mjpg?t=" in html
     # The overlay is the TRANSPARENT endpoint now, and it is keyed by the

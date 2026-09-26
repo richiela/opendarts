@@ -464,16 +464,41 @@ def test_the_list_is_bounded_while_the_measurement_is_not(tmp_path):
     assert measure_captures(root)["count"] == CAPTURE_LIST_LIMIT + 5
 
 
-# -- record_throw_clip: the per-throw video-record path ---------------------
+# -- write_package_clip: the per-throw video-record path --------------------
 
-def test_record_throw_clip_writes_clip_into_package(tmp_path):
-    """A real ring + a saved package -> record_throw_clip UPGRADES the
-    package's two-frame stills clips to verified bg..commit+1 recordings
-    and repoints meta.video at them. No PNGs at any point."""
-    import json
-    from opendarts.capture import clip
+def _saved_package(tmp_path, bg, commit):
+    """A package's data files, saved the way the live path saves them:
+    with its clip deferred (no `video` block yet)."""
     from opendarts.capture.throw_package import save_throw_package
     from opendarts.pipeline import CameraCalibration, ScoreResult
+
+    calibs = {s: CameraCalibration(
+        camera_matrix=np.eye(3), dist_coeffs=np.zeros(5),
+        rvec=np.zeros(3), tvec=np.array([0.0, 0.0, 400.0]),
+        pnp_result=None, landmark_spread_ok=True) for s in (0, 1, 2)}
+    result = ScoreResult(ok=True, sector="20", ring="treble", board_xy_mm=(1.0, 2.0),
+                         triangulation=None, n_cameras_used=3, max_ray_disagreement_mm=0.5)
+    pkg = tmp_path / "pkg"
+    save_throw_package(pkg, "sess", bg, commit, calibs, result, defer_clips=True)
+    assert "video" not in json.loads((pkg / "meta.json").read_text())
+    return pkg
+
+
+def _scored(bg, commit, bg_tick, commit_tick):
+    from opendarts.capture import clip
+
+    return clip.ScoredFrames(
+        bg=bg, commit=commit,
+        bg_generations={s: bg_tick for s in bg},
+        commit_generations={s: commit_tick for s in commit},
+    )
+
+
+def test_write_package_clip_records_the_window_into_the_package(tmp_path):
+    """A real ring + a saved package -> write_package_clip writes the
+    verified bg..commit+1 recording, taken by generation, and points
+    meta.video at it. No stills clip and no PNGs at any point."""
+    from opendarts.capture import clip
 
     ring = FrameRing(20.0)
     wall0 = 100_000.0
@@ -481,32 +506,20 @@ def test_record_throw_clip_writes_clip_into_package(tmp_path):
     commit_tick = 30
     bg_tick = commit_tick - 5
     commit = {s: frame(s, commit_tick) for s in (0, 1, 2)}   # == the ring's tick-30 frame
-    # The bg must be a frame the ring holds: its only copy is the stills
-    # clip, so an upgrade that cannot find it is abandoned (see
-    # test_record_throw_clip_keeps_stills_when_bg_not_in_ring).
     bg = {s: frame(s, bg_tick) for s in (0, 1, 2)}
-    calib = lambda: CameraCalibration(
-        camera_matrix=np.eye(3), dist_coeffs=np.zeros(5),
-        rvec=np.zeros(3), tvec=np.array([0.0, 0.0, 400.0]),
-        pnp_result=None, landmark_spread_ok=True)
-    calibs = {s: calib() for s in (0, 1, 2)}
-    result = ScoreResult(ok=True, sector="20", ring="treble", board_xy_mm=(1.0, 2.0),
-                         triangulation=None, n_cameras_used=3, max_ray_disagreement_mm=0.5)
+    pkg = _saved_package(tmp_path, bg, commit)
 
-    pkg = tmp_path / "pkg"
-    save_throw_package(pkg, "sess", bg, commit, calibs, result)
-    assert not clip.is_recorded_clip(json.loads((pkg / "meta.json").read_text())["video"])
-
-    svc = service(tmp_path, ring)
     anchor = wall0 + commit_tick * (1 / 30.0)
-    out = svc.record_throw_clip(pkg, anchor, reason="test", source="all")
+    out = service(tmp_path, ring).write_package_clip(
+        pkg, _scored(bg, commit, bg_tick, commit_tick), [0, 1, 2],
+        record=True, anchor_wall_s=anchor, reason="test")
 
-    assert out["ok"], out
+    assert out["ok"] and out["recorded"], out
     assert not list(pkg.glob("*.png"))
     meta = json.loads((pkg / "meta.json").read_text())
     assert clip.is_recorded_clip(meta["video"])
     for s in (0, 1, 2):
-        assert not (pkg / f"stills_cam{s}.mkv").exists(), "the stills clip is replaced"
+        assert not (pkg / f"stills_cam{s}.mkv").exists(), "one clip, never both"
         assert (pkg / f"clip_cam{s}.mkv").exists()
         entry = meta["video"]["cameras"][str(s)]
         assert entry["n_frames"] == 5 + 1 + 1   # bg..commit, plus one after
@@ -515,43 +528,93 @@ def test_record_throw_clip_writes_clip_into_package(tmp_path):
         assert np.array_equal(bg_back, bg[s])
 
 
-def test_record_throw_clip_keeps_stills_when_bg_not_in_ring(tmp_path):
-    """A FAILED upgrade costs the package nothing: its stills clip and
-    meta.video are left exactly as save_throw_package wrote them."""
-    import json
+def test_write_package_clip_writes_stills_when_bg_not_in_the_window(tmp_path, caplog):
+    """A recording that cannot be had costs the package nothing: it gets
+    the two-frame stills clip of exactly what was scored, and says why."""
     from opendarts.capture import clip
-    from opendarts.capture.throw_package import load_throw_package, save_throw_package
-    from opendarts.pipeline import CameraCalibration, ScoreResult
+    from opendarts.capture.throw_package import load_throw_package
 
     ring = FrameRing(20.0)
     wall0 = 100_000.0
     fill(ring, n=60, wall0=wall0)
     commit = {s: frame(s, 30) for s in (0, 1, 2)}
-    bg = {s: frame(s, 0) for s in (0, 1, 2)}   # long gone from a slice around tick 30
-    calibs = {s: CameraCalibration(
-        camera_matrix=np.eye(3), dist_coeffs=np.zeros(5),
-        rvec=np.zeros(3), tvec=np.array([0.0, 0.0, 400.0]),
-        pnp_result=None, landmark_spread_ok=True) for s in (0, 1, 2)}
-    result = ScoreResult(ok=True, sector="20", ring="treble", board_xy_mm=(1.0, 2.0),
-                         triangulation=None, n_cameras_used=3, max_ray_disagreement_mm=0.5)
-    pkg = tmp_path / "pkg"
-    save_throw_package(pkg, "sess", bg, commit, calibs, result)
-    before = {p.name: p.read_bytes() for p in pkg.iterdir()}
+    bg = {s: frame(s, 0) for s in (0, 1, 2)}   # 30 frames and 1s before the commit
+    pkg = _saved_package(tmp_path, bg, commit)
 
-    out = service(tmp_path, ring).record_throw_clip(
-        pkg, wall0 + 30 / 30.0, reason="test", source="all")
+    with caplog.at_level("WARNING"):
+        out = service(tmp_path, ring).write_package_clip(
+            pkg, _scored(bg, commit, 0, 30), [0, 1, 2],
+            record=True, anchor_wall_s=wall0 + 30 / 30.0, reason="test")
 
-    assert not out["ok"]
-    after = {p.name: p.read_bytes() for p in pkg.iterdir()}
-    assert after == before, "a failed upgrade must not touch the package"
+    assert out["ok"] and not out["recorded"]
+    assert "ceiling" in out["reason"] or "older" in out["reason"]
+    assert any("NOT recorded" in r.getMessage() for r in caplog.records)
+    meta = json.loads((pkg / "meta.json").read_text())
+    assert not clip.is_recorded_clip(meta["video"])
+    assert sorted(p.name for p in pkg.glob("*.mkv")) == [
+        f"stills_cam{s}.mkv" for s in (0, 1, 2)]
     loaded = load_throw_package(pkg)
     for s in (0, 1, 2):
         assert np.array_equal(loaded.bg_frames[s], bg[s])
         assert np.array_equal(loaded.dart_frames[s], commit[s])
+
+
+def test_write_package_clip_without_a_ring_writes_stills_and_says_so(tmp_path):
+    from opendarts.capture import clip
+
+    commit = {s: frame(s, 30) for s in (0, 1, 2)}
+    bg = {s: frame(s, 25) for s in (0, 1, 2)}
+    pkg = _saved_package(tmp_path, bg, commit)
+    out = service(tmp_path, None).write_package_clip(
+        pkg, _scored(bg, commit, 25, 30), [0, 1, 2], record=True, anchor_wall_s=1.0)
+    assert out["ok"] and not out["recorded"]
+    assert "no frame ring" in out["reason"]
     assert not clip.is_recorded_clip(json.loads((pkg / "meta.json").read_text())["video"])
 
 
-def test_record_throw_clip_refused_without_ring(tmp_path):
-    svc = service(tmp_path, None)
-    out = svc.record_throw_clip(tmp_path / "pkg", 1.0, reason="x", source="all")
-    assert out["ok"] is False
+def test_write_package_clip_not_recording_writes_stills_without_touching_the_ring(tmp_path):
+    """"never" (or a "mismatch" throw the oracle agreed with): the two
+    frames scoring used, whatever the ring holds."""
+    from opendarts.capture import clip
+
+    ring = FrameRing(20.0)
+    fill(ring, n=60, wall0=100_000.0)
+    commit = {s: frame(s, 30) for s in (0, 1, 2)}
+    bg = {s: frame(s, 25) for s in (0, 1, 2)}
+    pkg = _saved_package(tmp_path, bg, commit)
+    out = service(tmp_path, ring).write_package_clip(
+        pkg, _scored(bg, commit, 25, 30), [0, 1, 2], record=False)
+    assert out["ok"] and not out["recorded"] and out["reason"] is None
+    video = json.loads((pkg / "meta.json").read_text())["video"]
+    assert video["kind"] == clip.CLIP_KIND_STILLS
+    assert all(e["n_frames"] == 2 for e in video["cameras"].values())
+
+
+def test_write_package_clip_waits_for_the_frame_after_the_commit(tmp_path):
+    """The recording is started the moment the package's data is saved,
+    which can be before the pump has published the frame after the
+    commit. It waits for that frame (bounded) rather than ending the clip
+    at the commit."""
+    import threading
+    import time
+
+    ring = FrameRing(20.0)
+    wall0 = 100_000.0
+    fill(ring, n=31, wall0=wall0)                  # up to and including the commit
+    commit = {s: frame(s, 30) for s in (0, 1, 2)}
+    bg = {s: frame(s, 25) for s in (0, 1, 2)}
+    pkg = _saved_package(tmp_path, bg, commit)
+
+    def _publish_next():
+        time.sleep(0.05)
+        ring.append({s: frame(s, 31) for s in (0, 1, 2)}, wall_s=wall0 + 31 / 30.0,
+                    monotonic_s=4321.0 + 31 / 30.0, generation=31)
+
+    threading.Thread(target=_publish_next).start()
+    out = service(tmp_path, ring).write_package_clip(
+        pkg, _scored(bg, commit, 25, 30), [0, 1, 2],
+        record=True, anchor_wall_s=wall0 + 30 / 30.0)
+    assert out["recorded"], out
+    video = json.loads((pkg / "meta.json").read_text())["video"]
+    assert all(e["n_frames"] == 7 and e["commit_index"] == 5
+               for e in video["cameras"].values())

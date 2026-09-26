@@ -34,18 +34,21 @@ def _calib(seed):
 def _make_recorded_package(root, session="sess", throw="t1"):
     cams = range(3)
     fr = _frames(9, seed=1)
-    sets = [types.SimpleNamespace(pixels={c: fr[i] for c in cams}, jpegs={}) for i in range(len(fr))]
+    sets = [types.SimpleNamespace(generation=i, wall_s=float(i), pixels={c: fr[i] for c in cams},
+                                  jpegs={}) for i in range(len(fr))]
     commit = {c: fr[4] for c in cams}
-    # The bg must be a frame the ring actually held: the package's only
-    # copy of it is its stills clip, so an upgrade that cannot find it in
-    # the ring slice is abandoned rather than allowed to drop it.
+    # The bg is a frame the ring actually held, named by its generation
+    # like the commit -- the package's one clip runs from it.
     bg = {c: fr[1] for c in cams}
     pkg = root / session / throw
     save_throw_package(pkg, session, bg, commit, {c: _calib(c) for c in cams},
                        ScoreResult(ok=True, sector="20", ring="treble", board_xy_mm=(1.0, 2.0),
-                                   triangulation=None, n_cameras_used=3, max_ray_disagreement_mm=0.5))
-    out = clip.finalize_throw_clip(pkg, sets)
-    assert out["ok"], out
+                                   triangulation=None, n_cameras_used=3, max_ray_disagreement_mm=0.5),
+                       defer_clips=True)
+    scored = clip.ScoredFrames(bg=bg, commit=commit,
+                               bg_generations={c: 1 for c in cams},
+                               commit_generations={c: 4 for c in cams})
+    clip.point_meta_at_clip(pkg, clip.write_window_clips(pkg, sets, scored, cams))
     return commit, bg
 
 
@@ -219,7 +222,7 @@ def test_dashboard_hides_save_frames_when_recorded_and_always_shows_view(tmp_pat
     """
     from opendarts.live.server import create_app
     from fastapi.testclient import TestClient
-    html = TestClient(create_app(package_root=tmp_path, enable_background_poll=False)).get("/").text
+    html = TestClient(create_app(package_root=tmp_path, enable_background_poll=False)).get("/?ui=classic").text
     assert "VIDEO_RECORD_MODE !== 'all' && !p.has_video" in html
     assert "OD_BOOTSTRAP.video_record_mode" in html  # the mode reaches the page
     assert "view-throw-btn" in html             # View always rendered
@@ -238,7 +241,7 @@ def test_view_button_reachable_when_ad_never_answered(tmp_path):
     """
     from opendarts.live.server import create_app
     from fastapi.testclient import TestClient
-    html = TestClient(create_app(package_root=tmp_path, enable_background_poll=False)).get("/").text
+    html = TestClient(create_app(package_root=tmp_path, enable_background_poll=False)).get("/?ui=classic").text
     # the engine row's match cell falls back to the throw-level controls
     assert "!adAsked && si === 0" in html
     assert "? fmtAdWrongCell(p, sections)" in html
@@ -256,7 +259,7 @@ def test_view_button_has_its_own_column_not_the_match_cell(tmp_path):
     """
     from opendarts.live.server import create_app
     from fastapi.testclient import TestClient
-    html = TestClient(create_app(package_root=tmp_path, enable_background_poll=False)).get("/").text
+    html = TestClient(create_app(package_root=tmp_path, enable_background_poll=False)).get("/?ui=classic").text
     assert 'class="col-view"' in html            # the column exists
     assert "function fmtViewCell(p)" in html     # built separately from the badges
     # and it is NOT emitted from inside the badge cell any more
@@ -278,7 +281,7 @@ def test_dashboard_warns_when_ad_is_stuck_in_takeout(tmp_path):
     """
     from opendarts.live.server import create_app
     from fastapi.testclient import TestClient
-    html = TestClient(create_app(package_root=tmp_path, enable_background_poll=False)).get("/").text
+    html = TestClient(create_app(package_root=tmp_path, enable_background_poll=False)).get("/?ui=classic").text
     assert 'id="ad-takeout-warning"' in html          # the banner exists
     assert "AD_TAKEOUT_STUCK_SEC" in html             # and a threshold to fire on
     assert "state.ad_board_status_age_sec" in html    # fed by how long it has sat there
@@ -292,7 +295,7 @@ def test_dashboard_bootstrap_carries_the_record_mode(tmp_path):
     import re as _re
     from opendarts.live.server import create_app
     from fastapi.testclient import TestClient
-    html = TestClient(create_app(package_root=tmp_path, enable_background_poll=False)).get("/").text
+    html = TestClient(create_app(package_root=tmp_path, enable_background_poll=False)).get("/?ui=classic").text
     m = _re.search(
         r'<script id="bootstrap" type="application/json">(.*?)</script>', html, _re.S)
     assert m, "bootstrap JSON block not found in the page"

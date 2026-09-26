@@ -120,6 +120,25 @@ Set a **negative** value to keep OpenCV's own default on a rig where that
 trade differs. See `opendarts/live/cv2_threads.py` for the full
 measurement.
 
+`"detect_from_small_decode"` (default **true**) is how each camera frame
+is decoded. On, detection reads a camera's JPEG decoded straight to 1/4
+grey (libjpeg's reduced decode, 320x180 for a 720p camera), and a frame is
+decoded to full colour only when something reads its pixels: a dart's
+commit frame and the reference it is scored against, the dashboard
+preview, calibration, a pixel-format virtual camera. Scoring is
+bit-identical for the same commit frame. Detection's small picture differs
+slightly (0.29 grey levels mean), so a commit can land one frame earlier
+or later: on the 660-dart corpus, 645 committed on the same frame and 15
+moved by one, none changing its bed. A commit waits for its own three
+decodes, run in parallel (~1.1 ms on the dev Mac); the reference is
+decoded in the background as soon as a dart appears. Measured with the
+real pump and lifecycle on an idle board at 3x30 fps, passthrough cameras:
+about half the CPU (dev Mac: 28% → 10% of a core quiet, 45% → 24% under
+load). On macOS, whose cameras go through the q50 synthetic JPEG, the
+encode stays and the saving is smaller (~71% → ~64%). Set it **false** to
+decode every frame in full exactly as before. Read at startup. See
+`opendarts/capture/lazy_frame.py`.
+
 ## Where the data lives
 
 Everything this rig writes — `config.json`, logs, throw packages,

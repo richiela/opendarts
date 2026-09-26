@@ -307,29 +307,40 @@ def _package_with_result(tmp_path, *, sector, ring_name, ok=True) -> Path:
 
 
 class _RecordingService:
-    #: The mismatch trigger only fires in "mismatch" mode (in "all" every
-    #: throw is already recorded, in "never" there is no ring).
-    def __init__(self, ok=True, record_mode="mismatch"):
+    """Stands in for ThrowCaptureService.write_package_clip: records what
+    the capture daemon decided for the package's one clip."""
+
+    def __init__(self, record_mode="mismatch"):
         self.calls: list[dict] = []
-        self._ok = ok
         self.record_mode = record_mode
 
-    def record_throw_clip(self, package_dir, anchor=None, *, reason, source):
-        self.calls.append({"package_dir": package_dir, "anchor": anchor,
-                           "reason": reason, "source": source})
-        return {"ok": self._ok, "reason": None if self._ok else "aged out: 22.0s"}
+    def write_package_clip(self, package_dir, scored, cameras, *, record,
+                           anchor_wall_s=None, reason=""):
+        self.calls.append({"package_dir": package_dir, "record": record,
+                           "reason": reason, "cameras": cameras})
+        return {"ok": True}
 
 
-def test_a_disagreement_with_the_oracle_fires_a_capture_automatically(tmp_path, caplog):
+def _decide(pkg, gt, service, *, answered=True):
+    """Run the package-clip decision the way the save path does, with the
+    oracle's answer `gt` already delivered (or no attach at all)."""
+    verdict = None
+    if answered:
+        verdict = capture_daemon._OracleVerdict()
+        verdict.set(gt)
+    capture_daemon._write_package_clip(
+        pkg, None, [0, 1, 2], service, verdict=verdict, anchor_wall_s=None,
+    )
+
+
+def test_a_disagreement_with_the_oracle_records_the_clip_automatically(tmp_path, caplog):
     pkg = _package_with_result(tmp_path, sector=20, ring_name="single_outer")
     service = _RecordingService()
     with caplog.at_level("INFO"):
-        capture_daemon._capture_misscore_on_oracle_disagreement(
-            pkg, _Gt(20, "treble"), service
-        )
+        _decide(pkg, _Gt(20, "treble"), service)
     assert len(service.calls) == 1
     call = service.calls[0]
-    assert call["source"] == "oracle"
+    assert call["record"] is True
     assert call["package_dir"] == pkg
     # The reason carries BOTH answers, so a clip found later explains
     # itself without a second lookup.
@@ -338,72 +349,71 @@ def test_a_disagreement_with_the_oracle_fires_a_capture_automatically(tmp_path, 
     assert any("oracle disagreement" in r.getMessage() for r in caplog.records)
 
 
-def test_disagreement_does_not_fire_a_clip_in_all_or_never_mode(tmp_path):
-    """"all" already recorded this throw at commit; "never" has no ring --
-    so the oracle-disagreement trigger is a no-op in both."""
+def test_all_records_regardless_of_the_oracle_and_never_never_records(tmp_path):
+    """The oracle only decides in "mismatch" mode: "all" records every
+    throw, "never" none -- even a disagreement changes neither."""
     pkg = _package_with_result(tmp_path, sector=20, ring_name="single_outer")
-    for mode in ("all", "never"):
+    for mode, want in (("all", True), ("never", False)):
         service = _RecordingService(record_mode=mode)
-        capture_daemon._capture_misscore_on_oracle_disagreement(
-            pkg, _Gt(20, "treble"), service
-        )
-        assert service.calls == [], mode
+        _decide(pkg, _Gt(20, "treble"), service)
+        assert [c["record"] for c in service.calls] == [want], mode
 
 
-def test_agreement_fires_nothing(tmp_path):
+def test_agreement_records_nothing(tmp_path):
     pkg = _package_with_result(tmp_path, sector=20, ring_name="treble")
     service = _RecordingService()
-    capture_daemon._capture_misscore_on_oracle_disagreement(
-        pkg, _Gt(20, "treble"), service
-    )
-    # Called TWICE to be sure it is not a first-call quirk.
-    capture_daemon._capture_misscore_on_oracle_disagreement(
-        pkg, _Gt(20, "treble"), service
-    )
-    assert service.calls == []
+    # TWICE, to be sure it is not a first-call quirk.
+    _decide(pkg, _Gt(20, "treble"), service)
+    _decide(pkg, _Gt(20, "treble"), service)
+    assert [c["record"] for c in service.calls] == [False, False]
 
 
-def test_an_unmatched_oracle_event_fires_nothing(tmp_path):
-    """AD not answering is an ordinary state, not a misscore. Firing here
-    would fill the disk with dumps of throws nothing was wrong with."""
+def test_an_unmatched_oracle_event_records_nothing(tmp_path):
+    """AD not answering is an ordinary state, not a misscore. Recording
+    here would fill the disk with clips of throws nothing was wrong with."""
     pkg = _package_with_result(tmp_path, sector=20, ring_name="treble")
     service = _RecordingService()
-    capture_daemon._capture_misscore_on_oracle_disagreement(
-        pkg, _Gt(None, None, matched=False), service
-    )
-    assert service.calls == []
+    _decide(pkg, _Gt(None, None, matched=False), service)
+    _decide(pkg, None, service)                     # the attach failed
+    _decide(pkg, _Gt(2, "bull"), service, answered=False)  # no attach at all
+    assert [c["record"] for c in service.calls] == [False, False, False]
 
 
 def test_a_throw_we_could_not_score_is_not_treated_as_a_misscore(tmp_path):
     pkg = _package_with_result(tmp_path, sector=None, ring_name=None, ok=False)
     service = _RecordingService()
-    capture_daemon._capture_misscore_on_oracle_disagreement(
-        pkg, _Gt(20, "treble"), service
-    )
-    assert service.calls == []
+    _decide(pkg, _Gt(20, "treble"), service)
+    assert [c["record"] for c in service.calls] == [False]
 
 
-def test_an_automatic_capture_that_is_refused_is_logged_loudly(tmp_path, caplog):
-    """Nobody is watching a dashboard line for this one, so the log is the
-    only place the refusal can be seen at all."""
+def test_an_oracle_that_never_answers_gets_the_stills_clip_after_the_wait(tmp_path, monkeypatch):
+    """The package's frames wait on the oracle only so long; then the
+    two-frame clip is written without it."""
+    monkeypatch.setattr(capture_daemon, "ORACLE_VERDICT_WAIT_S", 0.05)
     pkg = _package_with_result(tmp_path, sector=20, ring_name="single_outer")
-    service = _RecordingService(ok=False)
-    with caplog.at_level("WARNING"):
-        capture_daemon._capture_misscore_on_oracle_disagreement(
-            pkg, _Gt(20, "treble"), service
-        )
-    messages = [r.getMessage() for r in caplog.records]
-    assert any("did NOT happen" in m and "aged out" in m for m in messages)
-
-
-def test_no_service_and_no_package_are_both_silent_no_ops(tmp_path):
-    pkg = _package_with_result(tmp_path, sector=1, ring_name="bull")
-    capture_daemon._capture_misscore_on_oracle_disagreement(pkg, _Gt(2, "bull"), None)
     service = _RecordingService()
-    capture_daemon._capture_misscore_on_oracle_disagreement(
-        tmp_path / "nothing-here", _Gt(2, "bull"), service
+    capture_daemon._write_package_clip(
+        pkg, None, [0], service, verdict=capture_daemon._OracleVerdict(),
+        anchor_wall_s=None,
     )
-    assert service.calls == []
+    assert [c["record"] for c in service.calls] == [False]
+
+
+def test_a_failed_clip_write_is_logged_loudly_and_never_raises(tmp_path, caplog):
+    """Nobody is watching a dashboard line for this one, so the log is the
+    only place the failure can be seen at all."""
+    class _Broken(_RecordingService):
+        def write_package_clip(self, *a, **k):
+            raise OSError("disk full")
+
+    pkg = _package_with_result(tmp_path, sector=20, ring_name="single_outer")
+    with caplog.at_level("ERROR"):
+        _decide(pkg, _Gt(20, "treble"), _Broken())
+    assert any("PACKAGE CLIP WRITE FAILED" in r.getMessage() for r in caplog.records)
+
+
+def test_no_package_is_not_a_disagreement(tmp_path):
+    assert capture_daemon._oracle_disagreement(tmp_path / "nothing-here", _Gt(2, "bull")) is None
 
 
 def test_a_ring_that_has_measured_itself_is_priced_by_that(client, monkeypatch):

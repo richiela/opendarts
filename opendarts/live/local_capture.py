@@ -344,6 +344,7 @@ from typing import Any
 import cv2
 import numpy as np
 
+from opendarts.capture.lazy_frame import LazyFrame, LazyFrames, pixels_of, reduced_gray
 from opendarts.live import camera_resolution, jpeg_info
 
 log = logging.getLogger("opendarts.local_capture")
@@ -444,6 +445,74 @@ def _synthesise_jpeg(frame: "np.ndarray") -> "tuple[np.ndarray, bytes] | None":
         log.error("synthetic JPEG: our own %d-byte encode would not decode", len(data))
         return None
     return decoded, data
+
+
+# DETECTION DECODES SMALL, 2026-09-26 -- a slot with a JPEG (passthrough or
+# synthetic) is no longer decoded to full BGR in the pump. The worker decodes
+# it straight to 1/4 grey instead (cv2.IMREAD_REDUCED_GRAYSCALE_4, what the
+# lifecycle compares) and publishes a LazyFrame: the bytes plus that small
+# picture, decoded to full pixels only when a consumer reads them -- in
+# practice the commit frame and its reference, the dashboard preview and
+# calibration. See opendarts/capture/lazy_frame.py for why scoring is still
+# bit-identical. `set_small_decode(False)` (config key
+# detect_from_small_decode) restores the full decode in the pump exactly.
+#
+#: The scale the hub pre-decodes at. It MUST be the lifecycle's
+#: SignalConfig.scale for the small picture to be used; at any other scale
+#: the lifecycle simply shrinks the full frame itself, as before (tested).
+SMALL_DECODE_SCALE = 4
+
+
+def _lazy_from_jpeg(data: bytes, scale: int,
+                    full: "np.ndarray | None" = None) -> "LazyFrame | None":
+    """A LazyFrame for `data`, or None if it will not decode even small.
+    `full` is the frame's already-decoded pixels, when someone has them."""
+    small = reduced_gray(data, scale)
+    if small is None:
+        return None
+    return LazyFrame(data, small, scale, full)
+
+
+def _synthesise_lazy(frame: "np.ndarray", scale: int) -> "tuple[LazyFrame, bytes] | None":
+    """`_synthesise_jpeg()` without its full decode: the same q50 encode,
+    then only the small grey decode. The full pixels, when read, are the
+    decode of these bytes -- SCORE==STORE holds exactly as before."""
+    ok, buf = cv2.imencode(".jpg", frame,
+                           [int(cv2.IMWRITE_JPEG_QUALITY), SYNTHETIC_JPEG_QUALITY])
+    if not ok:
+        return None
+    data = buf.tobytes()
+    lazy = _lazy_from_jpeg(data, scale)
+    if lazy is None:
+        log.error("synthetic JPEG: our own %d-byte encode would not decode", len(data))
+        return None
+    return lazy, data
+
+
+def _raw_to_lazy(buf: Any, scale: int) -> "tuple[str, Any, bytes | None]":
+    """`_raw_to_frame()` for a small-decode slot: same classification, but
+    a good JPEG comes back as a LazyFrame, decoded only to small grey. The
+    reduced decode still runs libjpeg over every entropy-coded block, so a
+    frame that will not decode is rejected here just as before."""
+    if buf is None:
+        return "bad", None, None
+    if getattr(buf, "ndim", 0) == 3:
+        return "pixels", buf, None
+    data = np.asarray(buf, dtype=np.uint8).reshape(-1).tobytes()
+    fixed = jpeg_info.repaired(data)
+    if fixed is None:
+        return "other", None, None
+    lazy = _lazy_from_jpeg(fixed, scale)
+    if lazy is None:
+        return "bad", None, None
+    return "jpeg", lazy, fixed
+
+
+def _takes_lazy(sink: Any) -> bool:
+    """Whether a frame sink handles LazyFrame values itself (reads only
+    the geometry when it forwards the JPEG, decodes when it needs pixels).
+    Anything else is handed full pixels, decoded on the pump's workers."""
+    return bool(getattr(sink, "accepts_lazy_frames", False))
 
 
 #: The Media Foundation pseudo-backend, tried before CAP_MSMF on Windows.
@@ -1171,6 +1240,14 @@ class CameraHub:
         # grab_with_jpeg() never gets bytes from one frame and pixels from
         # another.
         self._last_jpegs: dict[int, bytes] = {}
+        # The pump generation that FIRST published the frame in
+        # `_last_frames` -- the ring set (opendarts.capture.frame_ring)
+        # holding exactly that frame. Written in the same locked step as
+        # the frame. A slot re-served unchanged by a failed read keeps its
+        # number: the frame, and so the ring set it names, is the same one.
+        # Absent for a frame the pump never published (a camera's warm
+        # frame at open), which no ring set holds.
+        self._slot_generation: dict[int, int] = {}
         # A Condition wrapping a plain Lock -- see module docstring's
         # "FRAME-DRIVEN WAKE PRIMITIVE" section for why this replaced a
         # bare Lock (2026-09-05): every pre-existing `with
@@ -1183,6 +1260,10 @@ class CameraHub:
         # method's own comment) and once by close_all() -- see
         # wait_for_new_frame()'s own docstring for the full contract.
         self._frame_generation: int = 0
+        # DETECTION DECODES SMALL (see the module-level section): the scale
+        # JPEG slots are pre-decoded at, or None for the full decode in the
+        # pump. Off by default here; run_product turns it on from config.
+        self._small_decode_scale: "int | None" = None
         self._pool: ThreadPoolExecutor | None = None
         self._pump_thread: threading.Thread | None = None
         self._pump_stop: threading.Event = threading.Event()
@@ -1386,6 +1467,19 @@ class CameraHub:
         self._frame_sink = frame_sink
         self.frame_sink_errors = 0      # a fresh sink deserves a fresh count
 
+    def set_small_decode(self, enabled: bool, scale: int = SMALL_DECODE_SCALE) -> None:
+        """Turn DETECTION DECODES SMALL on or off (config key
+        detect_from_small_decode). Set before open_all(); a change while the
+        pump runs takes effect on its next cycle, and every consumer copes
+        with either kind of frame in the cache."""
+        self._small_decode_scale = int(scale) if enabled else None
+
+    @property
+    def small_decode(self) -> bool:
+        """Whether JPEG slots are published as LazyFrames. The capture
+        loop then fetches with grab_frames() rather than grab_all()."""
+        return self._small_decode_scale is not None
+
     def set_frame_ring(self, frame_ring) -> None:
         """Attach or detach the throw-capture ring at runtime.
 
@@ -1480,6 +1574,7 @@ class CameraHub:
         # docstring's "CACHE FRESHNESS at first-grab time" section).
         self._last_frames = {i: None for i in range(len(self.configs))}
         self._last_jpegs = {}
+        self._slot_generation = {}
         self._raw_slots = set()
         ok_flags = [False] * len(self.configs)
         for i in preset_slots:
@@ -1941,9 +2036,16 @@ class CameraHub:
                         raw = True      # a fresh array from imdecode, no copy needed
                         status.jpeg_synthetic = True
                         status.jpeg_synthetic_quality = SYNTHETIC_JPEG_QUALITY
+                if jpeg is not None and self._small_decode_scale is not None:
+                    # Same kind of frame the pump will publish next, so the
+                    # lifecycle never judges one slot by two different
+                    # small pictures; its pixels are already decoded.
+                    frame = _lazy_from_jpeg(jpeg, self._small_decode_scale, frame) or frame
                 with self._cache_lock:
                     # A decoded JPEG is already a fresh array.
                     self._last_frames[i] = frame if raw else frame.copy()
+                    # Not a pump-published frame, so no ring set holds it.
+                    self._slot_generation.pop(i, None)
                     if jpeg is not None:
                         self._last_jpegs[i] = jpeg
                     else:
@@ -2012,7 +2114,9 @@ class CameraHub:
         attempt succeeded, as opposed to merely "is there a cached frame
         at all"."""
         with self._cache_lock:
-            return self._last_frames.get(i)
+            frame = self._last_frames.get(i)
+        # A LazyFrame decodes here, outside the lock, once per frame.
+        return pixels_of(frame)
 
     def grab_with_jpeg(self, i: int) -> "tuple[np.ndarray | None, bytes | None]":
         """Slot `i`'s cached frame and the camera's own JPEG of that same
@@ -2021,7 +2125,25 @@ class CameraHub:
         PASSTHROUGH section) -- a caller that wants JPEG encodes the
         frame itself then, exactly as before."""
         with self._cache_lock:
+            frame, jpeg = self._last_frames.get(i), self._last_jpegs.get(i)
+        return pixels_of(frame), jpeg
+
+    def grab_jpeg_lazy(self, i: int) -> "tuple[Any, bytes | None]":
+        """grab_with_jpeg() WITHOUT decoding: the cached frame as held (a
+        LazyFrame or an array) and its JPEG. For a consumer that forwards
+        the bytes when it has them and reads pixels only otherwise."""
+        with self._cache_lock:
             return self._last_frames.get(i), self._last_jpegs.get(i)
+
+    def grab_paired(self, i: int) -> "tuple[np.ndarray | None, bytes | None, int | None]":
+        """grab_with_jpeg() plus the pump generation that published that
+        frame -- the frame ring set holding it (see `_slot_generation`).
+        All three read under the one cache lock, so they describe the same
+        frame. The generation is None for a frame no ring set holds."""
+        with self._cache_lock:
+            frame, jpeg, generation = (self._last_frames.get(i), self._last_jpegs.get(i),
+                                       self._slot_generation.get(i))
+        return pixels_of(frame), jpeg, generation
 
     def grab_all(self) -> dict[int, np.ndarray]:
         """Return every configured camera's most recently pumped frame.
@@ -2038,7 +2160,27 @@ class CameraHub:
                 frame = self._last_frames.get(i)
                 if frame is not None:
                     frames[i] = frame
-        return frames
+        # LazyFrames decode here, outside the lock -- a caller of grab_all()
+        # asked for pixels. The capture loop uses grab_frames() instead.
+        return {i: pixels_of(f) for i, f in frames.items()}
+
+    def grab_frames(self) -> LazyFrames:
+        """grab_all() WITHOUT the full decode: every slot's cached frame as
+        held (a LazyFrame carrying its JPEG and small grey picture, or an
+        array for a pixels-only slot), plus each slot's JPEG and ring
+        generation, all read under one lock hold so they describe the same
+        frames. Reading a VALUE of the returned mapping decodes that frame;
+        see opendarts/capture/lazy_frame.py."""
+        handles: "dict[int, Any]" = {}
+        with self._cache_lock:
+            for i in range(len(self.configs)):
+                frame = self._last_frames.get(i)
+                if frame is not None:
+                    handles[i] = frame
+            jpegs = {i: self._last_jpegs[i] for i in handles if i in self._last_jpegs}
+            generations = {i: self._slot_generation[i] for i in handles
+                           if i in self._slot_generation}
+        return LazyFrames(handles, jpegs=jpegs, generations=generations)
 
     def _read_one(self, i: int) -> "tuple[np.ndarray | None, bytes | None]":
         """`_read_one_raw()`, plus the SYNTHETIC JPEG round trip for a slot
@@ -2056,7 +2198,9 @@ class CameraHub:
         # Local cameras only -- a stream or replay source is left exactly as
         # it delivered (see the SYNTHETIC JPEG section).
         if frame is not None and jpeg is None and self._sources.get(i) is None:
-            synthesised = _synthesise_jpeg(frame)
+            scale = self._small_decode_scale
+            synthesised = (_synthesise_jpeg(frame) if scale is None
+                           else self._eager(_synthesise_lazy(frame, scale)))
             if synthesised is None:
                 # Detach from OpenCV's reusable buffer: _read_one_raw() skipped
                 # the copy on the promise that the round trip would replace it.
@@ -2110,13 +2254,31 @@ class CameraHub:
             # JPEG), and only if that round trip fails does it fall back to
             # publishing this one -- which it copies first.
             return frame, None
-        kind, decoded, jpeg = _raw_to_frame(frame)
+        scale = self._small_decode_scale
+        if scale is None:
+            kind, decoded, jpeg = _raw_to_frame(frame)
+        else:
+            kind, decoded, jpeg = _raw_to_lazy(frame, scale)
         if kind != "jpeg":
             status = self.status.get(i)
             if status is not None:
                 status.jpeg_rejected += 1
             return None, None
+        if scale is not None:
+            decoded, jpeg = self._eager((decoded, jpeg))
         return decoded, jpeg
+
+    def _eager(self, pair: "tuple[Any, bytes] | None") -> "tuple[Any, bytes] | None":
+        """Decode a small-decode slot's full pixels HERE, on its worker
+        thread in parallel with the other cameras -- as the pump always did
+        -- when this cycle's frame sink will read them anyway (one that does
+        not take LazyFrames). Otherwise leave the frame lazy."""
+        if pair is None:
+            return None
+        sink = self._sink_entry[0]
+        if sink is not None and not _takes_lazy(sink):
+            pair[0].pixels()
+        return pair
 
     def _stall_backoff_s(self) -> float:
         """How long `_pump_once()` sleeps after a cycle in which NO camera
@@ -2225,6 +2387,9 @@ class CameraHub:
                 # inside the cache lock, where it serialised the cameras.
                 copied = frame
                 self._last_frames[i] = copied
+                # The generation this cycle is about to publish (the bump
+                # below, under this same lock hold).
+                self._slot_generation[i] = self._frame_generation + 1
                 if jpeg is not None:
                     self._last_jpegs[i] = jpeg
                 else:
@@ -2294,10 +2459,14 @@ class CameraHub:
         sink, sink_takes_jpegs = self._sink_entry
         if sink is not None and published:
             try:
+                # A sink that does not take LazyFrames gets pixels; _eager()
+                # already decoded them on the workers, so this costs nothing.
+                to_sink = (published if _takes_lazy(sink)
+                           else {i: pixels_of(f) for i, f in published.items()})
                 if sink_takes_jpegs:
-                    sink(published, jpegs=published_jpegs)
+                    sink(to_sink, jpegs=published_jpegs)
                 else:
-                    sink(published)
+                    sink(to_sink)
             except Exception: # noqa: BLE001 -- a sink must never break capture
                 self.frame_sink_errors += 1
                 if self.frame_sink_errors == 1:
@@ -2441,6 +2610,7 @@ class CameraHub:
         with self._cache_lock:
             self._last_frames.clear()
             self._last_jpegs.clear()
+            self._slot_generation.clear()
             # FRAME-DRIVEN WAKE, 2026-09-05 -- bump+notify here too, not
             # just in _pump_once(): this is the ONLY notify that can ever
             # fire for a hub whose pump thread never started at all (zero

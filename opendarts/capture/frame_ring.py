@@ -488,6 +488,18 @@ class FrameRing:
             aged_out=False,
         )
 
+    def sets_since(self, generation: int) -> list[FrameSet]:
+        """Every held set whose generation is `generation` or later, oldest
+        first, as references -- how a package clip takes its frames out of
+        the ring BY NUMBER (opendarts.capture.clip.write_window_clips).
+        Walks back from the newest set, so the cost is the few sets asked
+        for, not the whole window."""
+        with self._lock:
+            i = len(self._sets)
+            while i > 0 and self._sets[i - 1].generation >= generation:
+                i -= 1
+            return self._sets[i:]
+
     def slice_around(
         self, anchor_wall_s: float, *, before_s: float, after_s: float
     ) -> RingSlice:

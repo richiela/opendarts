@@ -85,7 +85,8 @@ def _script() -> list[np.ndarray]:
     return frames
 
 
-def _run_live_loop(frames, *, scratch, monkeypatch):
+def _run_live_loop(frames, *, scratch, monkeypatch, reset_request=None, on_fetch=None,
+                   calibration_store=None):
     monkeypatch.setattr(
         capture_daemon, "bootstrap_calibrations",
         lambda snapshot_dir, *, hub=None, **_: {0: _fake_calibration()},
@@ -98,9 +99,12 @@ def _run_live_loop(frames, *, scratch, monkeypatch):
 
     def fake_fetch(dest_dir, *, hub=None):
         try:
-            return {0: next(it)}
+            frame = next(it)
         except StopIteration:
             raise _StopLoop()
+        if on_fetch is not None:
+            on_fetch()
+        return {0: frame}
 
     captured: list[dict] = []
 
@@ -131,6 +135,8 @@ def _run_live_loop(frames, *, scratch, monkeypatch):
             scratch_dir=scratch / "scratch",
             on_event=events.append,
             background_save=False,
+            reset_request=reset_request,
+            calibration_store=calibration_store,
         )
     return events, captured
 
@@ -202,6 +208,107 @@ def test_live_mode_bounce_out_and_hand_hover_produce_no_capture(scratch, monkeyp
     states = [e["state"] for e in events if e["type"] == "TRIGGER_STATE"]
     assert "MOTION_DETECTED" in states  # the hand was visible to the UI
     assert states[-1] == "IDLE"
+
+
+# --------------------------------------------------------------------------
+# the board photo: at Start, then after each takeout / Reset
+
+
+def _record_photo_submits(monkeypatch, events, tick):
+    from opendarts.live import board_photo
+
+    def fake_submit(frames, calibrations, on_done, *, skip_if_unchanged=False):
+        events.append({"type": "_photo", "frame": frames[0].copy(),
+                       "skip_if_unchanged": skip_if_unchanged, "tick": tick["n"]})
+
+    monkeypatch.setattr(board_photo.RENDERER, "submit", fake_submit)
+
+
+def test_the_board_photo_is_taken_after_the_takeout_not_at_dart_one(scratch, monkeypatch):
+    tick = {"n": 0}
+    marks: list[dict] = []
+    _record_photo_submits(monkeypatch, marks, tick)
+
+    def on_fetch():
+        tick["n"] += 1
+
+    real_emit = capture_daemon._emit
+
+    def emit(on_event, event):
+        if event.get("type") == "VISIT_CLEARED":
+            marks.append({"type": "VISIT_CLEARED", "tick": tick["n"]})
+        real_emit(on_event, event)
+
+    monkeypatch.setattr(capture_daemon, "_emit", emit)
+    events, captured = _run_live_loop(_script(), scratch=scratch, monkeypatch=monkeypatch, on_fetch=on_fetch)
+    assert len(captured) == 3
+
+    photos = [m for m in marks if m["type"] == "_photo"]
+    assert len(photos) == 2, "one at Start, one after the takeout -- none at dart 1"
+    start, after = photos
+    assert start["tick"] == 1 and not start["skip_if_unchanged"], "Start always renders"
+    assert after["skip_if_unchanged"]
+    cleared = next(m for m in marks if m["type"] == "VISIT_CLEARED")
+    # not on the takeout's own tick: once the post-clear cooldown has
+    # re-adopted the reference, i.e. clear_cooldown_frames ticks later
+    assert after["tick"] - cleared["tick"] == LifecycleConfig().clear_cooldown_frames
+    # and what it photographs is the empty board, arm gone
+    for x in (CX - 50, CX, CX + 50):
+        assert not _dart_present(after["frame"], x)
+    assert after["frame"][CY - 40 : CY + 40, :340].max() < 200
+
+
+def test_a_manual_reset_takes_a_board_photo_once_the_lifecycle_has_warmed_up(scratch, monkeypatch):
+    tick = {"n": 0}
+    marks: list[dict] = []
+    _record_photo_submits(monkeypatch, marks, tick)
+    reset = capture_daemon.ResetRequest()
+    reset.request()
+    frames = [Scene().render() for _ in range(15)]
+
+    def on_fetch():
+        tick["n"] += 1
+
+    events, _ = _run_live_loop(frames, scratch=scratch, monkeypatch=monkeypatch,
+                               reset_request=reset, on_fetch=on_fetch)
+    assert [e["reason"] for e in events if e["type"] == "VISIT_CLEARED"] == ["reset"]
+    photos = [m for m in marks if m["type"] == "_photo"]
+    assert [p["skip_if_unchanged"] for p in photos] == [False, True]
+    # tick 1 is Start, tick 2 the reset; then the re-warm on the current
+    # board (warmup_stable_frames=3 here) before the reference is trusted
+    assert photos[1]["tick"] == 2 + 3
+
+
+def test_a_recalibration_takes_a_board_photo_with_the_new_calibration(scratch, monkeypatch):
+    """The photo is warped with the calibration. Scoring re-reads the store
+    on every dart; the photo must too, and a mid-session Calibrate must
+    make one due -- otherwise the photo on screen stays warped with the old
+    calibration while the darts are drawn with the new one."""
+    from opendarts.live import board_photo
+
+    tick = {"n": 0}
+    got: list[dict] = []
+
+    def fake_submit(frames, calibrations, on_done, *, skip_if_unchanged=False):
+        got.append({"tick": tick["n"], "cal": calibrations[0], "skip": skip_if_unchanged})
+
+    monkeypatch.setattr(board_photo.RENDERER, "submit", fake_submit)
+    old_cal, new_cal = _fake_calibration(), _fake_calibration()
+    store = capture_daemon.CalibrationStore({0: old_cal}, package_id="calib-A")
+
+    def on_fetch():
+        tick["n"] += 1
+        if tick["n"] == 10:  # the dashboard's Calibrate, mid-session
+            store.set({0: new_cal}, source="manual", checked_at_utc="2026-09-26T00:00:00+00:00",
+                      package_id="calib-B")
+
+    frames = [Scene().render() for _ in range(20)]
+    _run_live_loop(frames, scratch=scratch, monkeypatch=monkeypatch, on_fetch=on_fetch,
+                   calibration_store=store)
+    assert [g["tick"] for g in got] == [1, 10], "Start, then the recalibration -- nothing else"
+    assert got[0]["cal"] is old_cal
+    assert got[1]["cal"] is new_cal, "the photo is warped with the NEW calibration"
+    assert got[1]["skip"], "the renderer never skips across a calibration change anyway"
 
 
 # --------------------------------------------------------------------------

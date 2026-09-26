@@ -4,10 +4,14 @@ Served by `opendarts.live.server` (FastAPI), started via
 `opendarts.live.run_product`. Default port `8420`, set in
 `data/config.json` or with `--port`.
 
-`GET /` serves the dashboard. This lists the whole HTTP and WebSocket
-surface. There is no authentication (see `docs/DEPLOYMENT.md`, Security).
-For a scoreboard or game client, `docs/RETAIL_API.md` is the smaller,
-stable surface to build on.
+`GET /` serves the dashboard: the new one or the classic one, whichever the
+rig's switch says (`/api/dashboard` below; the same API underneath both).
+`/?ui=new` or `/?ui=classic` shows the other on one screen without
+flipping it; `/?display` is the new one in its display role (Displays,
+below). This lists the whole HTTP and WebSocket surface. There
+is no authentication (see `docs/DEPLOYMENT.md`, Security). For a scoreboard
+or game client, `docs/RETAIL_API.md` is the smaller, stable surface to build
+on.
 
 ## State and control
 
@@ -55,6 +59,7 @@ store. See `config.example.json` for every default.
 | `frame_ring_max_gb` | optional hard ceiling on the ring, in GB | next restart (read when the ring is created) |
 | `publish_virtual_cameras`, `v4l2_format` | whether the virtual cameras are fed (`null` follows `ad_enabled`), and the Linux loopback pixel format | next restart |
 | `cv2_num_threads` | how many worker threads OpenCV may use | next restart |
+| `detect_from_small_decode` | detection reads each frame's JPEG decoded straight to 1/4 grey, and only scored frames are decoded in full (`true`, the default); `false` decodes every frame in full, as before | next restart |
 | `idle_timeout_sec` | seconds of no darts before the capture loop auto-stops; `0` disables it | **live**. Clamped to `max(0, n)` |
 | `lifecycle_settings.dart_stable_frames` | still frames a landed dart must hold before it is scored (1–5; fewer is faster but more error-prone) | **live**, on the next frame |
 | `engine_config` | which engine is primary, which also run, the per-engine timeout | next restart |
@@ -83,14 +88,15 @@ the picture routes.
 ## Throws and packages
 
 A saved throw package is `meta.json` plus **one MKV clip per camera** —
-no loose image files. Every package gets a two-frame *stills* clip
-(baseline and scored frame) the moment it is saved; when
-`video_record_mode` asks for a recording, a *recorded* clip of the
-whole throw replaces it shortly after. See `docs/PACKAGES.md`.
+no loose image files. Each package gets ONE clip per camera, written
+just after its JSON: a *recorded* clip of the whole throw when
+`video_record_mode` asks for one, otherwise (or when a recording cannot be
+had) a two-frame *stills* clip -- baseline and scored frame. `meta.json`
+names the clip once it is written. See `docs/PACKAGES.md`.
 
 | Route | Purpose |
 |---|---|
-| `GET /api/packages` | list saved throw packages. `has_video` on a record means it has a **recorded** clip, not merely the stills clip every package has |
+| `GET /api/packages` | list saved throw packages. `has_video` on a record means it has a **recorded** clip, not the two-frame stills clip an unrecorded package has |
 | `GET /packages/{session}/{throw_id}/viewer` | an HTML **page** (not JSON) for one throw: a 2×3 stills grid (3 cameras × before/after), plus a clip scrubber when the throw has a recorded clip. It fetches its data from the routes below |
 | `GET /api/packages/{session}/{throw_id}/frame/{cam}/{kind}.png` | one still of a throw — `kind` is `bg` (baseline) or `after` (the scored frame), read from the package. Default `fmt=png` is full-resolution lossless; `?fmt=jpeg` is a smaller display-quality encode |
 | `GET /api/packages/{session}/{throw_id}/clip/{cam}/{index}.png` | one clip frame at full resolution, lossless |
@@ -98,11 +104,13 @@ whole throw replaces it shortly after. See `docs/PACKAGES.md`.
 | `GET /api/packages/{session}/{throw_id}/clip/{cam}.mjpg` | a camera's recorded clip as a looping MJPEG stream an `<img>` can play (browsers do not decode MKV). Display quality only; `404` without a recorded clip |
 | `GET /api/recorded-data` | how much recorded data is on this rig, per kind — throw packages and frame-ring captures, each with a count and a byte total, plus whether a dump is mid-write. Walks the disk, so call it before a delete, not on a poll |
 | `POST /api/packages/delete-all` | delete ALL of this rig's recorded data — every throw package **and** every frame-ring capture. Reports what went per kind (counts and bytes) and broadcasts `PACKAGES_UPDATED` (with `count`) so open tabs refresh. Refused, with a reason and nothing deleted, while a capture is being written |
+| `GET /api/board/photo` | the Scoring tab's board photo: a straight-on JPEG of the empty board, built from every camera just after Start and again after each takeout or Reset, once the board has settled (about 0.3 s after `VISIT_CLEARED`) — never while a dart is being scored. A takeout's photo is skipped when the empty board has not visibly changed since the last one (same calibration, mean grey change ≤ 2 levels and ≤ 0.2% of the board changed by 25+ levels, in every camera), so the version stays put. It spans ±235 mm around the bull, +y up. `404` until the first photo, a moment after Start. Its version is `visit.board_photo_version` in `/api/state` and the `BOARD_PHOTO` event; fetch `?v=<version>` and it can be cached for good |
 | `POST /api/packages/{session}/{throw_id}/mark-ad-wrong` | operator marks "Autodarts was wrong on this throw" |
 | `POST /api/visits/{visit_id}/throws/{index}/correct` | record a ground-truth correction — body and errors in `docs/RETAIL_API.md` |
 | `POST /api/packages/{session}/{throw_id}/capture-misscore` | write the raw frames from around THIS throw out of the frame ring — ~1s, anchored on the throw's own recorded capture instant, not on "the last N frames". Refuses, **with the numbers**, when the throw is older than the ring still reaches |
 | `GET /api/calibration` | the full adopted calibration: camera_matrix / dist_coeffs / rvec / tvec per camera, plus the derived camera position, azimuth, elevation and distance in board coordinates |
 | `POST /api/calibration/refresh` | re-solve calibration |
+| `GET /api/calibration/progress` | how far along the current (or last) calibration is: the same body as the `CALIBRATION_PROGRESS` event, for a page that opens part-way through |
 | `POST /api/calibration/relearn-ring-geometry` | delete this rig's learned ring geometry so it relearns from scratch. Rarely needed: a calibration that finds the cameras have moved relearns it by itself and says so (`ring_geometry_relearned` on `/api/state`'s calibration section, the refresh response and `CALIBRATION_STATUS`). Idempotent: `cleared: false` when nothing was stored |
 
 ## Throw capture ring
@@ -154,6 +162,44 @@ gets its permitting tap at setup and silently loses it on any reload.
 The TV knows; nobody at the oche does — so every dashboard shows every
 other dashboard's state.
 
+## Dashboard
+
+Which page `/` serves — `new` (the default) or `classic` — is one rig-wide
+switch, kept as the `dashboard_ui` section of `data/config.json` and flipped
+from either dashboard, with no restart.
+
+| Route | Purpose |
+|---|---|
+| `GET /api/dashboard` | `ui` (`new` or `classic`) and the `choices` |
+| `PUT /api/dashboard` | `{"ui": "new" \| "classic"}` — flip it; broadcasts `DASHBOARD_SWITCHED`. Anything else is a 400 |
+
+## Displays
+
+A display is a screen that only shows — a TV beside the board, in a kiosk
+with no keyboard. `GET /?display` is the new dashboard in that role: no
+bar, no pointer, nothing to press. Its settings live **on the rig**, keyed
+by the display's id, and any controller (the ordinary dashboard) changes
+them; each change is pushed to the display at once as `DISPLAY_UPDATED`.
+So two displays can look different, any controller can change either, and
+a display that reboots comes back looking the same. Settings persist as
+the `displays` section of `data/config.json`; presence does not.
+
+`?display=tv` (or `?id=tv`) on the display's URL pins its identity (otherwise it makes one up
+and keeps it in the browser); `?name=Lounge%20TV` names it on first sight.
+
+| Route | Purpose |
+|---|---|
+| `GET /?display` | the page, in its display role (always the new dashboard, whatever the switch says) |
+| `GET /api/displays` | every display: `id`, `name`, `settings`, `online` (reported within 70 s), `age_s`, and `info` (what it last said about itself: size, sound state) |
+| `POST /api/displays/hello` | a display reporting in, every ~20 s: `display_id`, optional `name` (used only when it is first seen), `info`. Registers it the first time; answers with its `display` record |
+| `PATCH /api/displays/{display_id}` | change a display: `name` and/or a partial `settings` — `layout` (`split` = scoring beside every engine's call, `scoring`, `engines`), `text_size` (`normal` `large` `huge`), `theme` (`dark` blueprint, `light` paper), `board_view` (`photo` `diagram`), `sound`, `voice` (`""` = the rig's default), `volume` (0–1), `locked`. An unknown key or bad value is a 400; a locked display takes only `{"settings": {"locked": false}}` and answers anything else with 409. Broadcasts `DISPLAY_UPDATED` |
+| `POST /api/displays/{display_id}/identify` | put the display's name across its screen for a few seconds (`DISPLAY_IDENTIFY`), to tell which screen a row is |
+| `POST /api/displays/{display_id}/reload` | reload the page on a display nobody can reach with a keyboard (`DISPLAY_RELOAD`) |
+| `DELETE /api/displays/{display_id}` | forget it (`DISPLAY_FORGOTTEN`). A display still open registers again, fresh, on its next report |
+
+The lock is a guard against the wrong row being tapped, not a security
+boundary: like everything here, anyone who can reach the rig can unlock it.
+
 ## Events
 
 `WebSocket /api/events` is the dashboard's push stream. The server
@@ -169,7 +215,14 @@ an ISO `ts`:
 | `TRIGGER_STATE` | the board's lifecycle state changes | `state`, `session`, `dart_count`, `visit_id`, `emitted_at_utc`, ordering stamp |
 | `CAPTURE_LOOP_STATUS` | Start / Stop progress and results | `ok`, `starting`, `running`, `reason`, ordering stamp |
 | `DART_CALL` | a dart was scored — sent just **before** its `THROW_DETECTED` | `phrase` (e.g. `"treble 20"`, already what a caller would say), `visit_id` |
-| `THROW_DETECTED` | a dart was scored | `visit_id`, `visit_index`, `sector`, `ring`, `ok`, `captured_at_utc`, `emitted_at_utc`, `session`, `throw_id` |
+| `THROW_DETECTED` | a dart was scored | `visit_id`, `visit_index`, `sector`, `ring`, `ok`, `board_xy_mm`, `captured_at_utc`, `emitted_at_utc`, `session`, `throw_id`; `dart_axis` (unit shaft direction, board frame, +z toward the thrower) and `flight_color` (`#rrggbb`) when they could be worked out |
+| `BOARD_PHOTO` | a new board photo is ready: just after Start, and after a takeout or Reset when the board looks different | `version`, `visit_id` (`null` for the Start photo, else the visit that begins on this board) — fetch `GET /api/board/photo?v=<version>` |
+| `CALIBRATION_PROGRESS` | a calibration moved on — pushed only while one runs, and once when it ends | `active`, `stage` (`capture` `orientation` `solve` `refine` `finish`), `label`, `detail` (e.g. `"round 2"`, `"attempt 1 of 2"`), `fraction` (0–1, the whole calibration), `stages` (each `key`, `label`, `state`: `done` `now` `todo`), `cameras` (`"0"`: `waiting` `working` `done` `failed`), `elapsed_s`, `succeeded` (once it ends), `error`, `seq` |
+| `DASHBOARD_SWITCHED` | the rig's dashboard switch flipped — open dashboards reload onto the other page (a display, or a screen opened with `?ui=`, stays) | `ui` (`new` or `classic`) |
+| `DISPLAY_UPDATED` | a display's name or settings changed | `display` (the record `GET /api/displays` lists) |
+| `DISPLAY_IDENTIFY` | a controller asked a display to show its name | `display_id`, `name` |
+| `DISPLAY_RELOAD` | a controller asked a display to reload | `display_id` |
+| `DISPLAY_FORGOTTEN` | a display was forgotten | `display_id` |
 | `THROW_CORRECTED` | a correction was recorded | `visit_id`, `visit_index`, `live_sector` / `live_ring` (what was scored), `corrected_sector` / `corrected_ring`, `source`, `note` |
 | `VISIT_CLEARED` | a turn ended (board cleared, or Reset) | `previous_visit_id`, `visit_id` (the new one), `n_darts`, `reason` |
 | `PACKAGES_UPDATED` | packages were added, changed or deleted | `count` (true total), `new_count`, `packages` (the changed records) |

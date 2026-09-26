@@ -8,7 +8,10 @@ after a takeout, after a long quiet stretch). It is kept in two forms:
 * ``small`` -- downscaled gray, what the change detector compares to;
 * ``full``  -- the original BGR frame, what the scoring engines receive
                as ``bg`` when a dart is committed (the board exactly as it
-               looked before this dart).
+               looked before this dart). With ``detect_from_small_decode``
+               this is a LazyFrame (its JPEG), decoded only when a dart
+               actually needs it -- adoption happens on nearly every quiet
+               frame, and decoding each one would cost the whole saving.
 
 Both are always adopted together from the same frame, so the engine's
 ``bg`` is by construction the same scene the lifecycle judged against.
@@ -20,10 +23,14 @@ put there are gone -- rather than by resemblance to a startup frame.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import Any
 
 import cv2
 import numpy as np
+
+from opendarts.capture.lazy_frame import as_frames
 
 _DILATE_KERNEL = np.ones((3, 3), dtype=np.uint8)
 
@@ -31,7 +38,7 @@ _DILATE_KERNEL = np.ones((3, 3), dtype=np.uint8)
 @dataclass
 class CameraReference:
     small: np.ndarray
-    full: np.ndarray
+    full: Any  # np.ndarray, or a LazyFrame (opendarts.capture.lazy_frame)
     board_mask: np.ndarray
     prev_small: np.ndarray | None = None
     dart_masks: list[np.ndarray] = field(default_factory=list)
@@ -113,8 +120,15 @@ class ReferenceSet:
             patched[outside] = small[outside]
             ref.small = patched
 
-    def bg_full(self) -> dict[int, np.ndarray]:
+    def full_handles(self) -> dict[int, Any]:
+        """Each camera's reference frame as held: an array, or a LazyFrame
+        that has not necessarily been decoded. Reading this decodes nothing."""
         return {cam: ref.full for cam, ref in self.cams.items()}
+
+    def bg_full(self) -> "Mapping[int, np.ndarray]":
+        """The references as full pixels -- a plain dict when every one is
+        an array, else a LazyFrames that decodes on access."""
+        return as_frames(self.full_handles())
 
     def clear_darts(self) -> None:
         for ref in self.cams.values():

@@ -137,24 +137,23 @@ DEFAULT_CAPTURE_ROOT = DATA_DIR / "captures"
 MISSCORE_WINDOW_BEFORE_S = 0.5
 MISSCORE_WINDOW_AFTER_S = 0.2
 
-#: The per-throw CLIP SEARCH window, sliced from the ring around a throw's
-#: recorded time. This is only the in-memory window that must CONTAIN the
-#: commit frame plus enough on either side for clip.py to anchor on it --
-#: it is NOT what ends up on disk. clip.finalize_throw_clip trims the
-#: written clip to a per-throw frame COUNT around the commit (before =
-#: settle -> frames + lead-in, capped; after = 1), so widening this window
-#: costs nothing on disk; it only makes the before/after runs reliably
-#: available. `before` must comfortably hold
+#: The per-throw CLIP TIME WINDOW around the throw's capture instant. The
+#: clip itself is named by generation (bg..commit+1, see
+#: opendarts.capture.clip), and these only BOUND it in time: a bg older
+#: than `before` gets the stills clip, and an after frame later than
+#: `after` is left out. They are the bounds of the ring slice the clip was
+#: searched for in until 2026-09-26, kept so a package records exactly the
+#: frames it did then. `before` comfortably holds
 #: clip.CLIP_MAX_FRAMES_BEFORE_COMMIT frames even at a slower capture rate
-#: (0.6s ~= 15-18 frames), since a slow settle can reach that cap. Kept
-#: before-heavy (like the misscore window) because the package timestamp
-#: lands after the landing, so the interesting frames are on the `before`
-#: side.
+#: (0.6s ~= 15-18 frames), since a slow settle can reach that cap.
 CLIP_WINDOW_BEFORE_S = 0.6
 CLIP_WINDOW_AFTER_S = 0.2
-#: How long the "all" trigger waits after a commit before slicing, so the
-#: after-window has actually landed in the ring first.
-_CLIP_ALL_DEFER_S = CLIP_WINDOW_AFTER_S + 0.3
+#: The longest a recording waits for the frame after the commit to land in
+#: the ring. It normally takes one frame period (~33-38 ms) at most, and
+#: often none: scoring usually outlasts it. Past this the clip is written
+#: from what the ring holds -- ending at the commit if nothing followed.
+CLIP_AFTER_FRAME_WAIT_S = 0.3
+_CLIP_AFTER_FRAME_POLL_S = 0.005
 
 INTEGRITY_FILENAME = "integrity.json"
 
@@ -432,9 +431,9 @@ class ThrowCaptureService:
         self.capture_root = Path(capture_root)
         self.writer = writer or FrameDumpWriter()
         #: The per-throw video-record mode (opendarts.live.config
-        #: video_record_mode): "never" | "mismatch" | "all". Decides which
-        #: trigger records a per-throw clip INTO the package (record_throw_
-        #: clip); the whole-ring missed-dart / misscore dumps are unchanged.
+        #: video_record_mode): "never" | "mismatch" | "all". Decides whether
+        #: a package's one clip is a recording (write_package_clip); the
+        #: whole-ring missed-dart / misscore dumps are unchanged.
         self.record_mode = record_mode
         #: The RAW configured floor, not a resolved one -- None means
         #: "use the default", 0 means the same, and a negative value
@@ -624,84 +623,83 @@ class ThrowCaptureService:
             self._record(submitted["job"], kind=KIND_MISSCORE, source=source, dest=dest)
         return submitted
 
-    # -- the per-throw clip recorder (video_record_mode) ----------------
+    # -- the per-throw package clip (video_record_mode) -----------------
 
-    def record_throw_clip(
+    def write_package_clip(
         self,
         package_dir: Path,
-        anchor_wall_s: "float | None" = None,
+        scored: "clip.ScoredFrames",
+        cameras,
         *,
-        reason: str,
-        source: str,
+        record: bool,
+        anchor_wall_s: "float | None" = None,
+        reason: str = "",
     ) -> "dict[str, Any]":
-        """Slice the window around a throw and UPGRADE its package's clips
-        to a recording (opendarts.capture.clip.finalize_throw_clip): the
-        two-frame bg+commit clip save_throw_package() wrote is replaced by
-        the bg..commit+1 run out of the ring. This is the record path for
-        video_record_mode; the ring keeps running.
+        """Write the ONE clip a just-saved package gets, and point its
+        meta.json at it (opendarts.capture.clip.write_throw_clip /
+        point_meta_at_clip).
 
-        Never raises, and a failure costs the package nothing: it is
-        already complete on disk (its stills clip holds both scored
-        frames), and the upgrade only swaps the clips in once every camera
-        has a verified replacement -- through an atomic meta.json rewrite,
-        so even a crash mid-upgrade leaves the stills clip in charge. A
-        failure is logged and returned; it never propagates into the
-        capture path."""
-        refusal = self._ring_refusal()
-        if refusal is not None:
-            return refusal
+        `record` says the video-record mode wants a recording of this
+        throw: the bg..commit+1 run is then taken out of the ring by the
+        generations in `scored`, once the frame after the commit has
+        landed (see _ring_sets_for_clip). Not recording, no ring, frames
+        the ring no longer holds, or a window that fails its byte check
+        all end the same way -- the two-frame stills clip, from the scored
+        arrays, with the reason logged. `anchor_wall_s` is the throw's
+        capture instant; it bounds the window in time (CLIP_WINDOW_*_S).
+
+        Raises only if even the stills clip cannot be written -- the
+        caller logs that; the package's data files are already on disk."""
+        sets = None
+        why_not: "str | None" = None
+        if record:
+            refusal = self._ring_refusal()
+            if refusal is not None:
+                why_not = refusal["reason"]
+            else:
+                sets = self._ring_sets_for_clip(scored, cameras)
+        earliest = latest = None
+        if anchor_wall_s is not None:
+            earliest = anchor_wall_s - CLIP_WINDOW_BEFORE_S
+            latest = anchor_wall_s + CLIP_WINDOW_AFTER_S
+        video, window_refused = clip.write_throw_clip(
+            package_dir, scored, cameras, sets=sets,
+            earliest_wall_s=earliest, latest_wall_s=latest,
+        )
+        clip.point_meta_at_clip(package_dir, video)
+        recorded = clip.is_recorded_clip(video)
+        why_not = why_not or window_refused
+        if recorded:
+            log.info("recorded throw clip for %s: cams %s. %s",
+                     package_dir.name, sorted(video["cameras"], key=int), reason)
+        elif record:
+            log.warning("throw clip NOT recorded for %s (stills clip written): %s",
+                        package_dir.name, why_not)
+        return {"ok": True, "video": video, "recorded": recorded, "reason": why_not}
+
+    def _ring_sets_for_clip(self, scored: "clip.ScoredFrames", cameras) -> list:
+        """The ring sets from the earliest bg generation on, once every
+        camera's frame after its commit has landed -- or once
+        CLIP_AFTER_FRAME_WAIT_S has passed, whichever is first. Polled:
+        the wait is normally zero or one frame period, and a poll costs a
+        walk over the few newest sets."""
         ring = self.ring
         assert ring is not None
-        try:
-            if anchor_wall_s is None:
-                anchor_wall_s = anchor_wall_s_for_package(package_dir).wall_s
-            if anchor_wall_s is None:
-                return {"ok": False, "reason": "no anchor to centre the clip on"}
-            ring_slice = ring.slice_around(
-                anchor_wall_s, before_s=CLIP_WINDOW_BEFORE_S, after_s=CLIP_WINDOW_AFTER_S,
-            )
-            if ring_slice.aged_out or not ring_slice.sets:
-                return {
-                    "ok": False,
-                    "reason": ring_slice.reason or "the ring held no frames there",
-                    "aged_out": ring_slice.aged_out,
-                    "ring": ring.stats(),
-                }
-            out = clip.finalize_throw_clip(package_dir, ring_slice.sets)
-            if out.get("ok"):
-                log.info(
-                    "recorded throw clip (%s) for %s: %d set(s), cams %s. %s",
-                    source, package_dir.name, len(ring_slice.sets),
-                    out.get("cameras"), reason,
-                )
-            else:
-                log.warning(
-                    "throw clip NOT recorded for %s: %s",
-                    package_dir.name, out.get("reason"),
-                )
-            return out
-        except Exception as exc:  # noqa: BLE001 -- recording must never break capture
-            log.exception("throw clip recording failed for %s", package_dir)
-            return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
-
-    def schedule_throw_clip(
-        self,
-        package_dir: Path,
-        anchor_wall_s: "float | None" = None,
-        *,
-        reason: str,
-        source: str,
-    ) -> None:
-        """`record_throw_clip` on a daemon thread after a short defer, so
-        the after-window has actually landed in the ring first. Used by the
-        "all" trigger, which fires at commit -- before the post-commit
-        frames exist. Fire-and-forget: throws are seconds apart, so at most
-        a couple ever run at once."""
-        def _run() -> None:
-            time.sleep(_CLIP_ALL_DEFER_S)
-            self.record_throw_clip(package_dir, anchor_wall_s, reason=reason, source=source)
-
-        threading.Thread(target=_run, name="throw-clip", daemon=True).start()
+        cams = [c for c in cameras if c in scored.commit_generations]
+        oldest = min((scored.bg_generations.get(c, scored.commit_generations[c])
+                      for c in cams), default=None)
+        if oldest is None:
+            return []
+        deadline = time.monotonic() + CLIP_AFTER_FRAME_WAIT_S
+        while True:
+            sets = ring.sets_since(oldest)
+            if all(any(fs.generation > scored.commit_generations[c]
+                       and (c in fs.jpegs or c in fs.pixels) for fs in sets)
+                   for c in cams):
+                return sets
+            if time.monotonic() >= deadline:
+                return sets
+            time.sleep(_CLIP_AFTER_FRAME_POLL_S)
 
     # -- internals ------------------------------------------------------
 

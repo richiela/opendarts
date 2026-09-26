@@ -263,6 +263,10 @@ def _v_store_packages(value: Any, ctx: dict) -> bool:
     return _bool(value, "store_packages")
 
 
+def _v_detect_from_small_decode(value: Any, ctx: dict) -> bool:
+    return _bool(value, "detect_from_small_decode")
+
+
 def _v_video_record_mode(value: Any, ctx: dict) -> str:
     if not isinstance(value, str) or value.strip().lower() not in VIDEO_RECORD_MODES:
         raise ConfigValueError(
@@ -582,6 +586,12 @@ CONFIG_KEYS: tuple[ConfigKey, ...] = (
         "publish_virtual_cameras", _default_publish_virtual_cameras,
         _v_publish_virtual_cameras, restart=True,
         doc="whether the virtual cameras other software reads are fed (null follows ad_enabled)",
+    ),
+    ConfigKey(
+        "detect_from_small_decode", lambda ctx: True, _v_detect_from_small_decode,
+        restart=True,
+        doc="detection reads each frame's JPEG decoded straight to small grey; "
+            "only scored frames are decoded in full (false decodes every frame, as before)",
     ),
     ConfigKey(
         "cv2_num_threads", _default_cv2_num_threads, _v_cv2_num_threads, restart=True,

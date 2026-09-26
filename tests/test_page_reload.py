@@ -30,7 +30,7 @@ def _bootstrap(html: str) -> dict:
 
 def test_the_page_and_every_hello_carry_the_same_fingerprint(tmp_path):
     client = TestClient(create_app(package_root=tmp_path, enable_background_poll=False))
-    page = _bootstrap(client.get("/").text)["page_version"]
+    page = _bootstrap(client.get("/?ui=classic").text)["page_version"]
     assert page == server_module._DASHBOARD_PAGE_VERSION
     with client.websocket_connect("/api/events") as ws:
         hello = ws.receive_json()

@@ -81,7 +81,7 @@ def test_empty_frames_raise(tmp_path):
         clip.write_clip_mjpeg(tmp_path / "y.mkv", [], 320, 180)
 
 
-# --- write_throw_clips: per-camera clips + verified commit pointer ---------
+# --- write_window_clips: per-camera clips taken from the ring by generation ---
 
 import types
 import numpy as _np
@@ -90,11 +90,20 @@ import pytest as _pytest
 from opendarts.capture import clip as _clip
 
 
-def _fs(pixels=None, jpegs=None, wall_s=None):
-    return types.SimpleNamespace(pixels=pixels or {}, jpegs=jpegs or {}, wall_s=wall_s)
+def _fs(i, pixels=None, jpegs=None):
+    """A ring set at generation `i`, one pump period after set i-1."""
+    return types.SimpleNamespace(generation=i, wall_s=1000.0 + i / 30.0,
+                                 pixels=pixels or {}, jpegs=jpegs or {})
 
 
-def test_write_throw_clips_mjpeg_path(tmp_path):
+def _scored(bg, commit, bg_gen, commit_gen, **jpegs):
+    return _clip.ScoredFrames(bg=bg, commit=commit,
+                              bg_generations={c: bg_gen for c in bg},
+                              commit_generations={c: commit_gen for c in commit},
+                              **jpegs)
+
+
+def test_write_window_clips_mjpeg_path(tmp_path):
     """Linux/Win: every slot a JPEG -> MJPEG clips, commit frame recovered
     byte-identical to the scored (decoded) frame."""
     fr = _frames(n=9)  # 9 sets
@@ -102,45 +111,47 @@ def test_write_throw_clips_mjpeg_path(tmp_path):
     # each camera's per-set JPEG, and the scored commit = decode of set 4
     jpegs_by_cam = {c: [_cv2.imencode(".jpg", f, [_cv2.IMWRITE_JPEG_QUALITY, 85])[1].tobytes()
                         for f in fr] for c in cams}
-    sets = [_fs(jpegs={c: jpegs_by_cam[c][i] for c in cams}) for i in range(len(fr))]
-    commit = {c: _cv2.imdecode(_np.frombuffer(jpegs_by_cam[c][4], _np.uint8), _cv2.IMREAD_COLOR)
-              for c in cams}
+    sets = [_fs(i, jpegs={c: jpegs_by_cam[c][i] for c in cams}) for i in range(len(fr))]
+    dec = lambda c, i: _cv2.imdecode(_np.frombuffer(jpegs_by_cam[c][i], _np.uint8), _cv2.IMREAD_COLOR)
+    commit = {c: dec(c, 4) for c in cams}
+    bg = {c: dec(c, 1) for c in cams}
 
-    ptr = _clip.write_throw_clips(tmp_path, sets, commit)
+    ptr = _clip.write_window_clips(
+        tmp_path, sets,
+        _scored(bg, commit, 1, 4,
+                bg_jpegs={c: jpegs_by_cam[c][1] for c in cams},
+                commit_jpegs={c: jpegs_by_cam[c][4] for c in cams}),
+        cams)
     assert ptr["schema"] == _clip.THROW_CLIP_SCHEMA
     for c in cams:
         e = ptr["cameras"][str(c)]
-        assert e["encoding"] == "mjpeg" and e["commit_index"] == 4
-        # No bg supplied -> the clip is still BOUNDED: it ends one frame
-        # after the commit rather than running to the end of the ring
-        # slice, and the before side is held by the ceiling. Only the
-        # de-duplication is given up, never the bound.
-        assert e["n_frames"] == 4 + 1 + _clip.CLIP_FRAMES_AFTER_COMMIT
-        assert e.get("bg_index") is None
+        assert e["encoding"] == "mjpeg" and e["commit_index"] == 3 and e["bg_index"] == 0
+        # bounded both ends: the bg, and one frame after the commit
+        assert e["n_frames"] == 3 + 1 + _clip.CLIP_FRAMES_AFTER_COMMIT
         assert (tmp_path / e["clip"]).exists()
         back = _clip.read_commit_frame(tmp_path, ptr, c)
         assert _np.array_equal(back, commit[c])
 
 
-def test_write_throw_clips_ffv1_path(tmp_path):
-    """Mac: slots carried as pixels -> FFV1 clips, commit byte-identical."""
+def test_write_window_clips_ffv1_path(tmp_path):
+    """Pixel slots -> FFV1 clips, commit byte-identical."""
     fr = _frames(n=7, seed=3)
     cams = (0, 1)
-    sets = [_fs(pixels={c: fr[i] for c in cams}) for i in range(len(fr))]
-    commit = {c: fr[3] for c in cams}
-    ptr = _clip.write_throw_clips(tmp_path, sets, commit)
+    sets = [_fs(i, pixels={c: fr[i] for c in cams}) for i in range(len(fr))]
+    ptr = _clip.write_window_clips(
+        tmp_path, sets, _scored({c: fr[0] for c in cams}, {c: fr[3] for c in cams}, 0, 3), cams)
     for c in cams:
         e = ptr["cameras"][str(c)]
         assert e["encoding"] == "ffv1" and e["commit_index"] == 3
-        assert _np.array_equal(_clip.read_commit_frame(tmp_path, ptr, c), commit[c])
+        assert _np.array_equal(_clip.read_commit_frame(tmp_path, ptr, c), fr[3])
 
 
-def test_write_throw_clips_refuses_commit_not_in_window(tmp_path):
+def test_write_window_clips_refuses_a_commit_not_in_the_ring(tmp_path):
     fr = _frames(n=4, seed=5)
-    sets = [_fs(pixels={0: fr[i]}) for i in range(len(fr))]
-    stranger = _frames(n=1, seed=99)[0]  # not in the window
-    with _pytest.raises(_clip.CommitFrameNotInClip):
-        _clip.write_throw_clips(tmp_path, sets, {0: stranger})
+    sets = [_fs(i, pixels={0: fr[i]}) for i in range(len(fr))]
+    with _pytest.raises(_clip.ClipWindowUnavailable):
+        _clip.write_window_clips(tmp_path, sets, _scored({0: fr[0]}, {0: fr[3]}, 0, 7), [0])
+    assert not list(tmp_path.glob("*.mkv"))
 
 
 def test_clip_spans_bg_through_commit_plus_one(tmp_path):
@@ -152,10 +163,10 @@ def test_clip_spans_bg_through_commit_plus_one(tmp_path):
     one frame is kept after the commit.
     """
     fr = _frames(n=25, seed=7)
-    sets = [_fs(pixels={0: fr[i]}) for i in range(len(fr))]
+    sets = [_fs(i, pixels={0: fr[i]}) for i in range(len(fr))]
     bg_pos, commit_pos = 12, 17
-    ptr = _clip.write_throw_clips(
-        tmp_path, sets, {0: fr[commit_pos]}, bg_frames_by_cam={0: fr[bg_pos]})
+    ptr = _clip.write_window_clips(
+        tmp_path, sets, _scored({0: fr[bg_pos]}, {0: fr[commit_pos]}, bg_pos, commit_pos), [0])
     e = ptr["cameras"]["0"]
     assert e["bg_index"] == 0, "the bg IS the first frame"
     assert e["commit_index"] == commit_pos - bg_pos
@@ -166,80 +177,56 @@ def test_clip_spans_bg_through_commit_plus_one(tmp_path):
     assert _np.array_equal(back[-1], fr[commit_pos + 1])         # one after
 
 
+def test_a_camera_absent_from_a_set_is_skipped_not_padded(tmp_path):
+    """A camera's run is the sets that HOLD a frame for it -- a cycle it
+    produced nothing in has no frame to write."""
+    fr = _frames(n=9, seed=13)
+    sets = [_fs(i, pixels={0: fr[i]} if i != 3 else {}) for i in range(len(fr))]
+    ptr = _clip.write_window_clips(tmp_path, sets, _scored({0: fr[1]}, {0: fr[5]}, 1, 5), [0])
+    e = ptr["cameras"]["0"]
+    assert (e["commit_index"], e["n_frames"]) == (3, 5)   # gens 1, 2, 4, 5, 6
+
+
 def test_bg_and_commit_are_both_readable_back_byte_exact(tmp_path):
-    """Both ends are pointers now, and both must survive the round trip --
-    the package is about to stop storing the bg PNG, so the clip becomes
-    the ONLY copy of a scoring input (and of what recalibrate.py re-solves
-    a session's calibration from)."""
+    """Both ends are pointers, and both must survive the round trip -- the
+    clip is the ONLY copy of a scoring input (and of what recalibrate.py
+    re-solves a session's calibration from)."""
     fr = _frames(n=20, seed=8)
-    sets = [_fs(pixels={0: fr[i]}) for i in range(len(fr))]
-    ptr = _clip.write_throw_clips(
-        tmp_path, sets, {0: fr[14]}, bg_frames_by_cam={0: fr[9]})
+    sets = [_fs(i, pixels={0: fr[i]}) for i in range(len(fr))]
+    ptr = _clip.write_window_clips(tmp_path, sets, _scored({0: fr[9]}, {0: fr[14]}, 9, 14), [0])
     assert _np.array_equal(_clip.read_bg_frame(tmp_path, ptr, 0), fr[9])
     assert _np.array_equal(_clip.read_commit_frame(tmp_path, ptr, 0), fr[14])
     assert ptr["schema"] == _clip.THROW_CLIP_SCHEMA
 
 
-def test_bg_not_in_the_slice_is_refused_not_faked(tmp_path):
-    """A bg that is not in the ring slice must raise, so the caller keeps
-    the PNG. Silently starting the clip somewhere else would leave the
+def test_bg_not_in_the_ring_is_refused_not_faked(tmp_path):
+    """A bg the ring no longer holds must raise, so the caller writes the
+    stills clip. Silently starting the clip somewhere else would leave the
     package pointing at a frame that is not the reference."""
     fr = _frames(n=10, seed=9)
-    sets = [_fs(pixels={0: fr[i]}) for i in range(len(fr))]
-    stranger = _frames(n=1, seed=99)[0]
-    with _pytest.raises(_clip.BgFrameNotInClip):
-        _clip.write_throw_clips(tmp_path, sets, {0: fr[6]},
-                                bg_frames_by_cam={0: stranger})
+    sets = [_fs(i, pixels={0: fr[i]}) for i in range(2, len(fr))]
+    with _pytest.raises(_clip.ClipWindowUnavailable, match="bg"):
+        _clip.write_window_clips(tmp_path, sets, _scored({0: fr[1]}, {0: fr[6]}, 1, 6), [0])
 
 
 def test_bg_beyond_the_ceiling_is_refused(tmp_path):
     """The cap is a ceiling, not a target: a board that never settled can
     leave the last idle adoption far back, and that must not write a giant
-    clip. Refuse the de-duplication rather than truncate past the frame we
+    clip. Refuse the window rather than truncate past the frame we
     promised to include."""
     n = _clip.CLIP_MAX_FRAMES_BEFORE_COMMIT + 6
     fr = _frames(n=n + 4, seed=10)
-    sets = [_fs(pixels={0: fr[i]}) for i in range(len(fr))]
-    with _pytest.raises(_clip.BgFrameNotInClip):
-        _clip.write_throw_clips(tmp_path, sets, {0: fr[n]}, bg_frames_by_cam={0: fr[0]})
+    sets = [_fs(i, pixels={0: fr[i]}) for i in range(len(fr))]
+    with _pytest.raises(_clip.ClipWindowUnavailable, match="ceiling"):
+        _clip.write_window_clips(tmp_path, sets, _scored({0: fr[0]}, {0: fr[n]}, 0, n), [0])
 
 
-def _pkg(tmp_path, n=20, bg_pos=9, commit_pos=14, seed=11):
-    """A minimal saved package (bg + dart PNGs + meta) ready to finalize."""
-    import json as _json
-    fr = _frames(n=n, seed=seed)
-    sets = [_fs(pixels={0: fr[i]}) for i in range(len(fr))]
-    _cv2.imwrite(str(tmp_path / "cam0_bg.png"), fr[bg_pos])
-    _cv2.imwrite(str(tmp_path / "cam0_frame.png"), fr[commit_pos])
-    (tmp_path / "meta.json").write_text(_json.dumps({"cameras": [0]}))
-    return sets, fr
-
-
-def test_finalize_drops_the_bg_png_once_it_is_in_the_clip(tmp_path):
-    """The whole point: the same frame stops being stored twice. Measured
-    on the corpus it is ~1029 KB as PNG against ~75 KB as an MJPEG clip
-    frame."""
-    sets, fr = _pkg(tmp_path)
-    res = _clip.finalize_throw_clip(tmp_path, sets)
-    assert res["ok"] and res["bg_in_clip"] is True
-    assert not (tmp_path / "cam0_bg.png").exists(), "bg PNG should be gone"
-    assert not (tmp_path / "cam0_frame.png").exists()
-    # and it is still readable, byte-exact, through the pointer
-    assert _np.array_equal(_clip.read_bg_frame(tmp_path, res["video"], 0), fr[9])
-
-
-def test_finalize_keeps_the_bg_png_when_it_is_not_in_the_slice(tmp_path):
-    """Losing the de-duplication must never cost the clip. The clip is
-    still written (anchored on the commit) and the bg PNG stays."""
-    import json as _json
-    fr = _frames(n=20, seed=12)
-    sets = [_fs(pixels={0: fr[i]}) for i in range(len(fr))]
-    _cv2.imwrite(str(tmp_path / "cam0_bg.png"), _frames(n=1, seed=98)[0])  # not in slice
-    _cv2.imwrite(str(tmp_path / "cam0_frame.png"), fr[14])
-    (tmp_path / "meta.json").write_text(_json.dumps({"cameras": [0]}))
-    res = _clip.finalize_throw_clip(tmp_path, sets)
-    assert res["ok"] is True, res
-    assert res["bg_in_clip"] is False
-    assert (tmp_path / "cam0_bg.png").exists(), "bg PNG must be kept"
-    assert res["video"]["cameras"]["0"].get("bg_index") is None
-    assert _clip.read_bg_frame(tmp_path, res["video"], 0) is None
+def test_a_pointer_without_bg_index_reads_no_bg(tmp_path):
+    """A throw-clip/v1 pointer (or a pre-2026-09-26 window that could not
+    de-duplicate its bg) has no bg_index: the reader gets None and falls
+    back to the package's cam{N}_bg.png."""
+    fr = _frames(n=5, seed=12)
+    _clip.write_clip_ffv1(tmp_path / "clip_cam0.mkv", fr)
+    ptr = {"cameras": {"0": {"clip": "clip_cam0.mkv", "commit_index": 2}}}
+    assert _clip.read_bg_frame(tmp_path, ptr, 0) is None
+    assert _np.array_equal(_clip.read_commit_frame(tmp_path, ptr, 0), fr[2])

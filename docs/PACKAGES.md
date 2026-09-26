@@ -17,8 +17,8 @@ holds the frames. There are no image files.
 
 | File | Size | What it holds |
 |---|---|---|
-| `stills_cam{0,1,2}.mkv` | ~150 KB each | *every package*: two frames per camera — the empty board immediately before the dart landed, then the scored frame with the dart in it |
-| `clip_cam{0,1,2}.mkv` | ~0.5 MB each | *recorded package*: replaces the stills with the whole run from that empty board to one frame past the scored one — see [Video clips](#video-clips) |
+| `stills_cam{0,1,2}.mkv` | ~150 KB each | *unrecorded package*: two frames per camera — the empty board immediately before the dart landed, then the scored frame with the dart in it |
+| `clip_cam{0,1,2}.mkv` | ~0.5 MB each | *recorded package*, instead of the stills: the whole run from that empty board to one frame past the scored one — see [Video clips](#video-clips) |
 | `result.json` | ~19 KB | what every engine decided — see below |
 | `calibration.json` | ~2 KB | the calibration **in force at capture**: `camera_matrix`, `dist_coeffs`, `rvec`, `tvec` per camera |
 | `capture_diagnostics.json` | ~2 KB | timings, the settle decision, board-disc state |
@@ -34,11 +34,18 @@ or it is not a replay. On Linux and Windows those are the camera's own JPEG
 bytes. On macOS the system decodes the camera's MJPEG before any application
 can see it, so OpenDarts encodes each frame to JPEG itself (quality 50) and
 scores the decode of *those* bytes; storage and scoring still see the same
-pixels. Either way the frames are read back and compared with what was scored
-before the package is written.
+pixels. Either way every clip is checked after it is written: its two scored
+frames are read back out of the file as raw JPEG bytes and must equal the
+bytes the scored pixels were decoded from (a frame held only as pixels, with
+no JPEG, is decoded and compared with the scored pixels instead). A clip that
+fails is thrown away and the next fallback written.
 
-The stills are written together with the rest of the package, not after it,
-so a package is complete the moment it exists.
+A package gets **one** clip per camera, written once. The JSON files come
+first, the moment the throw is scored; the clip follows as soon as it is
+known which kind it will be (normally a frame period or less later — up to a
+few seconds in `mismatch` mode, which waits for Autodarts), and only then
+does `meta.json` gain its `video` block. Until that moment the package has
+data but no readable frames.
 
 ## What `result.json` holds
 
@@ -62,15 +69,18 @@ an MKV container. `video_record_mode` (the Config tab, or the key in
 
 - **`all`** (default) — record a clip for every throw
 - **`mismatch`** — record only when Autodarts was on and disagreed with us
-- **`never`** — no recordings (every package still has its two-frame stills), and the frame ring is not even created
+- **`never`** — no recordings (every package gets its two-frame stills instead), and the frame ring is not even created
 
 The clip starts at the empty-board frame the throw was scored against and
-ends one frame after the scored frame, and both ends are **byte-identical** to what
-the live scorer used, verified at write time, so a recorded package re-scores
-exactly like a still-only one. That is usually 5–8 frames, capped so a board
-that never settled cannot write a giant clip. The clip replaces the stills
-only once every camera's clip has been verified; if recording fails, the
-package keeps its stills and loses nothing.
+ends one frame after the scored frame. The capture loop records which frame
+of its in-memory frame ring each of those two is, so the clip is taken out of
+the ring by those numbers — nothing is searched for — and both ends are
+**byte-identical** to what the live scorer used, verified at write time, so a
+recorded package re-scores exactly like a still-only one. That is usually 5–8
+frames, capped so a board that never settled cannot write a giant clip. If a
+recording cannot be had (the frames have left the ring, the ring is off, or
+the check fails on any camera), the package gets its two-frame stills
+instead and loses nothing.
 
 The clip holds the same JPEG bytes the stills would. A frame with no JPEG
 bytes (rare) falls back to a lossless FFV1 encode. Nothing shells out to a

@@ -51,6 +51,7 @@ from typing import Any
 
 import numpy as np
 
+from opendarts.capture.lazy_frame import as_frames, handles_of, pixels_of
 from opendarts.lifecycle.reference import ReferenceSet
 from opendarts.lifecycle.signals import (
     DEFAULT_SIGNAL_CONFIG,
@@ -313,14 +314,26 @@ class Lifecycle:
     def observe(self, frames: dict[int, np.ndarray]) -> Tick:
         cfg = self.cfg
         self.tick_n += 1
-        smalls = {cam: to_small_gray(f, cfg.signals.scale) for cam, f in frames.items()}
+        # `frames` may be a LazyFrames (opendarts.capture.lazy_frame): each
+        # camera's small grey picture then comes straight from its JPEG
+        # (the hub's reduced decode) and the full frame is NOT decoded here
+        # -- the reference and the commit hold the lazy handle, and only a
+        # commit decodes it. A plain dict of arrays takes exactly the old
+        # path.
+        fulls = handles_of(frames)
+        small_of = getattr(frames, "small_gray", None)
+        smalls = {}
+        for cam, f in fulls.items():
+            small = small_of(cam, cfg.signals.scale) if small_of is not None else None
+            smalls[cam] = small if small is not None else to_small_gray(
+                pixels_of(f), cfg.signals.scale)
 
         for cam, small in smalls.items():
             if cam not in self.refs:
                 mask_full = self._board_masks_full.get(cam)
                 if mask_full is None:
                     continue
-                self.refs.seed(cam, frames[cam], small, to_small_mask(mask_full, small.shape))
+                self.refs.seed(cam, fulls[cam], small, to_small_mask(mask_full, small.shape))
 
         signals: dict[int, CamSignals] = {}
         for cam in self.refs.cameras():
@@ -344,7 +357,7 @@ class Lifecycle:
             return Tick(self.tick_n, self.phase, Action.NONE, self.dart_count, {}, False, False, [], "no cameras")
 
         agg = self._aggregate(signals)
-        tick = self._step(agg, signals, frames, smalls)
+        tick = self._step(agg, signals, fulls, smalls)
         return tick
 
     # ------------------------------------------------------------------
@@ -681,10 +694,13 @@ class Lifecycle:
     def _commit(self, agg, signals, frames, smalls, forced: bool, reason: str = "") -> Tick:
         cfg, c = self.cfg, self._c
         bg = {cam: ref.full for cam, ref in self.refs.cams.items() if cam in frames}
+        # Handles, not pixels: lazy frames are decoded by whoever reads
+        # them (the adapter decodes both sets in parallel). Plain arrays
+        # pass through as the same dicts as ever.
         commit = Commit(
             dart_index=self.dart_count,
-            bg=bg,
-            frames={cam: frames[cam] for cam in bg},
+            bg=as_frames(bg),
+            frames=as_frames({cam: frames[cam] for cam in bg}),
             dart_cams=list(agg.dart_cams),
             forced=forced,
         )

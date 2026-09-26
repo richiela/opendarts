@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opendarts"
-version = "0.81.1"
+version = "0.90.0"
 description = "Camera-based automatic scoring for steel-tip darts"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -86,6 +86,7 @@ include = ["opendarts*"]
 # live beside the package, not inside it.
 [tool.setuptools.package-data]
 "opendarts.live.dashboard" = ["*.html", "*.css", "*.js"]
+"opendarts.live.ui" = ["*.html", "*.css", "js/*.js", "fonts/*"]
 
 # NO [tool.pytest.ini_options] here on purpose. pytest.ini already exists
 # and takes precedence over pyproject.toml, so a section here would be

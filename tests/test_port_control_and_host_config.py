@@ -295,7 +295,7 @@ def test_the_bind_host_is_a_config_key_with_no_control_on_the_page(
     assert "/api/host" not in routes
     assert "/api/port" not in routes, "the per-setting route was retired"
 
-    html = client.get("/").text
+    html = client.get("/?ui=classic").text
     assert '<input type="text" id="server-host"' not in html
 
 
@@ -306,7 +306,7 @@ def test_the_bind_host_is_a_config_key_with_no_control_on_the_page(
 def test_config_tab_has_a_real_port_control_wired_to_the_endpoint(package_root):
     html = TestClient(
         create_app(package_root=package_root, enable_background_poll=False)
-    ).get("/").text
+    ).get("/?ui=classic").text
 
     assert 'id="server-port"' in html
     assert "'/api/config'" in html
@@ -321,7 +321,7 @@ def test_port_field_says_plainly_that_it_applies_at_restart(package_root):
     name WHEN the value lands, because it is not now."""
     html = TestClient(
         create_app(package_root=package_root, enable_background_poll=False)
-    ).get("/").text
+    ).get("/?ui=classic").text
 
     assert "applies at the next restart, not now" in html
 
@@ -329,7 +329,7 @@ def test_port_field_says_plainly_that_it_applies_at_restart(package_root):
 def test_bind_address_is_displayed_but_has_no_input(package_root):
     html = TestClient(
         create_app(package_root=package_root, enable_background_poll=False)
-    ).get("/").text
+    ).get("/?ui=classic").text
 
     assert 'id="server-host"' in html
     # Displayed as text, never as a form control -- not even a disabled
@@ -354,7 +354,7 @@ def test_the_old_info_tabs_config_duplication_did_not_come_back(package_root):
     DUPLICATION's absence, which is what actually mattered."""
     html = TestClient(
         create_app(package_root=package_root, enable_background_poll=False)
-    ).get("/").text
+    ).get("/?ui=classic").text
 
     # The old renderer and its table id are gone -- renamed, not left
     # rendering into an element that no longer exists. (The name survives
@@ -423,6 +423,10 @@ def test_template_config_covers_every_key_and_omits_capabilities():
         # only by reading a shell script.
         "always_update",
         "update_on_next_restart",
+        # 2026-09-26, detection's small decode. Listed because it is the
+        # owner's flip-back switch: its default (true) changes how every
+        # frame is decoded, and false must be findable without source.
+        "detect_from_small_decode",
     }
     assert set(raw) - {"_readme"} == expected
 
@@ -577,7 +581,7 @@ def test_bind_address_and_port_are_one_field(package_root):
     may DO to them, not a reason to file them under separate headings."""
     html = TestClient(
         create_app(package_root=package_root, enable_background_poll=False)
-    ).get("/").text
+    ).get("/?ui=classic").text
     server = _enclosing_config_field(html, "server-port")
 
     import re as _re

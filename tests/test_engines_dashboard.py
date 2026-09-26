@@ -37,7 +37,7 @@ def test_config_tab_has_no_engine_config_controls(package_root):
     2026-09-09 -- an API audit found the route had outlived its own UI and
     had no caller anywhere. /api/state still REPORTS the live engine set;
     nothing changes it at runtime."""
-    html = TestClient(create_app(package_root=package_root, enable_background_poll=False)).get("/").text
+    html = TestClient(create_app(package_root=package_root, enable_background_poll=False)).get("/?ui=classic").text
     assert 'id="engine-config-list"' not in html
     assert 'id="engine-config-timeout"' not in html
     assert 'id="btn-save-engine-config"' not in html
@@ -48,7 +48,7 @@ def test_config_tab_has_no_engine_config_controls(package_root):
 
 
 def test_scoring_table_thead_has_a_stable_row_id_for_dynamic_engine_columns(package_root):
-    html = TestClient(create_app(package_root=package_root, enable_background_poll=False)).get("/").text
+    html = TestClient(create_app(package_root=package_root, enable_background_poll=False)).get("/?ui=classic").text
     assert 'id="packages-thead-row"' in html
 
 

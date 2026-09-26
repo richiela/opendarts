@@ -229,6 +229,7 @@ import asyncio
 import collections
 import contextlib
 import dataclasses
+import hashlib
 import html
 import json
 import logging
@@ -258,6 +259,10 @@ from opendarts.capture.throw_package import (
 from opendarts.live import (audio, build_info, camera_names, capabilities,
                            diagnostics_gate, local_capture, vcam)
 from opendarts.live import config_document
+from opendarts.live import ui as next_ui
+from opendarts.live.displays import DisplayError, DisplayStore
+from opendarts.live.dashboard_choice import CHOICES as DASHBOARD_CHOICES, DashboardChoice
+from opendarts.live import calibration_progress
 from opendarts.live.config import (
     DEFAULT_VIDEO_RECORD_MODE,
     always_update,
@@ -293,6 +298,7 @@ from opendarts.live.capture_daemon import (
 )
 from opendarts.capture.calibration_package import DEFAULT_CALIBRATION_PACKAGE_ROOT
 from opendarts.live.ad_ws_listener import AdWsListener
+from opendarts.live.heap_trim import release_freed_heap
 from opendarts.live.board_status import BOARD_STATUS_UNKNOWN
 from opendarts.capture.trigger_state import MAX_DARTS_PER_TURN
 from opendarts.live.logging_setup import DEFAULT_LOG_DIR
@@ -1141,8 +1147,10 @@ def _package_record(meta_path: Path) -> "dict[str, Any] | None":
             # already stored -- and the viewer plays the clip.
             #
             # NOT "does meta have a video block" any more: since
-            # 2026-09-22 every package has one, because every package
-            # stores its two frames as a two-frame stills clip. Asking the
+            # 2026-09-22 every package has one, because a package that is
+            # not a recording stores its two frames as a two-frame stills
+            # clip (written just after its data, see
+            # opendarts.capture.clip). Asking the
             # old question would call every throw "recorded" and hide the
             # button on exactly the throws that need it. is_recorded_clip
             # reads the block's `kind`, and treats a block without one
@@ -1646,6 +1654,12 @@ class AppState:
         # the list is dropped wholesale when the visit rotates), so it
         # needs no maxlen.
         self.visit_throws: list[dict[str, Any]] = []
+        # The scoring page's board photo (opendarts.live.board_photo): the
+        # latest empty-board JPEG and a short content hash, which is all a
+        # screen needs to know whether it is looking at the current one.
+        # None until the first dart of the session.
+        self.board_photo_jpeg: bytes | None = None
+        self.board_photo_version: str | None = None
         # Completed-visit ring for GET /api/live/recent (see
         # RETAIL_RECENT_VISITS_MAX). Appended when a visit closes, so it
         # is independent of whether throw packages are ever written to
@@ -2123,10 +2137,18 @@ class AppState:
                 **extra_kwargs,
             )
         except Exception as exc: # noqa: BLE001 -- same graceful-degrade rule
+            calibration_error = str(exc)
+        else:
+            calibration_error = None
+        if calibration_error is not None:
+            # Only now, with `exc` gone, is a FAILED calibration's frame
+            # pool actually unreferenced -- its traceback pinned it through
+            # bootstrap_calibrations()'s own trim. See opendarts.live.heap_trim.
+            release_freed_heap("failed calibration")
             return {
                 "calibrations": {},
                 "raw_calibrations": {},
-                "calibration_error": str(exc),
+                "calibration_error": calibration_error,
             }
         return {
             "calibrations": calibration_status_dict(calibs, self.n_cameras),
@@ -2803,6 +2825,21 @@ class AppState:
             await self.publish_retail_state(
                 "manual_reset" if event.get("reason") == "reset" else "visit_complete"
             )
+        elif kind == "BOARD_PHOTO":
+            # A new empty-board photo, rendered off the capture thread
+            # just after Start and after a takeout/Reset that changed the
+            # board. The JPEG stays here; screens are told
+            # only its version and fetch GET /api/board/photo themselves,
+            # so a 200 KB image never rides the event socket.
+            jpeg = event.get("jpeg")
+            if isinstance(jpeg, (bytes, bytearray)) and jpeg:
+                self.board_photo_jpeg = bytes(jpeg)
+                self.board_photo_version = hashlib.sha1(self.board_photo_jpeg).hexdigest()[:12]
+                await self._broadcast({
+                    "type": "BOARD_PHOTO", "ts": ts,
+                    "version": self.board_photo_version,
+                    "visit_id": event.get("visit_id"),
+                })
         elif kind == "AD_BOARD_STATUS":
             # AD's indicator light (Scoring tab header, 2026-08-14).
             # Pushed by AdWsListener's own on_status_change callback --
@@ -2878,20 +2915,30 @@ class AppState:
             was_known = str(path) in self._known_package_paths
             record = await self._refresh_package(path) if path else None
             current = self._packages_cache
-            log.info(
-                "live PACKAGE_SAVED event: %s (%d package(s) total, %s)",
-                path, len(current),
-                "updated" if was_known else ("new" if record else "not readable yet"),
-            )
-            await self._broadcast(
-                {
-                    "type": "PACKAGES_UPDATED",
-                    "ts": ts,
-                    "count": len(current),
-                    "new_count": 0 if was_known or record is None else 1,
-                    "packages": self._broadcast_packages([record] if record else []),
-                }
-            )
+            if event.get("refresh_only") and was_known and record is not None:
+                # The daemon's "all"-mode clip landing (see capture_daemon.
+                # _write_package_clip): the cached row learns has_video for
+                # /api/packages, but screens are not told -- nothing they
+                # show depends on it in that mode, and the classic
+                # dashboard rebuilds its whole Engines table per broadcast.
+                # A package the cache had not seen, or has lost, is
+                # announced as usual.
+                log.debug("live PACKAGE_SAVED (refresh only): %s", path)
+            else:
+                log.info(
+                    "live PACKAGE_SAVED event: %s (%d package(s) total, %s)",
+                    path, len(current),
+                    "updated" if was_known else ("new" if record else "not readable yet"),
+                )
+                await self._broadcast(
+                    {
+                        "type": "PACKAGES_UPDATED",
+                        "ts": ts,
+                        "count": len(current),
+                        "new_count": 0 if was_known or record is None else 1,
+                        "packages": self._broadcast_packages([record] if record else []),
+                    }
+                )
         else:
             log.debug("unknown live event type %r, ignoring: %r", kind, event)
 
@@ -3355,6 +3402,7 @@ class AppState:
                 "n_throws": len(self.visit_throws),
                 "max_throws": MAX_DARTS_PER_TURN,
                 "throws": list(self.visit_throws),
+                "board_photo_version": self.board_photo_version,
             },
             "packages": {
                 "count": len(self._packages_cache),
@@ -3458,6 +3506,28 @@ class AppState:
             self._tasks.append(
                 asyncio.create_task(self._idle_timeout_loop(), name="opendarts-idle-timeout")
             )
+        self._tasks.append(
+            asyncio.create_task(self._calibration_progress_loop(), name="opendarts-calibration-progress")
+        )
+
+    async def _calibration_progress_loop(self) -> None:
+        """Push calibration progress (opendarts.live.calibration_progress)
+        to every screen as CALIBRATION_PROGRESS, whenever it moves. The
+        calibration records from its own thread; this only looks, five
+        times a second, and sends nothing when nothing changed -- so it is
+        silent except during a calibration."""
+        seen = calibration_progress.PROGRESS.seq
+        while True:
+            await asyncio.sleep(0.2)
+            try:
+                seq = calibration_progress.PROGRESS.seq
+                if seq == seen:
+                    continue
+                seen = seq
+                await self._broadcast({"type": "CALIBRATION_PROGRESS",
+                                       **calibration_progress.PROGRESS.snapshot()})
+            except Exception:  # noqa: BLE001 -- a report must never stop
+                log.debug("calibration progress push failed", exc_info=True)
 
     async def stop_background_tasks(self) -> None:
         for task in self._tasks:
@@ -3530,7 +3600,63 @@ def _page_fingerprint(*parts: str) -> str:
 # touches the backend should not either, and a checkout with no git (a
 # tarball copy) must still work.
 _DASHBOARD_PAGE_VERSION = _page_fingerprint(
-    _DASHBOARD_INDEX_HTML, _DASHBOARD_APP_CSS, _DASHBOARD_APP_JS)
+    _DASHBOARD_INDEX_HTML, _DASHBOARD_APP_CSS, _DASHBOARD_APP_JS,
+    # The new dashboard shares the one fingerprint (and the one HELLO
+    # field), so a change to either page reloads every open screen.
+    *next_ui.FINGERPRINT_PARTS)
+
+
+def _host_label() -> str:
+    # The machine's name leads the tab title, because with several rigs open
+    # at once every tab used to read "opendarts live dashboard" and the only
+    # way to tell them apart was to click through. `.local` is the mDNS
+    # suffix macOS appends; it adds nothing on a tab strip. Escaped because
+    # a hostname is operator-controlled text going into HTML.
+    return html.escape(
+        (platform.node() or "").removesuffix(".local") or "opendarts"
+    )
+
+
+def _dashboard_bootstrap(cam_ids: "list[int]") -> "dict[str, Any]":
+    # Every server-computed value on the page, in ONE JSON block index.html
+    # carries and app.js reads once (OD_BOOTSTRAP). A new value the page needs
+    # is a new key here -- not another interpolation into a template, which is
+    # the growth that got the old f-string to 6,000 lines.
+    return {
+        "cam_ids": cam_ids,
+        # Board vocabulary for the "Which was actually right?" modal's
+        # manual sector/ring picker, taken from opendarts.geometry.board
+        # itself (SECTOR_NUMBERS_CLOCKWISE, and board_ring_names() which
+        # derives the ring names by probing sector_ring_for_point) rather
+        # than hand-typed: a human's manually-confirmed segment has to be
+        # spelled exactly the way opendarts's own scorer spells it or it
+        # could never compare equal to any engine's answer.
+        "board_sectors": [str(n) for n in SECTOR_NUMBERS_CLOCKWISE],
+        "board_rings": board_ring_names(),
+        # Drives whether the per-throw "Save frames" control is offered
+        # at all. On "all" every throw already records a clip, so the
+        # button can only ever duplicate what the rig just did -- and it
+        # cannot be decided from the package's own has_video, because
+        # the clip is finalised a moment AFTER the package is saved, so
+        # a freshly-saved throw reads has_video=false and the useless
+        # button flashes up on every dart. The mode is restart-scoped
+        # (CONFIG_KEYS marks it restart=True), so reading it once here
+        # at page render cannot go stale within a session.
+        #
+        # EFFECTIVE mode, resolved the same way run_product.py resolves
+        # it: read_config_section returns None for an absent or invalid
+        # value, and None means "the default applies". Shipping that raw
+        # None would make the gate below compare against undefined and
+        # show the button on a rig that records every throw -- i.e. the
+        # exact bug this key exists to fix.
+        "video_record_mode": (
+            normalise_video_record_mode(read_config_section("video_record_mode"))
+            or DEFAULT_VIDEO_RECORD_MODE
+        ),
+        # The page's own identity, compared against every HELLO -- see
+        # _DASHBOARD_PAGE_VERSION.
+        "page_version": _DASHBOARD_PAGE_VERSION,
+    }
 
 
 def _render_dashboard_html(n_cameras: int) -> str:
@@ -3701,55 +3827,8 @@ def _render_dashboard_html(n_cameras: int) -> str:
         </figure>'''
         for c in cam_ids
     )
-    # The machine's name leads the tab title, because with several rigs open
-    # at once every tab used to read "opendarts live dashboard" and the only
-    # way to tell them apart was to click through. `.local` is the mDNS
-    # suffix macOS appends; it adds nothing on a tab strip. Escaped because
-    # a hostname is operator-controlled text going into HTML.
-    host_label = html.escape(
-        (platform.node() or "").removesuffix(".local") or "opendarts"
-    )
-    # Every server-computed value on the page, in ONE JSON block index.html
-    # carries and app.js reads once (OD_BOOTSTRAP). A new value the page needs
-    # is a new key here -- not another interpolation into a template, which is
-    # the growth that got the old f-string to 6,000 lines.
-    bootstrap_json = json.dumps(
-        {
-            "cam_ids": cam_ids,
-            # Board vocabulary for the "Which was actually right?" modal's
-            # manual sector/ring picker, taken from opendarts.geometry.board
-            # itself (SECTOR_NUMBERS_CLOCKWISE, and board_ring_names() which
-            # derives the ring names by probing sector_ring_for_point) rather
-            # than hand-typed: a human's manually-confirmed segment has to be
-            # spelled exactly the way opendarts's own scorer spells it or it
-            # could never compare equal to any engine's answer.
-            "board_sectors": [str(n) for n in SECTOR_NUMBERS_CLOCKWISE],
-            "board_rings": board_ring_names(),
-            # Drives whether the per-throw "Save frames" control is offered
-            # at all. On "all" every throw already records a clip, so the
-            # button can only ever duplicate what the rig just did -- and it
-            # cannot be decided from the package's own has_video, because
-            # the clip is finalised a moment AFTER the package is saved, so
-            # a freshly-saved throw reads has_video=false and the useless
-            # button flashes up on every dart. The mode is restart-scoped
-            # (CONFIG_KEYS marks it restart=True), so reading it once here
-            # at page render cannot go stale within a session.
-            #
-            # EFFECTIVE mode, resolved the same way run_product.py resolves
-            # it: read_config_section returns None for an absent or invalid
-            # value, and None means "the default applies". Shipping that raw
-            # None would make the gate below compare against undefined and
-            # show the button on a rig that records every throw -- i.e. the
-            # exact bug this key exists to fix.
-            "video_record_mode": (
-                normalise_video_record_mode(read_config_section("video_record_mode"))
-                or DEFAULT_VIDEO_RECORD_MODE
-            ),
-            # The page's own identity, compared against every HELLO -- see
-            # _DASHBOARD_PAGE_VERSION.
-            "page_version": _DASHBOARD_PAGE_VERSION,
-        }
-    )
+    host_label = _host_label()
+    bootstrap_json = json.dumps(_dashboard_bootstrap(cam_ids))
     # The page-level values first, the two whole files last, so nothing that
     # merely LOOKS like a placeholder inside app.css/app.js is ever rescanned.
     return (
@@ -3760,6 +3839,22 @@ def _render_dashboard_html(n_cameras: int) -> str:
         .replace("@@OD_APP_CSS@@", _DASHBOARD_APP_CSS)
         .replace("@@OD_APP_JS@@", _DASHBOARD_APP_JS)
     )
+
+
+
+def _render_next_html(n_cameras: int, role: str = "control") -> str:
+    """The greenfield dashboard (opendarts/live/ui, dev/ux/BRIEF.md): the
+    same bootstrap as the current page, plus the machine's name for the
+    bar, which this page shows rather than only titling the tab with it.
+
+    ``role`` is "control" (the whole app) or "display" (a screen that only
+    shows, set up from a controller -- opendarts/live/displays.py). One
+    page, two roles, so a fix to what a display shows is a fix to what a
+    controller shows."""
+    bootstrap = _dashboard_bootstrap(list(range(n_cameras)))
+    bootstrap["host_label"] = html.unescape(_host_label())
+    bootstrap["role"] = role
+    return next_ui.render(host_label=_host_label(), bootstrap_json=json.dumps(bootstrap))
 
 
 def _frame_sink_attached(hub: "Any") -> "bool | None":
@@ -3982,7 +4077,15 @@ class _SharedJpegCache:
 
 def _grab_with_jpeg(hub: "Any", cam_id: int) -> "tuple[Any, bytes | None]":
     """The hub's frame and camera JPEG for one slot. A hub without
-    grab_with_jpeg (a test double, say) has no JPEG to offer."""
+    grab_with_jpeg (a test double, say) has no JPEG to offer.
+
+    The frame may come back UNDECODED -- a LazyFrame, when the hub detects
+    from small decodes (opendarts.capture.lazy_frame) -- so a stream that
+    forwards the camera's JPEG never pays for a full decode. Whoever needs
+    its pixels calls pixels_of() on it."""
+    grab_lazy = getattr(hub, "grab_jpeg_lazy", None)
+    if grab_lazy is not None:
+        return grab_lazy(cam_id)
     grab_pair = getattr(hub, "grab_with_jpeg", None)
     if grab_pair is not None:
         return grab_pair(cam_id)
@@ -4004,6 +4107,11 @@ def _encode_preview_jpeg(
     there is nothing better to send)."""
     import cv2
 
+    from opendarts.capture.lazy_frame import pixels_of
+
+    # A LazyFrame decodes here, on the encode's worker thread, once per
+    # frame however many previews share it (_SharedJpegCache).
+    frame = pixels_of(frame)
     # max_width=0 means "do not downscale at all" -- the transport case,
     # where a consumer is SCORING these frames rather than looking at them.
     # Defaults keep the dashboard preview exactly as it was.
@@ -4044,6 +4152,8 @@ def create_app(
     reprojection_targets_px: dict[int, float] | None = None,
     throw_capture: Any = None,
     capture_root: "Path | None" = None,
+    display_store: "DisplayStore | None" = None,
+    dashboard_choice: "DashboardChoice | None" = None,
 ) -> FastAPI:
     """FastAPI app factory -- constructor-injected package_root/od_base_url
     (never a hardcoded module-level DEFAULT_PACKAGE_ROOT reference inside
@@ -4124,6 +4234,10 @@ def create_app(
     """
     package_root = Path(package_root)
     scratch_dir = Path(scratch_dir)
+    # In memory unless the caller persists it (run_product passes
+    # data/config.json), the same way as the other operator stores.
+    displays = display_store if display_store is not None else DisplayStore()
+    dashboard = dashboard_choice if dashboard_choice is not None else DashboardChoice()
     state = AppState(
         package_root=package_root,
         scratch_dir=scratch_dir,
@@ -4181,9 +4295,7 @@ def create_app(
     app = FastAPI(title="opendarts live dashboard", lifespan=lifespan)
     app.state.opendarts_state = state # exposed for tests / introspection
 
-    @app.get("/", response_class=HTMLResponse)
-    async def index(request: Request) -> Response:
-        html = _render_dashboard_html(n_cameras)
+    def _page_response(request: Request, page: str) -> Response:
         headers = {"Cache-Control": "no-store, max-age=0", "Vary": "Accept-Encoding"}
         # GZIPPED WHEN ACCEPTED, 2026-09-17: ~300 KB of page (much of it
         # comments) is ~96 KB compressed, which matters to a tablet on
@@ -4193,11 +4305,108 @@ def create_app(
             import gzip
 
             return Response(
-                gzip.compress(html.encode("utf-8"), compresslevel=6),
+                gzip.compress(page.encode("utf-8"), compresslevel=6),
                 media_type="text/html; charset=utf-8",
                 headers={**headers, "Content-Encoding": "gzip"},
             )
-        return HTMLResponse(html, headers=headers)
+        return HTMLResponse(page, headers=headers)
+
+    @app.get("/", response_class=HTMLResponse)
+    async def index(request: Request) -> Response:
+        """The dashboard -- the new one or the classic one, whichever the
+        rig's switch says (opendarts/live/dashboard_choice.py). Two query
+        options, never paths:
+
+          ``?display`` (``?display=tv&name=Lounge TV``) -- the new page in
+            its display role, for a TV nobody touches; always the new page,
+            since the classic one has no such role.
+          ``?ui=new`` / ``?ui=classic`` -- the other dashboard on this one
+            screen, once, without flipping the switch for everyone.
+        """
+        q = request.query_params
+        if "display" in q:
+            return _page_response(request, _render_next_html(n_cameras, role="display"))
+        ui = q.get("ui") if q.get("ui") in DASHBOARD_CHOICES else dashboard.get()
+        if ui == "classic":
+            return _page_response(request, _render_dashboard_html(n_cameras))
+        return _page_response(request, _render_next_html(n_cameras))
+
+    @app.get("/api/dashboard")
+    async def api_dashboard_get() -> dict[str, Any]:
+        """Which dashboard ``/`` serves."""
+        return {"ok": True, "ui": dashboard.get(), "choices": list(DASHBOARD_CHOICES)}
+
+    @app.put("/api/dashboard")
+    async def api_dashboard_put(payload: dict[str, Any] = Body(...)) -> Any:
+        """Flip it. Every open dashboard is told (DASHBOARD_SWITCHED) and
+        reloads onto the other page; a display is unaffected."""
+        try:
+            ui = dashboard.set(payload.get("ui"))
+        except ValueError as exc:
+            return JSONResponse({"ok": False, "reason": str(exc)}, status_code=400)
+        await state._broadcast({"type": "DASHBOARD_SWITCHED", "ui": ui})  # noqa: SLF001
+        return {"ok": True, "ui": ui}
+
+    # ---- displays: screens that only show, set up from any controller ----
+    # opendarts/live/displays.py has the model. Every change is pushed to
+    # the displays over the events socket as DISPLAY_UPDATED, so a TV
+    # changes the moment a phone saves, with no polling. A display is
+    # ``/?display`` (above).
+
+    def _display_error(exc: DisplayError) -> JSONResponse:
+        return JSONResponse({"ok": False, "reason": exc.reason}, status_code=exc.status)
+
+    @app.get("/api/displays")
+    async def api_displays() -> dict[str, Any]:
+        return {"ok": True, "displays": displays.list()}
+
+    @app.post("/api/displays/hello")
+    async def api_display_hello(payload: dict[str, Any] = Body(...)) -> Any:
+        """A display reporting in (on load, then every ~20 s): registers it
+        the first time, refreshes its presence, and answers with the
+        settings it should be showing."""
+        try:
+            rec = displays.hello(payload.get("display_id"), payload.get("info"), payload.get("name"))
+        except DisplayError as exc:
+            return _display_error(exc)
+        return {"ok": True, "display": rec}
+
+    @app.patch("/api/displays/{display_id}")
+    async def api_display_update(display_id: str, payload: dict[str, Any] = Body(...)) -> Any:
+        try:
+            rec = displays.update(display_id, name=payload.get("name"), settings=payload.get("settings"))
+        except DisplayError as exc:
+            return _display_error(exc)
+        await state._broadcast({"type": "DISPLAY_UPDATED", "display": rec})  # noqa: SLF001
+        return {"ok": True, "display": rec}
+
+    @app.post("/api/displays/{display_id}/identify")
+    async def api_display_identify(display_id: str) -> Any:
+        """Flash the display's name on it, so you know which screen a row
+        on your phone is."""
+        rec = displays.get(display_id)
+        if rec is None:
+            return _display_error(DisplayError("no such display", 404))
+        await state._broadcast({"type": "DISPLAY_IDENTIFY", "display_id": display_id, "name": rec["name"]})  # noqa: SLF001
+        return {"ok": True, "online": rec["online"]}
+
+    @app.post("/api/displays/{display_id}/reload")
+    async def api_display_reload(display_id: str) -> Any:
+        """Reload the page on a display nobody can reach with a keyboard."""
+        rec = displays.get(display_id)
+        if rec is None:
+            return _display_error(DisplayError("no such display", 404))
+        await state._broadcast({"type": "DISPLAY_RELOAD", "display_id": display_id})  # noqa: SLF001
+        return {"ok": True, "online": rec["online"]}
+
+    @app.delete("/api/displays/{display_id}")
+    async def api_display_forget(display_id: str) -> Any:
+        """Forget a display. If it is still open it registers again, fresh,
+        on its next report -- this is for a screen that is gone."""
+        if not displays.forget(display_id):
+            return _display_error(DisplayError("no such display", 404))
+        await state._broadcast({"type": "DISPLAY_FORGOTTEN", "display_id": display_id})  # noqa: SLF001
+        return {"ok": True}
 
     @app.get("/api/health")
     async def health() -> dict[str, Any]:
@@ -4236,6 +4445,23 @@ def create_app(
     @app.get("/api/state")
     async def api_state() -> dict[str, Any]:
         return state.state_dict()
+
+    @app.get("/api/board/photo")
+    async def api_board_photo() -> Response:
+        """The latest empty-board photo for the scoring page, as JPEG. 404
+        until the session's first dart has produced one. The version is in
+        /api/state (`visit.board_photo_version`) and the BOARD_PHOTO event;
+        a screen fetches `?v=<version>`, so the image may be cached for good."""
+        if state.board_photo_jpeg is None:
+            return JSONResponse({"error": "no board photo yet"}, status_code=404)
+        return Response(
+            content=state.board_photo_jpeg,
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": "public, max-age=31536000, immutable",
+                "ETag": f'"{state.board_photo_version}"',
+            },
+        )
 
     @app.get("/api/packages")
     async def api_packages() -> list[dict[str, Any]]:
@@ -4643,6 +4869,12 @@ def create_app(
                 ),
             }
         return {"ok": True, "cameras": cameras, **meta}
+
+    @app.get("/api/calibration/progress")
+    async def api_calibration_progress() -> dict[str, Any]:
+        """How far along the current (or last) calibration is -- the same
+        body CALIBRATION_PROGRESS pushes, for a page that opens mid-way."""
+        return {"ok": True, **calibration_progress.PROGRESS.snapshot()}
 
     @app.post("/api/calibration/refresh")
     async def api_calibration_refresh() -> dict[str, Any]:
@@ -5886,8 +6118,8 @@ def create_app(
         meta_p = pkg / "meta.json"
         meta = json.loads(meta_p.read_text()) if meta_p.exists() else {}
         cams = meta.get("frame_cameras") or meta.get("cameras") or []
-        # A RECORDED clip, not merely a clip: every package has a
-        # two-frame stills clip now, and that is not something to scrub.
+        # A RECORDED clip, not merely a clip: an unrecorded package has a
+        # two-frame stills clip, and that is not something to scrub.
         has_clip = _clip_mod.is_recorded_clip(meta.get("video"))
         base = f"/api/packages/{session}/{throw_id}"
 

@@ -270,6 +270,7 @@ from opendarts.calibration.ring_boundary_offset import SCHEMA as _RING_BOUNDARY_
 from opendarts.capture.throw_package import calibration_from_dict, calibration_to_dict
 from opendarts.geometry.board_color_calibration import SCHEMA as _BOARD_COLOR_CALIBRATION_SCHEMA
 from opendarts.live import capabilities
+from opendarts.live.heap_trim import release_freed_heap
 from opendarts.pipeline import CameraCalibration
 
 log = logging.getLogger(__name__)
@@ -1366,6 +1367,7 @@ def save_calibration_package_background(
         _IN_FLIGHT_PACKAGE_IDS[package_id] += 1
 
     def _run() -> None:
+        nonlocal raw_frames_by_cam
         try:
             try:
                 save_calibration_package(
@@ -1412,6 +1414,12 @@ def save_calibration_package_background(
                 _IN_FLIGHT_PACKAGE_IDS[package_id] -= 1
                 if _IN_FLIGHT_PACKAGE_IDS[package_id] <= 0:
                     del _IN_FLIGHT_PACKAGE_IDS[package_id]
+            # This closure is the LAST holder of the calibration's raw frame
+            # pool -- `bootstrap_calibrations()` returned long ago. Drop it,
+            # then hand the freed heap back; see opendarts.live.heap_trim
+            # for why freeing alone does not shrink the process.
+            raw_frames_by_cam = None
+            release_freed_heap("calibration package save")
 
     thread = threading.Thread(
         target=_run, name="calib-pkg-save", daemon=True

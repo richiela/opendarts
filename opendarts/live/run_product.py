@@ -190,6 +190,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from opendarts.lifecycle.settings import LifecycleSettingsStore
+from opendarts.live.displays import DisplayStore
+from opendarts.live.dashboard_choice import DashboardChoice
 from opendarts.live import (camera_names, capabilities, local_capture,
                            remote_capture, vcam)
 from opendarts.live.ad_ground_truth import (
@@ -731,6 +733,19 @@ def _build_components(
     # authority on how many slots it has, and a hub that cannot say falls
     # back to the default camera count purely so the LOG LINE has a
     # number in it.
+    # DETECTION DECODES SMALL (opendarts/capture/lazy_frame.py): set before
+    # the hub's pump runs, asked of the hub the same way as the ring below.
+    from opendarts.live.config import detect_from_small_decode_enabled
+
+    small_decode = detect_from_small_decode_enabled()
+    set_small_decode = getattr(hub, "set_small_decode", None)
+    if callable(set_small_decode):
+        set_small_decode(small_decode)
+        log.info(
+            "detection: %s (detect_from_small_decode in data/config.json)",
+            "each JPEG decoded straight to small grey; full decode only for scored frames"
+            if small_decode else "every frame fully decoded in the pump",
+        )
     slots = getattr(hub, "configs", None)
     n_slots = len(slots) if slots is not None else len(local_capture.DEFAULT_CAMERA_DEVICES)
     attach_ring = getattr(hub, "set_frame_ring", None)
@@ -913,6 +928,11 @@ def _build_components(
     lifecycle_settings_store = LifecycleSettingsStore(
         snapshot_path=DEFAULT_CONFIG_PATH
     )
+    # Each display's settings (opendarts/live/displays.py), kept across
+    # restarts: a TV comes back looking the way it was set up.
+    display_store = DisplayStore(snapshot_path=DEFAULT_CONFIG_PATH)
+    # Which dashboard `/` serves, new or classic -- a switch in either one.
+    dashboard_choice = DashboardChoice(snapshot_path=DEFAULT_CONFIG_PATH)
 
     app = create_app(
         package_root=package_root,
@@ -928,6 +948,8 @@ def _build_components(
         controller=controller,
         engine_config_store=engine_config_store,
         lifecycle_settings_store=lifecycle_settings_store,
+        display_store=display_store,
+        dashboard_choice=dashboard_choice,
         ad_ws_listener=ad_ws_listener,
         vcam_set=vcam_set,
         vcam_set_factory=make_virtual_camera_set,

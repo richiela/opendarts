@@ -17,6 +17,9 @@ Only what those consumers read lives here:
   for exactly those arrays, when the capture loop could prove the pairing
   (see ``opendarts.live.capture_daemon._FrameJpegIndex``). Storage only:
   nothing scores from them.
+* ``last_frame_generations`` / ``bg_generations`` -- the frame ring
+  generation holding each of those arrays, paired the same way. Storage
+  only: they name the ring frames the package clip is written from.
 * ``settle_started_monotonic`` / ``camera_settled_at_monotonic`` /
   ``settle_duration_s`` -- package diagnostics.
 
@@ -64,6 +67,13 @@ class ThrowTriggerState:
     #: trigger -- NOT ``true_baseline_frames``, which on a commit tick may
     #: already be the post-dart reference).
     bg_jpegs: dict[int, bytes] | None = None
+    #: The frame ring generation (opendarts.capture.frame_ring.FrameSet
+    #: ``generation``) holding each array in ``last_frame`` / the bg, per
+    #: camera -- paired the same way as the JPEG bytes, and absent the
+    #: same way. The package clip takes its frames out of the ring by these
+    #: numbers; a camera without one gets the two-frame clip.
+    last_frame_generations: dict[int, int] | None = None
+    bg_generations: dict[int, int] | None = None
     settle_started_monotonic: float | None = None
     camera_settled_at_monotonic: dict[int, float] = field(default_factory=dict)
     settle_duration_s: float | None = None

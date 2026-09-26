@@ -295,3 +295,88 @@ def test_a_paused_ring_stops_growing_while_the_pump_keeps_delivering(three_camer
     ring.resume()
     assert _wait_until(lambda: ring.stats()["sets"] > frozen)
     hub.close_all()
+
+
+# -- the generation a frame is named by -----------------------------------
+
+
+def _paired_frames_are_the_ring_sets_they_name(hub, ring, slots=(0, 1, 2)) -> int:
+    """grab_paired() for every slot, checked against the ring: the set of
+    the returned generation holds that very frame (its array, or its JPEG
+    bytes object), and the set before it does NOT -- the number is the
+    FIRST set holding it. Returns how many pairs were checked."""
+    checked = 0
+    for _ in range(20):
+        for i in slots:
+            arr, jpeg, gen = hub.grab_paired(i)
+            if arr is None or gen is None:
+                continue
+            assert _wait_until(lambda: any(s.generation >= gen for s in ring.snapshot().sets))
+            snap = ring.snapshot().sets
+            (held,) = [s for s in snap if s.generation == gen]
+            before = [s for s in snap if s.generation == gen - 1]
+            if jpeg is not None:
+                assert held.jpegs[i] is jpeg
+                assert not before or before[0].jpegs.get(i) is not jpeg
+            else:
+                assert held.pixels[i] is arr
+                assert not before or before[0].pixels.get(i) is not arr
+            checked += 1
+        time.sleep(0.003)
+    return checked
+
+
+def test_grab_paired_names_the_ring_set_holding_the_frame(three_cameras):
+    """THE NUMBER A PACKAGE CLIP IS WRITTEN BY. The generation grab_paired()
+    returns with a frame is the ring set that holds exactly that frame --
+    which is what lets the clip take its frames out of the ring by number
+    instead of searching the ring for matching pixels."""
+    ring = FrameRing(10.0)
+    hub = CameraHub(configs=[], frame_ring=ring)
+    hub.open_all()
+    assert _wait_until(lambda: ring.stats()["sets"] >= 5)
+    assert _paired_frames_are_the_ring_sets_they_name(hub, ring) > 20
+    hub.close_all()
+
+
+def test_grab_paired_names_the_ring_set_for_jpeg_slots_too(monkeypatch):
+    """Same, with the synthetic JPEG on: the ring holds the slot as its
+    JPEG, and the named set holds that very bytes object."""
+    monkeypatch.setattr(local_capture_module.cv2, "VideoCapture", _CountingCapture)
+    ring = FrameRing(10.0)
+    hub = CameraHub(configs=[], frame_ring=ring)
+    hub.open_all()
+    assert _wait_until(lambda: ring.stats()["sets"] >= 5)
+    assert hub.grab_paired(0)[1] is not None, "synthetic JPEG expected on this slot"
+    assert _paired_frames_are_the_ring_sets_they_name(hub, ring) > 20
+    hub.close_all()
+
+
+class _StallingCapture(_CountingCapture):
+    """Camera 1 fails every other read, so the pump re-serves its previous
+    frame -- the same array -- in the next set."""
+
+    def read(self):
+        ok, arr = super().read()
+        if int(self.device) == 1 and self.reads % 2 == 0:
+            return False, None
+        return ok, arr
+
+
+def test_a_re_served_frame_keeps_the_generation_that_first_published_it(monkeypatch):
+    """A slot whose camera missed a cycle is published again unchanged. Its
+    generation stays the one that FIRST held it: the frame, and so the set
+    it names, is the same one -- and the clip then starts or ends on the
+    first copy, exactly where a search for its pixels would have."""
+    monkeypatch.setattr(local_capture_module.cv2, "VideoCapture", _StallingCapture)
+    monkeypatch.setattr(local_capture_module, "_synthesise_jpeg", lambda frame: None)
+    ring = FrameRing(10.0)
+    hub = CameraHub(configs=[], frame_ring=ring)
+    hub.open_all()
+    assert _wait_until(lambda: ring.stats()["sets"] >= 12)
+    assert _paired_frames_are_the_ring_sets_they_name(hub, ring, slots=(1,)) > 5
+    hub.close_all()
+    sets = ring.snapshot().sets
+    repeats = [(a, b) for a, b in zip(sets, sets[1:])
+               if 1 in a.pixels and 1 in b.pixels and a.pixels[1] is b.pixels[1]]
+    assert repeats, "camera 1 should have been re-served at least once"

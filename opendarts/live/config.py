@@ -414,6 +414,30 @@ def store_packages_enabled(path: Path = DEFAULT_CONFIG_PATH) -> bool:
     return True
 
 
+def detect_from_small_decode_enabled(path: Path = DEFAULT_CONFIG_PATH) -> bool:
+    """Whether detection decodes each camera JPEG straight to small grey
+    (see opendarts/capture/lazy_frame.py), leaving the full decode to the
+    frames that are scored.
+
+    Default TRUE. False restores the pre-2026-09-26 path exactly: every
+    frame fully decoded in the pump, detection shrinking it itself. A
+    malformed value reads as the default, with a warning -- it is a
+    performance switch, and neither direction loses evidence.
+    """
+    try:
+        value = read_config_section("detect_from_small_decode", path)
+    except Exception:  # noqa: BLE001 -- a bad config must never stop a session starting
+        return True
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    log.warning(
+        "config.json detect_from_small_decode=%r is not a boolean -- using true", value
+    )
+    return True
+
+
 def min_free_disk_gb(path: Path = DEFAULT_CONFIG_PATH) -> float:
     """The free-space floor both on-disk writers stop at, in GB.
 

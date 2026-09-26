@@ -160,7 +160,9 @@ Package layout on disk (one directory per throw):
                                       commit -- for an ordinary package;
                                       clip_cam{N}.mkv holds the whole
                                       bg..commit+1 run out of the frame
-                                      ring for a RECORDED one. Since
+                                      ring for a RECORDED one. A package
+                                      has one or the other, written once
+                                      (2026-09-26). Since
                                       2026-09-22 every package has these
                                       and none has frame PNGs: the same
                                       frames of a real 3-camera package
@@ -658,6 +660,7 @@ def save_throw_package(
     build: str | None = None,
     bg_jpegs: dict[int, bytes] | None = None,
     dart_jpegs: dict[int, bytes] | None = None,
+    defer_clips: bool = False,
 ) -> Path:
     """Write a complete replay package. Fails loudly (raises) rather than
     writing a partial package -- an incomplete package that LOOKS
@@ -803,6 +806,14 @@ def save_throw_package(
     them by ARRAY IDENTITY against the frame it is about to score, so
     "the bytes and the array came from the same pump cycle" is checked
     rather than assumed.
+
+    ``defer_clips`` (2026-09-26): write the data files only -- no clip, and
+    no ``video`` block in meta.json. The live path uses it: a package's
+    ONE clip is written just after its data, once the recording decision
+    is known, and meta.json is then pointed at it
+    (``opendarts.capture.throw_capture.ThrowCaptureService.
+    write_package_clip`` / ``opendarts.capture.clip.point_meta_at_clip``).
+    Until then the package has no readable frames.
     """
     from opendarts.capture import clip as clip_mod
 
@@ -824,22 +835,18 @@ def save_throw_package(
     # write_still_clips reads both frames straight back and compares them
     # before returning, so an inexact clip cannot reach disk.
     #
-    # WHY SYNCHRONOUSLY, HERE. Until now the PNGs were the safety net: a
-    # package had real frames the moment this function returned, and the
-    # ring-sliced clip written ~0.5s later on a background thread was
-    # allowed to swallow every exception precisely because of that. Drop
-    # the PNGs and keep that ordering and a package has NO frames for half
-    # a second -- and permanently none whenever the deferred write fails
-    # (ring aged out, encoder error, disk full, process killed). That is a
-    # far worse failure than the ~5.7 MB a package saves. So the floor is
-    # written here, from the two arrays already in hand, with no ring and
-    # no timing involved; the recorded-window clip goes back to being what
-    # it should be -- an optional upgrade that may fail harmlessly (see
-    # opendarts.capture.clip.finalize_throw_clip).
+    # Called without `defer_clips` (offline tooling, tests), the stills
+    # clip is written here, from the two arrays already in hand, with no
+    # ring and no timing involved. The live capture path defers it: the
+    # package's ONE clip -- a recorded window or these same two frames --
+    # is written right after this returns, once its recording decision is
+    # known (see this function's docstring). A failure there still ends in
+    # the stills clip, which needs nothing but the arrays; only a process
+    # killed in between leaves a package with data and no frames.
     #
     # `video` already set means the caller wrote the clips itself and is
     # handing over the finished pointer block; nothing to do here.
-    if video is None:
+    if video is None and not defer_clips:
         video = clip_mod.write_still_clips(
             dest_dir,
             {cam: bg_frames_bgr[cam] for cam in cameras},
@@ -921,10 +928,11 @@ def save_throw_package(
         meta["build"] = str(build)
     # The clip pointer block (opendarts.capture.clip): names each
     # camera's clip and the byte-identical bg/commit indices inside it.
-    # Always present on a package written now -- the stills clip above is
-    # written unconditionally -- and absent only on a package from before
-    # 2026-09-22 that never had a recording, which is how a reader still
-    # tells a clip package from a bg+dart-PNG one. Whether the clip is a
+    # Present on every finished package written now -- here when the clip
+    # was written above, or added by point_meta_at_clip() just after a
+    # deferred one -- and absent on a package from before 2026-09-22 that
+    # never had a recording, which is how a reader still tells a clip
+    # package from a bg+dart-PNG one. Whether the clip is a
     # RECORDING is a separate question with its own answer: the block's
     # `kind` (opendarts.capture.clip.is_recorded_clip).
     if video is not None:

@@ -326,6 +326,120 @@ function throwCall(t) {
 }
 
 let visitThrows = [];   // THROW_DETECTED payloads, in visit_index order
+
+// ---- Board photo ------------------------------------------------------
+// The Scoring tab can show a real photo of the board (built by the server
+// from every camera's empty-board frame, opendarts/live/board_photo.py)
+// with each dart drawn in where it landed, the way it looks from the oche.
+// "Diagram" is the flat drawn board, and is also what shows until Start
+// has produced the first photo (after that, a new one follows a takeout
+// or Reset when the board looks different). Per screen, like sound.
+const BOARD_VIEW_KEY = 'opendarts.boardView';
+// Must match board_photo.HALF_MM: the photo spans +/- this many mm.
+const PHOTO_HALF_MM = 235.0;
+// Where the player's eye is, in board mm (+z out of the board): at the
+// oche, 2.37 m back, a touch right of and below the bull.
+const OCHE_EYE = [120.0, -50.0, 2370.0];
+// Real darts lean only 5-15 degrees; seen from 2.4 m that barely shows,
+// yet in person the lean is what you notice. So the measured lean is
+// exaggerated -- each dart still leans its own way, just more.
+const DART_LEAN_EXAGGERATION = 2.0;
+const DEFAULT_FLIGHT_COLOR = '#262428';
+
+let boardView = 'photo';
+let boardPhotoVersion = null;
+let boardPhotoImg = null;   // set once the current version has loaded
+
+function readBoardView() {
+  try {
+    const v = window.localStorage.getItem(BOARD_VIEW_KEY);
+    return v === 'diagram' ? 'diagram' : 'photo';
+  } catch (err) {
+    return 'photo';
+  }
+}
+
+// Where a point in board space appears to the eye, drawn on the board
+// photo: the spot on the board plane that it covers. Returns [x, y, scale]
+// in board mm, scale being how much larger than life it looks (nearer =
+// larger).
+function ochePoint(P, eye) {
+  const k = eye[2] / (eye[2] - P[2]);
+  return [eye[0] + (P[0] - eye[0]) * k, eye[1] + (P[1] - eye[1]) * k, k];
+}
+
+function norm3(v) {
+  const n = Math.hypot(v[0], v[1], v[2]) || 1;
+  return [v[0] / n, v[1] / n, v[2] / n];
+}
+
+function cross3(a, b) {
+  return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+}
+
+// A steel-tip dart as seen from `eye`, in board mm: the parts to stroke
+// (point, barrel, shaft -- widths in mm already scaled for distance) and
+// the four flight vanes to fill, nearest last. Pure, so it can be tested
+// without a canvas. `axis` is the shaft direction out of the board; a
+// missing one means straight in.
+function dartSilhouette(tipXY, axis, rollDeg, eye, lean) {
+  let a = axis && axis.length === 3 ? axis.slice() : [0, 0, 1];
+  a = norm3([a[0] * lean, a[1] * lean, a[2]]);
+  const ref = Math.abs(a[1]) < 0.9 ? [0, 1, 0] : [1, 0, 0];
+  let e1 = norm3(cross3(a, ref));
+  let e2 = cross3(a, e1);
+  const r = rollDeg * Math.PI / 180;
+  [e1, e2] = [
+    [0, 1, 2].map((i) => Math.cos(r) * e1[i] + Math.sin(r) * e2[i]),
+    [0, 1, 2].map((i) => -Math.sin(r) * e1[i] + Math.cos(r) * e2[i]),
+  ];
+  const at = (s, e, w) => [
+    tipXY[0] + a[0] * s + (e ? e[0] * w : 0),
+    tipXY[1] + a[1] * s + (e ? e[1] * w : 0),
+    a[2] * s + (e ? e[2] * w : 0),
+  ];
+  const seg = (s0, s1, wmm, part) => {
+    const p0 = ochePoint(at(s0), eye), p1 = ochePoint(at(s1), eye);
+    return {part, a: [p0[0], p0[1]], b: [p1[0], p1[1]], w: wmm * (p0[2] + p1[2]) / 2};
+  };
+  const vanes = [e1, e1.map((v) => -v), e2, e2.map((v) => -v)].map((e) => {
+    const pts3 = [at(84), at(122), at(121, e, 28), at(110, e, 28), at(90, e, 5)];
+    return {
+      depth: pts3.reduce((acc, q) => acc + q[2], 0) / pts3.length,
+      pts: pts3.map((q) => ochePoint(q, eye).slice(0, 2)),
+    };
+  }).sort((u, v) => u.depth - v.depth);
+  // The shadow: the same dart dropped onto the board by a light in front,
+  // up and to the left.
+  const light = [-0.35, 0.6, 1.0];
+  const drop = (P) => [P[0] - light[0] * P[2] / light[2], P[1] - light[1] * P[2] / light[2]];
+  const shadow = [[0, 12, 2], [12, 58, 6.5], [58, 95, 4], [84, 118, 12]].map(([s0, s1, w]) => ({
+    a: drop(at(s0)), b: drop(at(s1)), w,
+  }));
+  return {
+    shaft: [seg(0, 14, 2.6, 'point-edge'), seg(12, 58, 8.0, 'barrel-edge'), seg(58, 95, 5.2, 'shaft-edge'),
+            seg(0, 14, 1.6, 'point'), seg(12, 58, 6.5, 'barrel'), seg(14, 56, 1.4, 'highlight'),
+            seg(58, 95, 4.0, 'shaft')],
+    vanes,
+    cap: seg(95, 112, 2.5, 'shaft'),
+    shadow,
+    // nearness to the eye, for drawing order across darts
+    depth: Math.hypot(tipXY[0] - eye[0], tipXY[1] - eye[1], eye[2]),
+  };
+}
+
+const DART_PART_COLORS = {
+  'point-edge': '#282828', 'barrel-edge': '#191919', 'shaft-edge': '#141414',
+  point: '#9b9696', barrel: '#443e3e', highlight: '#968c8c', shaft: '#302d2d',
+};
+
+function shadeHex(hex, f) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex || '');
+  if (!m) return hex;
+  const n = parseInt(m[1], 16);
+  const ch = (sh) => Math.max(0, Math.min(255, Math.round(((n >> sh) & 255) * f)));
+  return '#' + [16, 8, 0].map((sh) => ch(sh).toString(16).padStart(2, '0')).join('');
+}
 let visitId = null;
 // Mirrors /api/state's visit.available -- false when this process has no
 // live event queue wired, i.e. no THROW_DETECTED will ever arrive.
@@ -379,6 +493,13 @@ function drawBoard() {
   const mm = (v) => (v / BOARD_MM.doubleOuter) * R;
   c.clearRect(0, 0, s, s);
 
+  if (boardView === 'photo' && boardPhotoImg) {
+    // Its own scale: the photo includes the number ring and surround,
+    // which the diagram's scale would push off the canvas.
+    drawPhotoBoard(c, cx, cy, (s / 2) / PHOTO_HALF_MM);
+    return;
+  }
+
   c.beginPath();
   c.arc(cx, cy, R * 1.22, 0, Math.PI * 2);
   c.fillStyle = '#0a0c0f';
@@ -426,6 +547,14 @@ function drawBoard() {
     c.fillText(String(n), cx + Math.cos(mid) * R * 1.11, cy + Math.sin(mid) * R * 1.11);
   });
 
+  // Photo chosen but none exists yet (nothing has been captured since the
+  // server started): say so, rather than a switch that seems to do nothing.
+  if (boardView === 'photo' && !boardPhotoImg) {
+    c.font = Math.round(s * 0.028) + 'px system-ui, sans-serif';
+    c.fillStyle = 'rgba(215,222,229,0.55)';
+    c.fillText('Photo appears once Start has captured the board', cx, s - s * 0.03);
+  }
+
   // Oldest first, so a later dart draws over an earlier one. +y is up in
   // board space, hence the y negation into canvas space.
   visitThrows.forEach((t, idx) => {
@@ -441,6 +570,87 @@ function drawBoard() {
     c.strokeStyle = 'rgba(0,0,0,0.72)'; c.lineWidth = 1.5; c.stroke();
   });
 }
+
+// The photo view: the board photo at the same mm scale as the diagram,
+// then the visit's darts, farthest first so a nearer dart overlaps.
+function drawPhotoBoard(c, cx, cy, pxPerMm) {
+  const X = (x) => cx + x * pxPerMm;
+  const Y = (y) => cy - y * pxPerMm;
+  c.save();
+  c.beginPath();
+  c.arc(cx, cy, (PHOTO_HALF_MM - 3) * pxPerMm, 0, Math.PI * 2);
+  c.clip();
+  const span = PHOTO_HALF_MM * 2 * pxPerMm;
+  c.drawImage(boardPhotoImg, cx - span / 2, cy - span / 2, span, span);
+  c.restore();
+
+  const darts = [];
+  visitThrows.forEach((t, idx) => {
+    if (!t || !t.board_xy_mm) return;
+    const sil = dartSilhouette(t.board_xy_mm, t.dart_axis, 45 + 17 * idx, OCHE_EYE, DART_LEAN_EXAGGERATION);
+    darts.push({sil, flight: t.flight_color || DEFAULT_FLIGHT_COLOR});
+  });
+  darts.sort((u, v) => v.sil.depth - u.sil.depth);
+  c.lineCap = 'round';
+  c.lineJoin = 'round';
+  for (const {sil, flight} of darts) {
+    c.save();
+    if ('filter' in c) c.filter = 'blur(' + Math.max(1, 2.5 * pxPerMm) + 'px)';
+    c.strokeStyle = 'rgba(0,0,0,0.32)';
+    for (const sh of sil.shadow) {
+      c.lineWidth = Math.max(1, sh.w * pxPerMm);
+      c.beginPath(); c.moveTo(X(sh.a[0]), Y(sh.a[1])); c.lineTo(X(sh.b[0]), Y(sh.b[1])); c.stroke();
+    }
+    c.restore();
+    for (const sg of sil.shaft) {
+      c.strokeStyle = DART_PART_COLORS[sg.part];
+      c.lineWidth = Math.max(1, sg.w * pxPerMm);
+      c.beginPath(); c.moveTo(X(sg.a[0]), Y(sg.a[1])); c.lineTo(X(sg.b[0]), Y(sg.b[1])); c.stroke();
+    }
+    c.fillStyle = flight;
+    c.strokeStyle = shadeHex(flight, 0.55);
+    c.lineWidth = Math.max(1, 0.8 * pxPerMm);
+    for (const vane of sil.vanes) {
+      c.beginPath();
+      vane.pts.forEach((pt, i) => (i ? c.lineTo(X(pt[0]), Y(pt[1])) : c.moveTo(X(pt[0]), Y(pt[1]))));
+      c.closePath(); c.fill(); c.stroke();
+    }
+    const cap = sil.cap;
+    c.strokeStyle = DART_PART_COLORS.shaft;
+    c.lineWidth = Math.max(1, cap.w * pxPerMm);
+    c.beginPath(); c.moveTo(X(cap.a[0]), Y(cap.a[1])); c.lineTo(X(cap.b[0]), Y(cap.b[1])); c.stroke();
+  }
+}
+
+// Called with the version from /api/state and from every BOARD_PHOTO
+// event. The old photo stays on screen until the new one has loaded.
+function setBoardPhotoVersion(version) {
+  if (!version || version === boardPhotoVersion) return;
+  boardPhotoVersion = version;
+  const img = new Image();
+  img.onload = () => {
+    if (boardPhotoVersion !== version) return;   // a newer one overtook it
+    boardPhotoImg = img;
+    drawBoard();
+  };
+  img.onerror = () => console.warn('board photo', version, 'failed to load');
+  img.src = '/api/board/photo?v=' + encodeURIComponent(version);
+}
+
+function setBoardView(view) {
+  boardView = view === 'diagram' ? 'diagram' : 'photo';
+  try { window.localStorage.setItem(BOARD_VIEW_KEY, boardView); } catch (err) { /* per-session only */ }
+  document.querySelectorAll('#board-view-switch button').forEach((b) => {
+    b.setAttribute('aria-pressed', String(b.dataset.view === boardView));
+  });
+  drawBoard();
+}
+
+boardView = readBoardView();
+document.querySelectorAll('#board-view-switch button').forEach((b) => {
+  b.setAttribute('aria-pressed', String(b.dataset.view === boardView));
+  b.addEventListener('click', () => setBoardView(b.dataset.view));
+});
 
 if (boardCanvas && window.ResizeObserver) {
   new ResizeObserver(() => resizeBoard()).observe(boardCanvas.parentElement);
@@ -803,6 +1013,22 @@ function updateCameraFeeds() {
 // makes this one request per recalibration rather than a slower poll.
 let lastCalibrationToken = '';
 
+// Bounded retry for a STARVED overlay fetch -- deliberately NOT a poll.
+// The overlay image is one small GET, and it can lose that fetch in the
+// one moment the page is short of sockets: three MJPEG streams
+// reconnecting at once on a tab-return, or the reconnect right after a
+// Calibrate, against Chrome's ~6-per-origin budget. When it lost, the old
+// code hid the layer and left it hidden until the next recalibration or a
+// hard refresh -- the operator's "no overlay when the previews come back"
+// and "black until refresh". These arm a few one-shot retries AFTER an
+// actual failure and do nothing whatsoever while the overlay is healthy,
+// so a stationary board is never polled (the thing the timer test guards).
+const OVERLAY_RETRY_MS = 1200;
+const OVERLAY_MAX_RETRIES = 6;
+const overlayRetries = {};
+const overlayRetryTimers = {};
+for (const c of CAM_IDS) { overlayRetries[c] = 0; overlayRetryTimers[c] = null; }
+
 function hideCalibrationOverlay(c) {
   const ov = document.getElementById('cam-overlay-' + c);
   if (!ov) return;
@@ -811,6 +1037,9 @@ function hideCalibrationOverlay(c) {
   // the next show must re-check the calibration rather than flash the
   // previous one over a freshly reopened camera.
   ov.removeAttribute('src');
+  // Cancel any pending starve-retry: this tile is intentionally down now
+  // (teardown, or no live picture under it), not waiting on a fetch.
+  if (overlayRetryTimers[c]) { clearTimeout(overlayRetryTimers[c]); overlayRetryTimers[c] = null; }
 }
 
 function refreshCalibrationOverlays() {
@@ -825,11 +1054,35 @@ function refreshCalibrationOverlays() {
     }
     const want = '/api/cameras/' + c + '/overlay-rgba.png?v='
       + encodeURIComponent(lastCalibrationToken || 'none');
-    if (ov.getAttribute('src') === want) continue; // already the current one
-    ov.onload = () => { ov.hidden = false; };
+    // Skip only when the overlay is ALREADY SHOWN with this src -- not
+    // merely when the src attribute equals `want`. The old test was
+    // `getAttribute('src') === want` alone, which wedged: a FAILED fetch
+    // (onerror below) left the src set to `want` while the layer was
+    // hidden, so every later pass short-circuited here and the overlay
+    // never returned until the token changed or the page was hard-
+    // refreshed. Re-checking `!ov.hidden` means a hidden/failed layer is
+    // always re-attempted.
+    if (ov.getAttribute('src') === want && !ov.hidden) continue;
+    ov.onload = () => { ov.hidden = false; overlayRetries[c] = 0; };
     // A camera with no calibration answers 404 -- show the stream alone
-    // rather than an empty layer or a broken-image icon.
-    ov.onerror = () => { ov.hidden = true; };
+    // rather than an empty layer or a broken-image icon. Drop the src so
+    // the guard above cannot mistake the wedged `want` for "already
+    // current", and arm a bounded retry: a starved fetch (see the retry
+    // note above) succeeds within a second or two once the reconnect
+    // storm clears, and a genuinely-broken overlay gives up after a few
+    // tries rather than looping forever. onload resets the counter.
+    ov.onerror = () => {
+      ov.hidden = true;
+      ov.removeAttribute('src');
+      if (overlayRetries[c] < OVERLAY_MAX_RETRIES) {
+        overlayRetries[c] += 1;
+        if (overlayRetryTimers[c]) clearTimeout(overlayRetryTimers[c]);
+        overlayRetryTimers[c] = setTimeout(() => {
+          overlayRetryTimers[c] = null;
+          refreshCalibrationOverlays();
+        }, OVERLAY_RETRY_MS);
+      }
+    };
     ov.setAttribute('src', want);
   }
 }
@@ -1010,7 +1263,14 @@ function renderCalibration(calibration) {
   // top-level calibration.checked_at_utc is deliberately NOT used, since
   // that is "when this status was computed" and moves constantly.
   const src = (calibration && calibration.live_source) || {};
-  lastCalibrationToken = src.calibration_package_id || src.checked_at_utc || '';
+  const nextToken = src.calibration_package_id || src.checked_at_utc || '';
+  // A new calibration is a fresh chance for an overlay that had exhausted
+  // its starve-retries under the old one -- clear the per-camera budget so
+  // it re-attempts cleanly.
+  if (nextToken !== lastCalibrationToken) {
+    for (const c of CAM_IDS) { overlayRetries[c] = 0; }
+  }
+  lastCalibrationToken = nextToken;
   const cams = (calibration && calibration.cameras) || {};
   for (const c of CAM_IDS) {
     const key = String(c);
@@ -1123,7 +1383,18 @@ document.getElementById('btn-refresh-calib').onclick = async () => {
   // live tab/visibility/capture state rather than a remembered list -- so
   // switching tabs mid-calibration is honoured instead of being
   // overridden by whatever happened to be true at click time.
-  for (const c of CAM_IDS) stopCamStream(c);
+  for (const c of CAM_IDS) {
+    stopCamStream(c);
+    // Hide the overlay layer TOO, in the same breath as closing its
+    // stream. camOverlayOn was just set false above, but nothing paints
+    // that until renderCalibration/finally runs -- ~25s away. Without
+    // this the previous calibration's overlay stayed drawn over a tile
+    // that had just gone black, reading as a frozen, wrong overlay for
+    // the whole calibration. hideCalibrationOverlay() also drops the src,
+    // so the fresh overlay is re-fetched cleanly once the new stream is
+    // live rather than flashing the stale one.
+    hideCalibrationOverlay(c);
+  }
   const line = logAction('Calibrate', 'pending', 'requested\u2026');
   // Wall clock for the action line. performance.now(), not Date.now():
   // this is an elapsed-time measurement and must not be skewed by a
@@ -4999,6 +5270,7 @@ function renderState(state) {
   if (state.visit) {
     visitId = state.visit.visit_id || null;
     visitThrows = (state.visit.throws || []).slice();
+    setBoardPhotoVersion(state.visit.board_photo_version);
     // `available` is false when this process has no live event queue
     // (standalone -- no capture loop). THROW_DETECTED can then never
     // arrive, so say so instead of leaving an empty board that looks
@@ -5080,6 +5352,12 @@ function connectWebSocket() {
   ws.onmessage = (ev) => {
     let msg;
     try { msg = JSON.parse(ev.data); } catch (e) { return; }
+    if (msg.type === 'DASHBOARD_SWITCHED') {
+      // The rig's switch flipped: / serves the other dashboard now. A
+      // screen opened with ?ui= chose its page itself and stays.
+      if (!new URLSearchParams(window.location.search).get('ui')) window.location.reload();
+      return;
+    }
     if (msg.type === 'HELLO') {
       // A new build on the server means this page is out of date -- reload
       // rather than keep running old JS against a new backend.
@@ -5149,6 +5427,9 @@ function connectWebSocket() {
       // so the board updates on the score itself rather than waiting on
       // the package write.
       onThrowDetected(msg);
+    } else if (msg.type === 'BOARD_PHOTO') {
+      // A fresh empty-board photo; the image itself is fetched, not sent.
+      setBoardPhotoVersion(msg.version);
     } else if (msg.type === 'VISIT_CLEARED') {
       onVisitCleared(msg);
     } else if (msg.type === 'THROW_CORRECTED') {
@@ -5220,8 +5501,12 @@ refreshCalibrationOverlays();
 // The overlay is deliberately NOT on this tick. It changes only when
 // calibration is re-derived, and refreshCalibrationOverlays() is called
 // from the places where that can happen (renderCalibration, tab and
-// visibility edges, and a stream going live). The tick is left doing
-// what it was always actually for: retrying and tearing down streams.
+// visibility edges, and a stream going live) -- plus a bounded, one-shot
+// retry armed only after an actual failed fetch (see refreshCalibration-
+// Overlays' onerror). Polling a stationary board's overlay every 3s was
+// work with nothing to find; a post-failure retry only runs when there
+// IS something to find, and stops once the layer is up. The tick is left
+// doing what it was always for: retrying and tearing down streams.
 setInterval(updateCameraFeeds, CAMERA_FEED_TICK_MS);
 // Camera status feeds the Config tab's detail rows and the Info tab's
 // diagnostics text; a TV on the Scoring tab was polling it every 3 s for
@@ -5245,5 +5530,16 @@ async function refreshLoad() {
 setInterval(() => {
   if (tabShowing('config') || tabShowing('info')) refreshLoad();
 }, LOAD_REFRESH_MS);
+document.getElementById('btn-new-ui').onclick = async (ev) => {
+  ev.target.disabled = true;
+  try {
+    const r = await fetch('/api/dashboard', {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ui: 'new'})});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    window.location.href = '/';
+  } catch (err) {
+    ev.target.disabled = false;
+    console.error('dashboard switch failed', err);
+  }
+};
 loadInitial();
 connectWebSocket();
