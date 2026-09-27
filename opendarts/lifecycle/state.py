@@ -57,6 +57,7 @@ from opendarts.lifecycle.signals import (
     DEFAULT_SIGNAL_CONFIG,
     CamSignals,
     SignalConfig,
+    change_mask,
     compute_signals,
     to_small_gray,
     to_small_mask,
@@ -194,6 +195,35 @@ class LifecycleConfig:
     #: a partial removal that stays this long is accepted into the reference.
     partial_adopt_frames: int = 45
 
+    # --- the empty board ------------------------------------------------
+    # 2026-09-26, a phantom S12 on the Pi: the takeout was cleared while
+    # the hand was still pulling the last dart, so the new reference held
+    # the hand and that dart; pulling it out then read as a dart arriving
+    # where it had been, and was scored. Both guards below judge against
+    # the EMPTY board -- the board as it was before the visit's first dart
+    # -- which the dart-by-dart reference cannot remember.
+    #: board pixels differing from the empty board (in one camera) below
+    #: which that camera "looks empty" -- the dart floor, so anything that
+    #: could be a dart counts as "not empty".
+    empty_match_max_px: int = 80
+    #: a would-be dart whose changed pixels mostly match the empty board
+    #: again is something LEAVING the board, not arriving: never scored.
+    #: The fraction of its changed pixels still differing from the empty
+    #: board, below which a camera reads it as a removal.
+    removal_match_frac: float = 0.3
+    #: share of the committed darts' area (per camera, with at least
+    #: ``empty_match_max_px`` pixels) that may still differ from the empty
+    #: board when a takeout clears. Measured: the phantom's hand-and-dart
+    #: frame left 21/25/50% of it off-empty; the takeouts of 1,360 corpus
+    #: darts left at most 9%, all thin edge lines from the board or a
+    #: camera shifting a pixel as the darts came out.
+    empty_union_frac: float = 0.15
+    #: a takeout clears only once, where the committed darts were, every
+    #: camera matches the empty board again; if that never happens (a dart
+    #: left in), it clears anyway after this many stable frames of removal
+    #: (~3 s), so the board cannot stay stuck in the previous visit.
+    clear_force_frames: int = 90
+
     # --- cooldowns / adoption ------------------------------------------
     commit_cooldown_frames: int = 6
     clear_cooldown_frames: int = 10
@@ -240,6 +270,9 @@ class Tick:
     commit: Commit | None = None
     #: darts removed by a CLEARED action
     cleared: int = 0
+    #: a would-be dart refused as a removal: the frames it would have been
+    #: scored from (bg = the reference it was judged against), for evidence
+    removed: Commit | None = None
 
     def as_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -278,10 +311,13 @@ class _Counters:
     stuck: int = 0
     cooldown: int = 0
     over_darts: int = 0
+    #: stable removal frames spent waiting for the board to look empty
+    clear_wait: int = 0
 
     def reset_idle(self) -> None:
         self.dart = self.pending = self.takeout = self.partial = 0
         self.quiet = self.scene = self.stuck = self.over_darts = 0
+        self.clear_wait = 0
         self.hand_change = False
 
 
@@ -302,6 +338,9 @@ class Lifecycle:
         self.tick_n = 0
         self._c = _Counters()
         self._last_change: dict[int, np.ndarray] = {}
+        #: per camera, the small grey board as it was with no darts on it
+        #: (see LifecycleConfig's "empty board" section). None until warm.
+        self._empty: dict[int, np.ndarray] = {}
 
     def reset(self) -> None:
         """Operator reset: forget darts and re-warm on the current scene."""
@@ -433,6 +472,67 @@ class Lifecycle:
         # whatever was pending is background (or committed) now
         self._c.dart_before_hand = False
 
+    # ---- the empty board -------------------------------------------------
+    def _set_empty(self, smalls: dict[int, np.ndarray]) -> None:
+        self._empty = {cam: smalls[cam] for cam in self.refs.cameras() if cam in smalls}
+
+    def _off_empty(self, cam: int, small: np.ndarray) -> np.ndarray | None:
+        """Board pixels of ``small`` that differ from the empty board."""
+        empty = self._empty.get(cam)
+        if empty is None:
+            return None
+        return change_mask(small, empty, self.cfg.signals) & self.refs[cam].board_mask
+
+    def _looks_empty(self, smalls: dict[int, np.ndarray]) -> bool:
+        """Every camera's board matches the empty board (True while none is
+        known yet, so a cold start behaves exactly as before)."""
+        for cam, small in smalls.items():
+            off = self._off_empty(cam, small) if cam in self.refs else None
+            if off is not None and int(off.sum()) >= self.cfg.empty_match_max_px:
+                return False
+        return True
+
+    def _darts_gone(self, smalls: dict[int, np.ndarray]) -> bool:
+        """Where the committed darts were, every camera matches the empty
+        board again. Judged only there, so a dart nudged elsewhere, a mark
+        on the board or slow lighting drift cannot hold a takeout open."""
+        for cam, small in smalls.items():
+            if cam not in self.refs:
+                continue
+            where = self.refs[cam].dart_union_grown
+            off = self._off_empty(cam, small)
+            if where is None or off is None:
+                continue
+            n = int((off & where).sum())
+            if n >= self.cfg.empty_match_max_px and n >= self.cfg.empty_union_frac * int(where.sum()):
+                return False
+        return True
+
+    def _refresh_empty(self, smalls: dict[int, np.ndarray]) -> None:
+        """Follow slow drift on an empty board -- but only from a frame that
+        still matches it, so a hand or a dart is never taken as empty."""
+        if self.dart_count == 0 and self._empty and self._looks_empty(smalls):
+            self._set_empty(smalls)
+
+    def _is_removal(self, dart_cams: list[int], smalls: dict[int, np.ndarray]) -> bool:
+        """The change a would-be dart made has mostly returned the board to
+        empty, in most of its cameras: something left, nothing arrived."""
+        votes = 0
+        judged = 0
+        for cam in dart_cams:
+            changed = self._last_change.get(cam)
+            off = self._off_empty(cam, smalls[cam]) if cam in smalls else None
+            if changed is None or off is None:
+                continue
+            changed = changed & self.refs[cam].board_mask
+            n = int(changed.sum())
+            if n == 0:
+                continue
+            judged += 1
+            if int((changed & off).sum()) < self.cfg.removal_match_frac * n:
+                votes += 1
+        return judged > 0 and votes * 2 > judged
+
     def _tick(self, agg: "Lifecycle._Agg", signals, action: Action, reason: str = "", commit: Commit | None = None) -> Tick:
         return Tick(
             n=self.tick_n,
@@ -457,6 +557,8 @@ class Lifecycle:
             if c.warm >= cfg.warmup_stable_frames:
                 self.phase = Phase.IDLE
                 c.reset_idle()
+                if self.dart_count == 0:
+                    self._set_empty(smalls)
                 return self._tick(agg, signals, Action.READY, "warmup complete")
             return self._tick(agg, signals, Action.NONE)
 
@@ -467,6 +569,8 @@ class Lifecycle:
             if c.cooldown <= 0:
                 self.phase = Phase.IDLE
                 c.reset_idle()
+                if self.dart_count == 0 and not self._empty:
+                    self._set_empty(smalls)
             return self._tick(agg, signals, Action.NONE)
 
         # ---- scene change (lighting step): every camera's board changed.
@@ -482,6 +586,12 @@ class Lifecycle:
                 self._adopt(frames, smalls)
                 self.phase = Phase.IDLE
                 c.reset_idle()
+                # with darts on the board the new scene is not an empty
+                # one: forget it, and take the next empty board after a clear
+                if self.dart_count == 0:
+                    self._set_empty(smalls)
+                else:
+                    self._empty = {}
                 return self._tick(agg, signals, Action.READOPT, "scene change adopted")
             return self._tick(agg, signals, Action.NONE)
 
@@ -586,6 +696,24 @@ class Lifecycle:
             if c.since_hand - c.pending < cfg.post_hand_stable_frames:
                 need = max(need, cfg.post_hand_stable_frames)
             if (c.dart >= need and agg.stable) or forced:
+                if self._is_removal(agg.dart_cams, smalls):
+                    # Back to the empty board where it changed: something
+                    # was taken away (a dart pulled after an early clear),
+                    # not thrown. Absorb it -- keeping what it would have
+                    # been scored from, so a refusal can be checked.
+                    bg = {cam: ref.full for cam, ref in self.refs.cams.items() if cam in frames}
+                    removed = Commit(
+                        dart_index=self.dart_count,
+                        bg=as_frames(bg),
+                        frames=as_frames({cam: frames[cam] for cam in bg}),
+                        dart_cams=list(agg.dart_cams),
+                    )
+                    self._adopt(frames, smalls)
+                    self.phase = Phase.IDLE
+                    c.reset_idle()
+                    tick = self._tick(agg, signals, Action.READOPT, "a removal, not a dart")
+                    tick.removed = removed
+                    return tick
                 if agg.over_darts and not forced:
                     if agg.stable and not agg.hand_now:
                         c.over_darts += 1
@@ -619,6 +747,13 @@ class Lifecycle:
             elif majority:
                 c.takeout += 1
             if c.takeout >= cfg.takeout_stable_frames:
+                if not self._darts_gone(smalls) and c.clear_wait < cfg.clear_force_frames:
+                    # The union reads "removed", but where the darts were the
+                    # board is not empty yet -- usually the last dart, with
+                    # the hand pulling it. Clearing now would make that the
+                    # new reference, and its removal would read as a throw.
+                    c.clear_wait += 1
+                    return self._tick(agg, signals, Action.NONE, "waiting for an empty board")
                 return self._clear(agg, signals, frames, smalls)
             return self._tick(agg, signals, Action.NONE)
 
@@ -668,6 +803,7 @@ class Lifecycle:
         if agg.stable:
             absorbed = any(s.board_px or s.outside_px for s in signals.values())
             self._adopt(frames, smalls)
+            self._refresh_empty(smalls)
             c.quiet = 0
             if absorbed:
                 return self._tick(agg, signals, Action.READOPT)

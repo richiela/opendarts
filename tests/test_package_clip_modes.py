@@ -40,6 +40,18 @@ CAMS = (0, 1, 2)
 BG_GEN, COMMIT_GEN, N_SETS = 4, 7, 10
 
 
+@pytest.fixture(autouse=True)
+def _no_background_engines(monkeypatch):
+    """The also-run engines answer on a thread of their own and announce
+    their result with a PACKAGE_SAVED of their own, about a millisecond
+    after handle_ready_to_capture returns -- so counting announcements
+    right after the call raced them (the v0.90.1 publish gate's flake).
+    These tests are about the package's data and clip, not the engines:
+    keep that thread out."""
+    monkeypatch.setattr(capture_daemon, "_dispatch_also_run_engines_in_background",
+                        lambda *a, **k: None)
+
+
 def _calib():
     return CameraCalibration(
         camera_matrix=np.array([[900.0, 0, 32], [0, 900.0, 24], [0, 0, 1]]),

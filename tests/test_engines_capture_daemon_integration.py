@@ -31,7 +31,7 @@ from opendarts.engines.athena import AthenaEngine
 from opendarts.engines.apollo import ApolloEngine
 from opendarts.engines.ares import AresEngine
 from opendarts.engines.talos import TalosEngine
-from opendarts.engines.registry import DEFAULT_PRIMARY_ENGINE
+from opendarts.engines.registry import DEFAULT_ALSO_RUN, DEFAULT_PRIMARY_ENGINE
 from opendarts.engines.zeus import ZEUS_SUB_ENGINE_NAMES
 from tests.test_capture_daemon import (
     STARTUP_FETCHES,
@@ -137,21 +137,36 @@ def test_engine_config_store_corrupt_snapshot_does_not_crash_construction(tmp_pa
 
 def test_handle_ready_to_capture_with_no_engine_config_store_is_byte_identical_to_default(tmp_path):
     """engine_config_store=None (every pre-existing caller/test) must
-    behave EXACTLY like an EngineConfigStore() default -- Apollo
-    primary, no also-run, no other_engines key ever written."""
+    behave EXACTLY like an EngineConfigStore() default: the same primary,
+    the same also-run engines, the same call. The default also-runs Zeus's
+    own sub-engines, so ``other_engines`` does appear -- written by the
+    background dispatch a moment after the call returns. Asserting on
+    result.json straight away raced that thread (the v0.90.1 publish gate's
+    flake); wait for both writes, then compare."""
+    import json
+
     bg = {0: np.full((4, 4, 3), 50, dtype=np.uint8)}
     frame = {0: np.full((4, 4, 3), 200, dtype=np.uint8)}
     calibrations = {0: _fake_calibration_attempt().calibration}
 
-    dest_dir = capture_daemon.handle_ready_to_capture(
-        _throw_trigger_ready(frame), bg, calibrations, tmp_path / "packages", "sess1",
-    background_save=False,
-    )
-    import json
+    def _save(root, store):
+        return capture_daemon.handle_ready_to_capture(
+            _throw_trigger_ready(frame), bg, calibrations, root, "sess1",
+            engine_config_store=store, background_save=False,
+        )
 
-    data = json.loads((dest_dir / "result.json").read_text())
-    assert "primary_engine" not in data
-    assert "other_engines" not in data
+    def _settled(dest_dir):
+        def _has_other_engines():
+            return "other_engines" in json.loads((dest_dir / "result.json").read_text())
+        assert _wait_until(_has_other_engines), "the default also-run engines never reported"
+        return json.loads((dest_dir / "result.json").read_text())
+
+    without = _settled(_save(tmp_path / "none", None))
+    default = _settled(_save(tmp_path / "default", capture_daemon.EngineConfigStore()))
+    assert without["primary_engine"] == default["primary_engine"] == DEFAULT_PRIMARY_ENGINE
+    assert sorted(without["other_engines"]) == sorted(default["other_engines"]) == sorted(DEFAULT_ALSO_RUN)
+    assert {k: without.get(k) for k in ("ok", "sector", "ring", "label")} == {
+        k: default.get(k) for k in ("ok", "sector", "ring", "label")}
 
 
 def test_handle_ready_to_capture_dispatches_also_run_engine_and_writes_other_engines(tmp_path):

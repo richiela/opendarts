@@ -116,6 +116,9 @@ class LifecycleDriver:
 
     MAX_ERRORS = 20
     MAX_COMMIT_DIRS = 500
+    #: refused "removals" are rare and each is worth seeing: always saved,
+    #: up to this many per run
+    MAX_REMOVAL_DIRS = 50
 
     def __init__(
         self,
@@ -146,6 +149,11 @@ class LifecycleDriver:
         self._masks: dict[int, np.ndarray] | None = None
         self._disabled = False
         self.stats = DriverStats()
+        #: the empty-board guards, logged at INFO so a rig's main log says
+        #: whenever they act: a takeout held, and a would-be dart refused
+        self._hold_started: float | None = None
+        self._hold_ticks = 0
+        self._removals = 0
         self._last_logged_phase: Phase | None = None
         self._idle_since_log = 0
         # periodic "is the loop keeping up" summary
@@ -343,6 +351,7 @@ class LifecycleDriver:
             st.clears += 1
         elif tick.action is Action.HAND_ENTER:
             st.hand_enters += 1
+        self._log_guards(tick)
 
         interesting = (
             tick.action is not Action.NONE
@@ -395,6 +404,64 @@ class LifecycleDriver:
                     for c, s in tick.signals.items()
                 },
             )
+
+    def _log_guards(self, tick: Tick) -> None:
+        if tick.reason == "waiting for an empty board":
+            if self._hold_started is None:
+                self._hold_started = time.monotonic()
+                self._hold_ticks = 0
+                log.info(
+                    "lifecycle: takeout held -- where the darts were, the board does not "
+                    "look empty yet (darts=%d)", tick.dart_count)
+            self._hold_ticks += 1
+        elif self._hold_started is not None and (
+            tick.action is Action.CLEARED or tick.phase is not Phase.TAKEOUT_PENDING
+        ):
+            # still mid-takeout (the count restarting as the hand lifts off)
+            # is the same hold; it ends when the visit clears or the takeout
+            # is abandoned
+            held_s = time.monotonic() - self._hold_started
+            timed_out = self._hold_ticks >= self.cfg.clear_force_frames
+            ended = (
+                "timed out, cleared anyway" if timed_out and tick.action is Action.CLEARED
+                else "board empty, cleared" if tick.action is Action.CLEARED
+                else f"takeout abandoned ({tick.phase.value} {tick.action.value} {tick.reason})".strip()
+            )
+            log.info("lifecycle: takeout hold ended after %.1fs (%d ticks): %s",
+                     held_s, self._hold_ticks, ended)
+            self._write({"event": "takeout_hold", "held_s": round(held_s, 2),
+                         "ticks": self._hold_ticks, "ended": ended})
+            self._hold_started = None
+        if tick.removed is not None:
+            self._removals += 1
+            evidence = self._save_removal(tick)
+            log.info(
+                "lifecycle: a would-be dart was a removal, not scored (dart %d, cams %s) -- "
+                "evidence %s", tick.removed.dart_index + 1, tick.removed.dart_cams, evidence)
+            self._write({"event": "removal", "dart_index": tick.removed.dart_index,
+                         "dart_cams": tick.removed.dart_cams, "evidence": evidence})
+
+    def _save_removal(self, tick: Tick) -> str | None:
+        if self._removals > self.MAX_REMOVAL_DIRS or tick.removed is None:
+            return None
+        d = self.evidence_dir / f"removal-{self._removals:03d}"
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            for cam, img in tick.removed.bg.items():
+                cv2.imwrite(str(d / f"cam{cam}_bg.png"), img)
+            for cam, img in tick.removed.frames.items():
+                cv2.imwrite(str(d / f"cam{cam}_frame.png"), img)
+            (d / "meta.json").write_text(json.dumps({
+                "tick": tick.n,
+                "dart_index": tick.removed.dart_index,
+                "dart_cams": tick.removed.dart_cams,
+                "captured_at_utc": datetime.now(timezone.utc).isoformat(),
+                "signals": {str(c): s.as_dict() for c, s in tick.signals.items()},
+            }, indent=2))
+            return str(d)
+        except Exception:
+            log.exception("lifecycle: failed to save removal evidence")
+            return None
 
     def _save_commit(self, tick: Tick) -> str | None:
         if self.stats.commits > self.MAX_COMMIT_DIRS or tick.commit is None:

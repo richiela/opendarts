@@ -38,4 +38,9 @@ made since the latest release.
 - **Apollo no longer overrides its own answer on the strength of cameras that disagree about where the dart is.** When individual cameras out-vote Apollo's combined answer, the override now needs at least two cameras placing the dart within 10 mm of each other, and the position it reports must lie in the bed it calls. A double bull whose two outer-bull votes sat on opposite sides of the bull was called 25 from a position dead centre; that throw now scores 50. Across 1,120 recorded throws this changes one final call — that one — while every override the owner verified as correct still fires.
 - **Smaller fixes.** The board photo always uses the calibration in force, and a recalibration retakes it. The rig gives a calibration's memory back to the operating system when it finishes; camera previews get their overlay back after returning to the tab and after Calibrate; the scoring board no longer nudges down on the first dart.
 
-## Unreleased — since v0.90.0
+## v0.90.1 (Sep 26, 2026)
+
+- **Pulling a dart out is no longer scored as a throw.** A takeout could be taken as finished while the hand was still pulling the last dart; that dart and hand then became the new empty board, and pulling it out read as a dart arriving where it had been. The rig now remembers the board as it was before a turn's first dart: a takeout finishes only once the board looks like that again where the darts were (or after about three seconds, so a dart left in cannot hold the board in the old turn), and a "dart" whose change puts the board back to that empty state is recognised as something removed and never scored. Replaying the 1,363 recorded throws changes no score and no takeout.
+- The rig logs when it holds a takeout, when that hold ends (board empty, or timed out) and when a would-be dart turns out to be a removal, and keeps the frames of each refused removal (`removal-NNN`) so the decision can be checked afterwards.
+
+## Unreleased — since v0.90.1

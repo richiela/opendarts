@@ -339,6 +339,7 @@ def test_takeout_count_pauses_on_borderline_frames_instead_of_resetting():
     s.darts.append((CX - 2, CY - 60, 16, 100))
     run(lc, s, 15)
     assert lc.dart_count == 1
+    s.darts = []  # taken out: a takeout clears only onto an empty board
     frame = s.render()
     frames, smalls = {0: frame}, {0: to_small_gray(frame)}
     sig = lc.observe(frames).signals
@@ -365,6 +366,7 @@ def test_one_removal_camera_is_enough_right_after_a_hand():
     warm(lc, s)
     s.darts.append((CX - 2, CY - 60, 16, 100))
     run(lc, s, 15)
+    s.darts = []  # taken out: a takeout clears only onto an empty board
     frame = s.render()
     frames, smalls = {0: frame}, {0: to_small_gray(frame)}
     sig = lc.observe(frames).signals

@@ -130,3 +130,46 @@ def test_old_lifecycle_logs_are_pruned_to_the_limits(tmp_path, monkeypatch):
     driver_module._prune_old_logs(tmp_path, keep_path=paths[3])
     assert sorted(p.name for p in tmp_path.glob("lifecycle-*.jsonl")) == [
         paths[3].name, paths[5].name]
+
+
+def test_driver_logs_the_empty_board_guards_and_keeps_removal_evidence(tmp_path, caplog):
+    import logging
+    from opendarts.lifecycle.signals import to_small_gray
+    from tests.test_lifecycle_empty_board import DART_A, DART_B, HAND_ON_B
+
+    masks = {0: board_mask()}
+    drv = LifecycleDriver(log_dir=tmp_path, masks_provider=lambda: masks, run_id="guards",
+                          config=LifecycleConfig(warmup_stable_frames=3))
+    s = Scene()
+    caplog.set_level(logging.INFO, logger="opendarts.lifecycle.driver")
+    for _ in range(6):
+        drv.observe({0: s.render()})
+    # a takeout held while a hand is still on the last dart, then cleared
+    for d in (DART_A, DART_B):
+        s.darts.append(d)
+        for _ in range(15):
+            drv.observe({0: s.render()})
+    s.darts, s.blobs = [DART_B], [HAND_ON_B]
+    for _ in range(30):
+        drv.observe({0: s.render()})
+    s.darts, s.blobs = [], []
+    for _ in range(40):
+        drv.observe({0: s.render()})
+    # a would-be dart that is a removal (as after an early clear)
+    s.darts, s.blobs = [DART_B], [HAND_ON_B]
+    frame = s.render()
+    drv.lifecycle._adopt({0: frame}, {0: to_small_gray(frame)})
+    s.darts, s.blobs = [], []
+    for _ in range(20):
+        drv.observe({0: s.render()})
+    drv.close()
+
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("takeout held" in m for m in msgs)
+    assert any("takeout hold ended" in m and "board empty, cleared" in m for m in msgs)
+    assert any("a removal, not scored" in m for m in msgs)
+    ev = tmp_path / "lifecycle-guards" / "removal-001"
+    assert (ev / "cam0_bg.png").exists() and (ev / "cam0_frame.png").exists()
+    lines = [json.loads(l) for l in (tmp_path / "lifecycle-guards.jsonl").read_text().splitlines()]
+    assert any(l.get("event") == "takeout_hold" for l in lines)
+    assert any(l.get("event") == "removal" for l in lines)
