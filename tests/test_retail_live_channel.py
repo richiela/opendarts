@@ -342,3 +342,124 @@ def test_state_darts_report_a_correction(package_root):
     state.visit_throws[0]["corrected_ring"] = "treble"
     d = state._build_retail_state_fields()["darts"][0]  # noqa: SLF001
     assert d["label"] == "T20" and d["value"] == 60 and d["corrected"] is True
+
+
+class _FakeHub:
+    def open_all(self):
+        return [True, True, True]
+
+    def close_all(self):
+        pass
+
+    def status_report(self) -> str:
+        return "fake hub status"
+
+
+@pytest.mark.parametrize("in_takeout", [False, True])
+@pytest.mark.parametrize("reason", ["manual", "idle timeout"])
+def test_start_and_stop_reach_the_retail_feed(package_root, reason, in_takeout):
+    """A client listening only on the retail feed (FlightDeck, the kiosk)
+    must see OD start and stop. The capture thread pushes no event when a
+    session ends, so a Stop -- or the idle timeout -- used to leave the
+    feed claiming OD was still capturing, and the kiosk never turned the
+    cabinet off."""
+    from opendarts.live.capture_daemon import CaptureLoopController
+
+    state = create_app(
+        package_root=package_root, enable_background_poll=False,
+        local_hub=_FakeHub(), controller=CaptureLoopController(),
+    ).state.opendarts_state
+
+    async def run() -> list:
+        q = state.subscribe_retail()
+        await state.start_capture()
+        if in_takeout:
+            # Stopping from a takeout (or an oracle hold, which also reads
+            # takeout) was the case live on the reference rig: the generic path names
+            # nothing when the status leaves takeout.
+            state.capture_starting = False
+            state.trigger_state = "TAKEOUT_WAITING"
+            await state.publish_retail_state()
+        state.controller.stopped_ack.set()
+        await state.stop_capture(reason=reason)
+        msgs = []
+        while not q.empty():
+            msgs.append(q.get_nowait())
+        return msgs
+
+    msgs = [m for m in asyncio.run(run()) if m.get("type") == "state"]
+    events = [m["event"] for m in msgs]
+    assert "connecting" in events
+    assert events[-1] == "stopped"
+    assert msgs[-1]["running"] is False and msgs[-1]["status"] == "stopped"
+
+
+def test_no_oracle_hold_during_ods_own_takeout():
+    """Pulling the darts puts OD and the oracle in takeout together. That
+    is OD's own takeout, not a hold: reporting the oracle's takeout as a
+    hold made every visit's takeout read as "held by the oracle" (the
+    cabinet strip turned purple at every takeout). Once OD's own takeout
+    ends, a still-stuck oracle is a hold again."""
+    st = _state()
+    st.oracle_hold_snapshot = lambda: {"code": "takeout", "reason": "oracle in takeout"}
+    st.visit_id, st.visit_throws = "v1", [{"visit_id": "v1", "visit_index": 0}]
+    st.trigger_state = "TAKEOUT_WAITING"
+    assert st._build_retail_state_fields()["hold"] is None  # noqa: SLF001
+    st.visit_throws = []
+    st.trigger_state = "IDLE"
+    assert st._build_retail_state_fields()["hold"] == "oracle in takeout"  # noqa: SLF001
+
+
+def test_ods_own_takeout_reaches_the_retail_feed_from_a_real_trigger_event():
+    """The capture loop sends TRIGGER_STATE with the state's name
+    (`trigger.state.name`). The retail status compared it against the lower-
+    case value, so OD's own takeout never showed: the feed said `throw`, and
+    with the oracle also in takeout it read as an oracle hold (purple on the
+    cabinet strip at every takeout)."""
+    from opendarts.capture.trigger_state import ThrowState
+
+    st = _state()
+    st.visit_id, st.visit_throws = "v1", [{"visit_id": "v1", "visit_index": 0}]
+
+    async def run():
+        await st._handle_live_event(  # noqa: SLF001
+            {"type": "TRIGGER_STATE", "state": ThrowState.TAKEOUT_WAITING.name,
+             "session": "s1", "dart_count": 3}
+        )
+
+    asyncio.run(run())
+    st.oracle_hold_snapshot = lambda: {"code": "takeout", "reason": "oracle in takeout"}
+    assert st.trigger_state == "TAKEOUT_WAITING"
+    fields = st._build_retail_state_fields()  # noqa: SLF001
+    assert fields["hold"] is None
+
+
+class _Running:
+    def is_running(self):
+        return True
+
+
+def test_a_takeout_lasts_until_its_visit_clears_and_the_clear_says_throw(package_root):
+    """Driven through the real event path in the order the capture loop
+    sends it: a hand mid-pull must not flip the feed to `throw`, and the
+    clear itself must say `throw` -- VISIT_CLEARED arrives just before the
+    trigger leaves TAKEOUT_WAITING, and the return to throw after it was
+    never named, leaving FlightDeck and the kiosk in takeout."""
+    from opendarts.capture.trigger_state import ThrowState
+
+    state = create_app(package_root=package_root, enable_background_poll=False).state.opendarts_state
+    state.controller = _Running()
+    trig = lambda s: {"type": "TRIGGER_STATE", "state": s, "session": "s1", "dart_count": 3}  # noqa: E731
+    q = state.subscribe_retail()
+    _drive(state, [_throw("v1", i, 20, "single_outer") for i in range(3)])
+    _drive(state, [trig(ThrowState.TAKEOUT_WAITING.name)])
+    assert state.retail_status == "takeout"
+    _drive(state, [trig("SETTLING"), trig("MOTION_DETECTED")])   # hand in mid-pull
+    assert state.retail_status == "takeout"
+    _drive(state, [_cleared("v1", "v2"), trig("IDLE")])
+    msgs = []
+    while not q.empty():
+        msgs.append(q.get_nowait())
+    last = [m for m in msgs if m.get("type") == "state"][-1]
+    assert last["status"] == "throw"
+    assert state.retail_status == "throw"

@@ -21,6 +21,11 @@ BOARD_STATUS_STOPPED = "stopped"
 BOARD_STATUS_READY = "ready"
 BOARD_STATUS_TAKEOUT = "takeout"
 BOARD_STATUS_UNKNOWN = "unknown"
+#: The board says it is running, but its cameras deliver no frames: it
+#: cannot see a dart. Not one of Autodarts' own states -- its /api/state
+#: keeps saying "Throw" after its camera grabber has given up -- but read
+#: off its per-camera frame rate (see ad_ws_listener's camera check).
+BOARD_STATUS_CAMERAS_DOWN = "cameras_down"
 
 # Colors are a separate, trivial derived step so "what state is it in"
 # and "what color do we show" can never drift apart into two competing
@@ -30,5 +35,6 @@ BOARD_STATUS_COLOR = {
     BOARD_STATUS_READY: "green",
     BOARD_STATUS_TAKEOUT: "yellow",
     BOARD_STATUS_UNKNOWN: "grey",
+    BOARD_STATUS_CAMERAS_DOWN: "red",
 }
 

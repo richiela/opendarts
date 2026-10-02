@@ -51,6 +51,15 @@ is Talos's own opinion about how to turn raw images into a score:
   ghost leftover-dart tip on one poisoned camera; see `prior_dart.py`.
 - `prior_dart.py` -- visit-prior board-XY lookup + gated erase of a
   motion-diff blob that is actually last throw's dart (T15, +1/-0).
+- `cross_view.py` (2026-09-28) -- picks each camera's blob from Talos's
+  OWN top candidates (`shaft_line.shaft_components()`, this package's
+  frozen blob machinery) by how well it fits the other two views in 3D.
+  The consistency geometry is imported from
+  `opendarts.engines.apollo.cross_view` -- one implementation of the
+  physics, not two -- but no Apollo blob, tip or call ever reaches
+  Talos. `ray_fallback.prefer_pair_on_board()` and
+  `slide_point_along_dart_axis(max_tilt_deg=...)` are the two on-board
+  gates that came with it.
 
 Zero-behavior-change proof: this engine was run against the full real
 `data/archive/clean/` (and `important/`) corpus and confirmed the same

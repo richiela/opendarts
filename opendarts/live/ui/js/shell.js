@@ -55,11 +55,12 @@ const Shell = (() => {
   // ---- the status chip ----
   // The show says it like a broadcast (LIVE, OFF AIR, STAND BY, NO SIGNAL);
   // the lab says it like an instrument. Same phase, same place.
-  const ON_AIR = {ready: 'LIVE', takeout: 'LIVE', stopped: 'OFF AIR', nocapture: 'OFF AIR', offline: 'NO SIGNAL'};
+  const ON_AIR = {ready: 'LIVE', takeout: 'LIVE', stopped: 'OFF AIR', nocapture: 'OFF AIR', offline: 'NO SIGNAL', held: 'ON HOLD'};
   function renderStatus() {
     const p = rigPhase();
     const chip = $('#status');
     chip.dataset.tone = p.tone;
+    chip.dataset.led = rigLed(p);
     $('#status-tag').textContent = ON_AIR[p.key] || 'STAND BY';
     $('#status-label').textContent = p.label;
     $('#status-detail').textContent = p.key === 'ready' || p.key === 'takeout' || p.key === 'stopped' ? p.detail.replace(/\.$/, '') : '';
@@ -70,17 +71,7 @@ const Shell = (() => {
 
   // The lab's readout: the oracle and the cameras at a glance, and a clock.
   function renderReadout() {
-    const ad = S.ad || (S.runtime && S.runtime.ad);
-    const b = S.adBoard || {};
-    const o = $('#ro-oracle');
-    let tone = 'idle', word = '—';
-    if (S.config && S.config.ad_enabled === false) word = 'OFF';
-    else if (ad && ad.available === false) word = 'NONE';
-    else if (ad && !ad.connected) { tone = 'bad'; word = 'DOWN'; }
-    else if (b.status === 'takeout' && typeof b.age === 'number' && b.age >= 30) { tone = 'bad'; word = 'STUCK'; }
-    else if (ad && ad.connected) { tone = 'live'; word = 'READY'; }
-    o.dataset.tone = tone;
-    o.replaceChildren('ORACLE ', h('b', {}, word));
+    renderOracle();
     const cams = $('#ro-cams');
     const rows = S.camRows ? Object.values(S.camRows) : null;
     const running = !!(S.capture && S.capture.running);
@@ -89,12 +80,69 @@ const Shell = (() => {
     cams.replaceChildren('CAMS ', h('b', {}, !running ? 'OFF' : open === null ? 'ON' : open + '/' + CAM_IDS.length));
   }
 
+  // ---- the oracle: every indicator, and its sheet ----
+  // One state (oracleState, play.js), shown wherever it appears: the bar's
+  // readout, the Play board, a display's Engines layout. Tapping any of them
+  // on a controller opens the sheet: the state in words, Start / Stop /
+  // Reset (POST /api/oracle/{action}; the board's new state then arrives
+  // as AD_BOARD_STATUS like any other change). A display only shows it.
+  const DOT_TONE = {off: 'idle', stopped: 'bad', takeout: 'warn', ready: 'live'};
+  let oracleBusy = false;
+  function renderOracle() {
+    const o = oracleState();
+    $$('.oracle-ind').forEach((el) => {
+      el.dataset.tone = o.tone;
+      el.dataset.blink = o.blink ? 'on' : 'off';
+      el.title = o.label + ' — ' + o.detail;
+      el.replaceChildren(h('i', {class: 'od', 'aria-hidden': 'true'}), h('span', {class: 'ol'}, 'ORACLE'), ' ', h('b', {}, o.word));
+    });
+    const dot = $('#orc-dot');
+    dot.dataset.tone = DOT_TONE[o.tone] || 'idle';
+    dot.dataset.blink = o.blink ? 'on' : 'off';
+    $('#orc-title').textContent = o.label;
+    $('#orc-detail').textContent = o.detail;
+    // One button that starts a stopped board and stops a running one, as
+    // the session sheet's Start/Stop does for scoring.
+    const running = o.key === 'ready' || o.key === 'takeout' || o.key === 'stuck' || o.key === 'cameras';
+    const toggle = $('#orc-toggle');
+    toggle.textContent = running ? 'Stop' : 'Start';
+    toggle.className = running ? 'btn' : 'btn signal';
+    toggle.title = running ? 'Stop Autodarts’ board.' : 'Start Autodarts’ board scoring again.';
+    toggle.disabled = oracleBusy || !o.live;
+    $('#orc-calibrate').disabled = oracleBusy || !o.live;
+    $('#orc-reset').disabled = oracleBusy || !o.live;
+  }
+  function openOracle() {
+    if (ROLE === 'display') return;
+    renderOracle();
+    renderActivity();
+    sheet.open('sheet-oracle');
+  }
+  // Each press is one activity line, updated in place -- the same record
+  // the session sheet keeps, shown in both.
+  const ORACLE_ACT = {
+    start: ['Autodarts start', 'starting its board…'], stop: ['Autodarts stop', 'stopping its board…'],
+    reset: ['Autodarts reset', 'clearing its board…'], calibrate: ['Autodarts calibrate', 'keep the board clear — this takes a while…'],
+  };
+  async function oracleAction(action) {
+    oracleBusy = true;
+    renderOracle();
+    const act = activity(ORACLE_ACT[action][0], 'pending', ORACLE_ACT[action][1]);
+    let body = null;
+    try { body = await api.post('/api/oracle/' + action); } catch (err) { body = null; }
+    if (body && body.ok) act.done('ok', action === 'calibrate' ? 'calibrated' : 'done — the light follows its board');
+    else act.done('bad', (body && (body.error || (body.status ? 'Autodarts answered ' + body.status : null))) || 'could not reach the rig');
+    oracleBusy = false;
+    renderOracle();
+  }
+
   // ---- the session sheet ----
   function renderSession() {
     const p = rigPhase();
     $('#sess-title').textContent = p.label;
     $('#sess-detail').textContent = p.detail || '';
     $('#sess-dot').dataset.tone = p.tone;
+    $('#sess-dot').dataset.led = rigLed(p);
     const running = !!(S.capture && S.capture.running);
     const noCapture = p.key === 'nocapture' || p.key === 'offline' || p.key === 'connecting';
     $('#sess-start').hidden = running || noCapture;
@@ -102,15 +150,21 @@ const Shell = (() => {
     const busy = p.key === 'starting' || p.key === 'calibrating' || Session.busy;
     ['#sess-start', '#sess-stop', '#sess-calibrate', '#sess-reset'].forEach((sel) => { $(sel).disabled = busy || noCapture; });
     $('#sess-reset').disabled = busy || !running;
+    // With the oracle on, Reset clears Autodarts' board too (POST /api/reset).
+    const both = !!(S.config && S.config.ad_enabled);
+    $('#sess-reset').textContent = both ? 'Reset OD + oracle' : 'Reset visit';
+    $('#sess-reset').title = both ? 'Take the board as it is now as empty and start the visit again — and reset Autodarts’ board too.' : 'Take the board as it is now as empty, and start the visit again.';
   }
 
+  // The same record in both sheets: the session's and the oracle's.
   function renderActivity() {
-    const list = $('#sess-activity');
-    if (!S.activity.length) { list.replaceChildren(h('li', {class: 'muted'}, 'Nothing yet this visit to the page.')); return; }
-    list.replaceChildren(...S.activity.map((a) => h('li', {class: 'act act-' + a.status},
-      h('span', {class: 'act-time'}, clock(a.started) + (a.finished ? '–' + clock(a.finished) : '')),
-      h('span', {class: 'act-label'}, a.label),
-      h('span', {class: 'act-detail'}, a.detail))));
+    for (const list of [$('#sess-activity'), $('#orc-activity')]) {
+      if (!S.activity.length) { list.replaceChildren(h('li', {class: 'muted'}, 'Nothing yet this visit to the page.')); continue; }
+      list.replaceChildren(...S.activity.map((a) => h('li', {class: 'act act-' + a.status},
+        h('span', {class: 'act-time'}, clock(a.started) + (a.finished ? '–' + clock(a.finished) : '')),
+        h('span', {class: 'act-label'}, a.label),
+        h('span', {class: 'act-detail'}, a.detail))));
+    }
   }
 
   // ---- this screen ----
@@ -176,6 +230,13 @@ const Shell = (() => {
   $$('.views a').forEach((a) => a.addEventListener('click', (ev) => { ev.preventDefault(); go(a.dataset.view); }));
   window.addEventListener('hashchange', () => { if (ROLE !== 'display') fromHash(); });
   $('#status').addEventListener('click', () => { renderSession(); renderActivity(); sheet.open('sheet-session'); });
+  $$('.oracle-ind').forEach((el) => el.addEventListener('click', openOracle));
+  $('#orc-toggle').addEventListener('click', () => {
+    const o = oracleState();
+    oracleAction(o.key === 'ready' || o.key === 'takeout' || o.key === 'stuck' || o.key === 'cameras' ? 'stop' : 'start');
+  });
+  $('#orc-calibrate').addEventListener('click', () => oracleAction('calibrate'));
+  $('#orc-reset').addEventListener('click', () => oracleAction('reset'));
   $('#screen').addEventListener('click', openScreen);
   $('#sess-start').addEventListener('click', () => Session.start());
   $('#sess-stop').addEventListener('click', () => Session.stop());
@@ -211,7 +272,11 @@ const Shell = (() => {
   on('adboard', renderReadout);
   on('camstatus', renderReadout);
   on('config', renderReadout);
-  setInterval(() => { const el = $('#ro-clock'); if (el) el.textContent = clock(new Date()); }, 1000);
+  // Once a second: the clock, and the oracle (takeout turns to "stuck" by
+  // time alone, with no event to say so).
+  // A held takeout becomes a hold by time alone (its grace runs out), so the
+  // rig's status is re-read with it.
+  setInterval(() => { const el = $('#ro-clock'); if (el) el.textContent = clock(new Date()); renderOracle(); if (S.oracleHold) emit('phase'); }, 1000);
   on('connected', renderStatus);
   on('activity', renderActivity);
   on('sound', renderScreen);
@@ -289,11 +354,15 @@ const Session = (() => {
   }
 
   async function reset() {
-    const act = activity('Reset visit', 'pending');
+    const act = activity(S.config && S.config.ad_enabled ? 'Reset OD + oracle' : 'Reset visit', 'pending');
     try {
       const body = await api.post('/api/reset');
-      if (body && body.loop_listening) { act.done('ok', 'the board as it is now is the new empty board'); toast('Visit reset', 'ok'); }
-      else act.done('bad', 'no capture loop in this process');
+      const orc = body && body.oracle_reset;
+      const orcWord = !orc ? '' : orc.ok ? ' · Autodarts reset' : ' · Autodarts did not reset: ' + (orc.error || 'answered ' + orc.status);
+      if (body && body.loop_listening) {
+        act.done(orc && !orc.ok ? 'warn' : 'ok', 'the board as it is now is the new empty board' + orcWord);
+        toast(orc ? (orc.ok ? 'Visit and Autodarts reset' : 'Visit reset — Autodarts did not') : 'Visit reset', orc && !orc.ok ? 'warn' : 'ok');
+      } else act.done('bad', 'no capture loop in this process' + orcWord);
     } catch (err) { act.done('bad', 'could not reach the rig'); }
   }
 
@@ -349,7 +418,9 @@ function applyState(st) {
   }
   if (st.calibration) S.calibration = st.calibration;
   if (st.engine_config) S.engineConfig = st.engine_config;
-  S.adBoard = {status: st.ad_board_status, age: st.ad_board_status_age_sec};
+  if ('oracle_hold' in st) S.oracleHold = st.oracle_hold;
+  S.adBoard = {status: st.ad_board_status,
+    since: typeof st.ad_board_status_age_sec === 'number' ? Date.now() - st.ad_board_status_age_sec * 1000 : null};
   emit('state'); emit('phase'); emit('visit'); emit('calibration'); emit('engines'); emit('adboard');
 }
 
@@ -452,11 +523,12 @@ function connect() {
         Calib.onProgress(m);
         break;
       case 'AD_BOARD_STATUS':
-        S.adBoard = {status: m.status, age: 0};
-        emit('adboard');
+        S.adBoard = {status: m.status, since: Date.now()};
+        if ('oracle_hold' in m) S.oracleHold = m.oracle_hold;
+        emit('adboard'); emit('phase');
         break;
       case 'AD_CONNECTION':
-        if (acceptAd(m)) { S.ad = m; emit('adboard'); }
+        if (acceptAd(m)) { S.ad = m; if ('oracle_hold' in m) S.oracleHold = m.oracle_hold; emit('adboard'); emit('phase'); }
         break;
       case 'DISPLAY_UPDATED':
       case 'DISPLAY_IDENTIFY':

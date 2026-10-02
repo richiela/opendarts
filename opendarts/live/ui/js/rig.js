@@ -671,10 +671,11 @@ const Rig = (() => {
       : ad.connected ? 'Connected to ' + S.config.ad_base_url + '.'
         : 'Not connected to ' + S.config.ad_base_url + ' — no comparisons are being recorded.');
     const b = S.adBoard || {};
-    const stuck = b.status === 'takeout' && typeof b.age === 'number' && b.age >= 30;
+    const age = adBoardAge();
+    const stuck = b.status === 'takeout' && age !== null && age >= ORACLE_STUCK_S;
     $('#ad-board').textContent = !S.config.ad_enabled ? '' : b.status
-      ? 'Autodarts’ board: ' + ({ready: 'ready', takeout: 'takeout', stopped: 'stopped'}[b.status] || b.status)
-        + (stuck ? ' — stuck for ' + Math.round(b.age) + ' s, so it is not scoring. Clear the board.' : '')
+      ? 'Autodarts’ board: ' + ({ready: 'ready', takeout: 'takeout', stopped: 'stopped', cameras_down: 'cameras down — it is getting no frames'}[b.status] || b.status)
+        + (stuck ? ' — stuck for ' + Math.round(age) + ' s, so it is not scoring. Clear the board.' : '')
       : '';
     $('#ad-board').className = 'note' + (stuck ? ' bad' : '');
   }
@@ -755,10 +756,19 @@ const Rig = (() => {
     if (fh.frame_sink_attached === false) { list.replaceChildren(line('bad', 'ALL', 'Not wired', 'Publishers exist but nothing feeds them — frames are captured and never offered.')); return; }
     const slots = pub.slots || [];
     if (!slots.length) { list.replaceChildren(line('warn', 'ALL', 'No slots', 'Publishing is on, but no virtual camera exists.')); return; }
+    // Open is not publishing: with scoring stopped the virtual cameras stay
+    // open but nothing feeds them. Say so, rather than "Publishing" over a
+    // frame count that is standing still.
+    const scoring = !!(S.capture && S.capture.running);
     list.replaceChildren(...slots.map((sl) => {
       const name = 'CAM ' + ((sl.slot === undefined ? 0 : sl.slot) + 1);
       if (sl.open === false || (sl.open === undefined && sl.published === undefined)) {
         return line('warn', name, 'Not open', (sl.device ? sl.device + ' · ' : '') + (sl.last_error || 'nothing published yet'));
+      }
+      const moved = fh.moved ? fh.moved[sl.slot] : null;
+      if (!scoring || moved === false) {
+        const why = !scoring ? 'scoring is stopped, so the cameras are not feeding it' : 'no new frames since the last look';
+        return line('idle', name, 'Idle', (sl.device ? sl.device + ' · ' : '') + why + ' · ' + (sl.published || 0).toLocaleString() + ' frames so far');
       }
       const neg = sl.negotiated || {};
       const res = neg.width && neg.height ? neg.width + '×' + neg.height : (sl.width && sl.height ? sl.width + '×' + sl.height : null);
@@ -781,8 +791,19 @@ const Rig = (() => {
       return line(tone, name, state, bits.join(' · '));
     }));
   }
+  // Start or Stop flips the rows at once, without waiting for the next fetch.
+  on('phase', () => { if (Shell.showing('rig')) renderPublishing(S.frameHealth); });
   async function refreshFrameHealth() {
     const fh = await api.get('/api/frame-health').catch(() => null);
+    // Whether each virtual camera's frame count moved since the last fetch.
+    if (fh && fh.publish && Array.isArray(fh.publish.slots)) {
+      const before = S.frameHealth && S.frameHealth.publish && S.frameHealth.publish.slots;
+      fh.moved = {};
+      for (const sl of fh.publish.slots) {
+        const was = before && before.find((b) => b.slot === sl.slot);
+        fh.moved[sl.slot] = was && typeof was.published === 'number' && typeof sl.published === 'number' ? sl.published > was.published : null;
+      }
+    }
     S.frameHealth = fh && fh.ok !== false ? fh : null;
     renderPublishing(S.frameHealth);
     emit('framehealth');

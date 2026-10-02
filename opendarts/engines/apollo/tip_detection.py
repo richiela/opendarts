@@ -1547,6 +1547,86 @@ def _locate_tip_in_component(
     return (float(tip_pt[0]), float(tip_pt[1])), diag
 
 
+@dataclass
+class DiffComponents:
+    """`detect_tip()`'s front end for one (bg, frame) pair: the blurred
+    diff, the opened mask and the labelled dilated components. Split out
+    2026-09-28 so `cross_view.blob_candidates()` can rank the SAME
+    components instead of recomputing them (see `diff_components()`)."""
+
+    img_h: int
+    img_w: int
+    bg_gray: np.ndarray
+    diff_blur: np.ndarray
+    origin: tuple[int, int]
+    opened: np.ndarray
+    n: int
+    labels: np.ndarray
+    stats: np.ndarray
+
+
+# The last few front ends computed, keyed on the IDENTITY of the exact
+# arrays passed in. Apollo's cross-view selection and detect_tip() read
+# the same camera pair within one score() call; without this the
+# selection more than doubled Apollo's per-dart time (13 -> 29ms median
+# on the dev machine; 18ms with it). Each entry holds references to its
+# own arrays, so an id can never be reused while its entry is alive --
+# identity, not id(), is what is compared. Concurrent callers are safe:
+# a lost or evicted entry only costs a recompute of the same result.
+_COMPONENTS_MEMO: list[tuple[np.ndarray, np.ndarray, object, DiffComponents]] = []
+_COMPONENTS_MEMO_SIZE = 3  # one per camera: a score() call's selection then its detections
+
+
+def diff_components(bg_bgr: np.ndarray, frame_bgr: np.ndarray, precomputed: DiffCrop | None = None) -> DiffComponents:
+    """The diff / threshold / open / dilate / label front end of
+    `detect_tip()`, memoized per exact (bg, frame, precomputed) objects.
+    Callers must have checked that the two shapes match."""
+    import cv2
+
+    for bg0, fr0, pc0, comps in _COMPONENTS_MEMO:
+        if bg0 is bg_bgr and fr0 is frame_bgr and pc0 is precomputed:
+            return comps
+    pc = precomputed
+    if pc is not None and not pc.accepts(PRECOMPUTE_REQUIREMENTS, bg_bgr.shape):
+        pc = None
+    if pc is None:
+        img_h, img_w = bg_bgr.shape[:2]
+        bg_gray = cv2.cvtColor(bg_bgr, cv2.COLOR_BGR2GRAY)
+        frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        diff_blur = _blurred_diff(bg_gray, frame_gray)
+        origin = (0, 0)
+    else:
+        img_h, img_w = pc.img_h, pc.img_w
+        bg_gray = pc.bg_gray
+        diff_blur = pc.diff_blur  # crop of the identical full-frame array
+        origin = pc.origin
+
+    # From here to the connected-component labeling every array is
+    # crop-sized (the whole frame when there is no `precomputed`).
+    mask = threshold_mask(diff_blur, DIFF_THRESHOLD)
+    # The 3x3 opening runs on the whole (crop) array: before it, sensor
+    # noise above threshold is spread over ~80% of the frame, so there is
+    # no tight region to crop to yet. The 31px dilation AFTER it is a
+    # different story -- the opened mask's non-zero bounding box is a
+    # median ~4% of the frame, and the full-frame ellipse dilate alone was
+    # 43% of this engine's per-throw time (2026-09-05 perf pass;
+    # bit-identical, see `opendarts.imageops.morph_on_bbox`).
+    opened = cv2.morphologyEx(mask, cv2.MORPH_OPEN, ellipse_kernel(OPEN_KERNEL_PX))
+    dilated = morph_on_bbox(opened, cv2.MORPH_DILATE, ellipse_kernel(DILATE_KERNEL_PX))
+    if pc is not None:
+        dilated = pc.paste_full(dilated)
+
+    n, comp_labels, stats, _ = cv2.connectedComponentsWithStats(dilated, connectivity=8)
+
+    comps = DiffComponents(
+        img_h=img_h, img_w=img_w, bg_gray=bg_gray, diff_blur=diff_blur, origin=origin,
+        opened=opened, n=n, labels=comp_labels, stats=stats,
+    )
+    _COMPONENTS_MEMO.append((bg_bgr, frame_bgr, precomputed, comps))
+    if len(_COMPONENTS_MEMO) > _COMPONENTS_MEMO_SIZE:
+        del _COMPONENTS_MEMO[0]
+    return comps
+
 def detect_tip(
     bg_bgr: np.ndarray,
     frame_bgr: np.ndarray,
@@ -1595,37 +1675,11 @@ def detect_tip(
             reason=f"shape mismatch: bg {bg_bgr.shape} vs frame {frame_bgr.shape}",
         )
 
-    pc = precomputed
-    if pc is not None and not pc.accepts(PRECOMPUTE_REQUIREMENTS, bg_bgr.shape):
-        pc = None
-    if pc is None:
-        img_h, img_w = bg_bgr.shape[:2]
-        bg_gray = cv2.cvtColor(bg_bgr, cv2.COLOR_BGR2GRAY)
-        frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        diff_blur = _blurred_diff(bg_gray, frame_gray)
-        origin = (0, 0)
-    else:
-        img_h, img_w = pc.img_h, pc.img_w
-        bg_gray = pc.bg_gray
-        diff_blur = pc.diff_blur  # crop of the identical full-frame array
-        origin = pc.origin
-
-    # From here to the connected-component labeling every array is
-    # crop-sized (the whole frame when there is no `precomputed`).
-    mask = threshold_mask(diff_blur, DIFF_THRESHOLD)
-    # The 3x3 opening runs on the whole (crop) array: before it, sensor
-    # noise above threshold is spread over ~80% of the frame, so there is
-    # no tight region to crop to yet. The 31px dilation AFTER it is a
-    # different story -- the opened mask's non-zero bounding box is a
-    # median ~4% of the frame, and the full-frame ellipse dilate alone was
-    # 43% of this engine's per-throw time (2026-09-05 perf pass;
-    # bit-identical, see `opendarts.imageops.morph_on_bbox`).
-    opened = cv2.morphologyEx(mask, cv2.MORPH_OPEN, ellipse_kernel(OPEN_KERNEL_PX))
-    dilated = morph_on_bbox(opened, cv2.MORPH_DILATE, ellipse_kernel(DILATE_KERNEL_PX))
-    if pc is not None:
-        dilated = pc.paste_full(dilated)
-
-    n, comp_labels, stats, _ = cv2.connectedComponentsWithStats(dilated, connectivity=8)
+    comps = diff_components(bg_bgr, frame_bgr, precomputed)
+    img_h, img_w = comps.img_h, comps.img_w
+    bg_gray, diff_blur, origin = comps.bg_gray, comps.diff_blur, comps.origin
+    opened = comps.opened
+    n, comp_labels, stats = comps.n, comps.labels, comps.stats
     if n <= 1:
         return TipDetectionResult(
             ok=False, tip_px=None,
@@ -1781,3 +1835,133 @@ def detect_tip(
         alt_tip_px=tip_diag.get("alt_tip_px"),
         far_end_px=far_end_px,
     )
+
+
+# --- Half-maximum tip refinement (2026-09-28) ---------------------------
+# The fixed DIFF_THRESHOLD above cuts the dart's end off where the thin
+# needle's diff drops below 25, and how much it cuts depends on the bed
+# under the needle: measured on the 2026-09 corpus (1,618 darts, 3-camera
+# triangulations), the triangulated tip sat ~1.1mm IN FRONT of the board
+# plane on black beds (34% more than 2mm in front, i.e. clearly short)
+# and ~1.3mm BEHIND it on cream beds, with the oracle's own tip agreeing
+# on the direction (black short, cream long). Lowering the threshold
+# (tried 10/14/18) moves every bed the same way and pushed cream a
+# further 1.1-2mm behind the board -- a fixed level cannot be right on
+# both. The half-maximum edge of the diff profile, measured relative to
+# the local noise floor and the level just inside the end, is where a
+# blurred edge really is whatever its contrast.
+#
+# Applied only when it moves the tip by HALF_MAX_MIN_MOVE_PX or more:
+# the 1-2px creeps it would otherwise make are blur halo (they push the
+# already-right cream tips deeper), while moves of 3px+ are a faint or
+# fragmented needle the threshold missed. With that rule cream is left
+# where it was, the black-bed short tail shrinks (p90 height +5.7mm ->
+# +3.1mm) and the ray spread tightens (p90 3.4 -> 3.0mm). On its own it
+# broke one right call, by walking a tip further along a board wire; the
+# engine therefore never applies it to a tip `cross_view.wire_tail()`
+# flags (see ApolloEngine.score()).
+HALF_MAX_FRACTION = 0.5
+HALF_MAX_MAX_EXTENSION_PX = 12
+HALF_MAX_BACK_PX = 6
+HALF_MAX_GAP_PX = 2
+HALF_MAX_NOISE_K = 3.0
+HALF_MAX_MIN_MOVE_PX = 3.0
+
+
+def _sample_bilinear(img: np.ndarray, x: float, y: float) -> float:
+    import cv2
+
+    h, w = img.shape
+    if not (0 <= x < w - 1 and 0 <= y < h - 1):
+        return -1.0
+    return float(cv2.getRectSubPix(img, (1, 1), (float(x), float(y)))[0, 0])
+
+
+def _half_max_end(
+    bg_bgr: np.ndarray,
+    frame_bgr: np.ndarray,
+    tip: tuple[float, float],
+    far: tuple[float, float],
+) -> tuple[tuple[float, float], float]:
+    """The dart's end along its own axis as the half-maximum crossing of
+    the diff profile. Returns `(new_tip, signed_move_px)`, positive
+    toward the point; `(tip, 0.0)` whenever the evidence is too thin to
+    say anything."""
+    import cv2
+
+    u = np.subtract(tip, far).astype(float)
+    n = np.linalg.norm(u)
+    if n < 5:
+        return tip, 0.0
+    u /= n
+    v = np.array([-u[1], u[0]])
+    max_ext, back = HALF_MAX_MAX_EXTENSION_PX, HALF_MAX_BACK_PX
+    r = max_ext + back + 8
+    h, w = bg_bgr.shape[:2]
+    x0, y0 = max(int(tip[0]) - r, 0), max(int(tip[1]) - r, 0)
+    x1, y1 = min(int(tip[0]) + r + 1, w), min(int(tip[1]) + r + 1, h)
+    if x1 - x0 < 10 or y1 - y0 < 10:
+        return tip, 0.0
+    g0 = cv2.cvtColor(bg_bgr[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY).astype(np.float32)
+    g1 = cv2.cvtColor(frame_bgr[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY).astype(np.float32)
+    d = cv2.GaussianBlur(
+        cv2.absdiff(g0, g1), (GAUSSIAN_BLUR_KSIZE, GAUSSIAN_BLUR_KSIZE), 0
+    )
+    # Noise floor from pixels ahead of the tip but 4-12px off the axis:
+    # the same neighbourhood the needle would be in, minus the needle.
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    rx, ry = xx - tip[0], yy - tip[1]
+    along, across = rx * u[0] + ry * u[1], np.abs(rx * v[0] + ry * v[1])
+    ring = (across >= 4) & (across <= 12) & (along >= -2) & (along <= max_ext + 4)
+    vals = d[ring]
+    if vals.size < 20:
+        return tip, 0.0
+    med = float(np.median(vals))
+    mad = float(np.median(np.abs(vals - med))) + 0.5
+    floor = med + HALF_MAX_NOISE_K * 1.4826 * mad
+    ss = np.arange(-back, max_ext + 0.01, 0.5)
+    prof = np.array([
+        max(
+            _sample_bilinear(d, tip[0] + s * u[0] - x0 + o * v[0], tip[1] + s * u[1] - y0 + o * v[1])
+            for o in (-1.0, 0.0, 1.0)
+        )
+        for s in ss
+    ])
+    # Last sample above the noise floor walking out from the current tip,
+    # tolerating a short gap (a fragmented needle).
+    i0 = int(np.searchsorted(ss, 0.0))
+    end, miss = i0, 0
+    for i in range(i0, len(ss)):
+        if prof[i] > floor:
+            end, miss = i, 0
+        else:
+            miss += 1
+            if miss > HALF_MAX_GAP_PX * 2:
+                break
+    inside = prof[(ss >= ss[end] - 4) & (ss <= ss[end] - 1.5)]
+    if inside.size == 0:
+        return tip, 0.0
+    level = float(np.median(inside))
+    if level <= floor:
+        return tip, 0.0
+    half = floor + HALF_MAX_FRACTION * (level - floor)
+    j = end
+    while j > 0 and prof[j] < half:
+        j -= 1
+    s = float(ss[j])
+    return (float(tip[0] + s * u[0]), float(tip[1] + s * u[1])), s
+
+
+def refine_tip_half_max(
+    bg_bgr: np.ndarray,
+    frame_bgr: np.ndarray,
+    tip_px: tuple[float, float],
+    far_end_px: tuple[float, float] | None,
+) -> tuple[float, float]:
+    """`tip_px` moved to the half-maximum end of the dart (see the dated
+    block above), or unchanged when that would move it by less than
+    `HALF_MAX_MIN_MOVE_PX` or there is no far end to give the axis."""
+    if far_end_px is None:
+        return tip_px
+    new_tip, moved = _half_max_end(bg_bgr, frame_bgr, tip_px, far_end_px)
+    return tip_px if abs(moved) < HALF_MAX_MIN_MOVE_PX else new_tip

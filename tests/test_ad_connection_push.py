@@ -64,6 +64,14 @@ class _Listener:
     def set_base_url(self, url):
         self.base_url = url.strip().rstrip("/")
 
+    # read by the oracle hold, which rides on the AD_CONNECTION push and
+    # the retail status (2026-09-28)
+    def board_status(self):
+        return "ready", None
+
+    def board_status_age_sec(self):
+        return None
+
 
 @pytest.fixture
 def no_config_writes(monkeypatch):

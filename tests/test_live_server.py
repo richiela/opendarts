@@ -4984,7 +4984,9 @@ class _FakeBoardStatusListener:
     """Minimal duck-typed stand-in for AdWsListener -- only the methods
     AppState ever actually calls on it (start()/stop()/board_status()/
     board_status_age_sec() -- confirmed by grepping server.py's own
-    self.ad_ws_listener. call sites, not assumed)."""
+    self.ad_ws_listener. call sites, not assumed -- plus is_enabled()/
+    is_connected(), which the oracle hold reads for state_dict(), since
+    2026-09-28)."""
 
     def __init__(self, status: str, raw=None, age_sec=None):
         self._status = status
@@ -4997,6 +4999,12 @@ class _FakeBoardStatusListener:
         """Seconds in the current status -- what tells a normal takeout
         apart from a board wedged in one."""
         return self._age_sec
+
+    def is_enabled(self):
+        return True
+
+    def is_connected(self):
+        return True
 
     def start(self):
         self.start_calls += 1

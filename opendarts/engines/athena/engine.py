@@ -36,6 +36,7 @@ from opendarts.engines.athena.confidence import (
 )
 from opendarts.engines.athena.crossing_detection import PRECOMPUTE_REQUIREMENTS, detect_crossing
 from opendarts.engines.athena.plane_intersect import ray_plane_intersect
+from opendarts.engines.athena.tip_continuation import continue_tip
 from opendarts.engines.athena.shaft_lines import (
     MAX_INTERSECTION_RADIUS_MM,
     MIN_CROSSING_ANGLE_DEG,
@@ -43,7 +44,7 @@ from opendarts.engines.athena.shaft_lines import (
     intersect_board_lines,
     intersection_weight,
 )
-from opendarts.geometry.board import sector_ring_for_point
+from opendarts.geometry.board import DOUBLE_OUTER_RADIUS_MM, sector_ring_for_point
 from opendarts.pipeline import CameraCalibration
 from opendarts.triangulation.rays import back_project_ray
 
@@ -1102,6 +1103,8 @@ def _select_best_candidate(
     cam: int,
     roi_polygon,
     require_roi: bool,
+    images: "tuple[np.ndarray, np.ndarray] | None" = None,
+    lone_camera: bool = False,
 ):
     """Walk one camera's candidate list (already end-picked/re-ranked by
     `_pick_tip_end`), keep the ones that pass the board ROI gate (or, when
@@ -1119,13 +1122,19 @@ def _select_best_candidate(
     by another admitted candidate's diff-component area is dropped before
     steepness is even consulted. Candidates with no area recorded (the
     synthesized single-candidate fallback in `score()`) are never dropped
-    by it -- there is nothing real to compare."""
+    by it -- there is nothing real to compare.
+
+    `images` (`(bg, frame)`, 2026-09-28): when given, each candidate's
+    tip is continued down the shaft first -- see `_continue_candidate()`
+    and `AthenaEngine.score()` for when, and `lone_camera`."""
     admitted: list[dict] = []
     n_end_flips = 0
     for cand in candidates:
         cand = _pick_tip_end(cand, calib, cam, roi_polygon)
         if cand.get("end_flipped"):
             n_end_flips += 1
+        if images is not None:
+            cand = _continue_candidate(cand, images, calib, cam, lone_camera)
         if require_roi and not point_in_board_roi(cand["crossing_px"], roi_polygon):
             continue
         admitted.append(cand)
@@ -1230,6 +1239,54 @@ def _pick_tip_end(cand: dict, calib: CameraCalibration, cam: int, roi_polygon) -
     }
     flipped["end_flipped"] = True
     return flipped
+
+
+def _board_radius_mm(pixel, calib: CameraCalibration, cam: int) -> float | None:
+    ray = back_project_ray(
+        pixel, calib.camera_matrix, calib.dist_coeffs, calib.rvec, calib.tvec, cam=cam
+    )
+    xy = ray_plane_intersect(ray, z_mm=BOARD_PLANE_Z_MM)
+    if xy is None:
+        return None
+    x_mm, y_mm = apply_radial_correction(*xy)
+    return float(np.hypot(x_mm, y_mm))
+
+
+def _continue_candidate(
+    cand: dict, images: "tuple[np.ndarray, np.ndarray]", calib: CameraCalibration, cam: int,
+    lone_camera: bool = False,
+) -> dict:
+    """`cand` with its tip continued down the shaft (`tip_continuation.
+    continue_tip()`, see that module's docstring), or `cand` unchanged.
+
+    `lone_camera`: this camera is the only one that sees the dart inside
+    the board on its own. Its read then decides on its own whether the
+    dart is on the board at all, so a continuation may not move that read
+    from off the board onto it: 130708-045-OUT's lone camera walked from
+    201mm (outside, right) to a 4 on the board, the one call the
+    continuation broke in the 2026-09-28 audit. Everything else it does
+    for a lone camera -- on the board, or staying off it -- is left
+    alone: judged in the images, those continuations were mostly right.
+    Decided from this camera's own two board points, never from any other
+    engine or reference."""
+    axis_unit = cand.get("axis_unit")
+    if axis_unit is None:
+        return cand
+    new_px, move_px = continue_tip(images[0], images[1], cand["crossing_px"], axis_unit)
+    if move_px == 0.0:
+        return cand
+    if lone_camera:
+        before = _board_radius_mm(cand["crossing_px"], calib, cam)
+        after = _board_radius_mm(new_px, calib, cam)
+        off_before = before is None or before > DOUBLE_OUTER_RADIUS_MM
+        on_after = after is not None and after <= DOUBLE_OUTER_RADIUS_MM
+        if off_before and on_after:
+            return cand
+    continued = dict(cand)
+    continued["tip_px"] = new_px
+    continued["crossing_px"] = new_px
+    continued["tip_continued_px"] = move_px
+    return continued
 
 
 class AthenaEngine:
@@ -1410,9 +1467,32 @@ class AthenaEngine:
             detections[cam] = {
                 "calib": calib, "roi_polygon": roi_polygon, "candidates": candidates,
             }
-            picked, ray, best_cand_steepness, n_end_flips = _select_best_candidate(
-                candidates, calib, cam, roi_polygon, require_roi=True,
+
+        # 2026-09-28 -- every camera's tip is continued down the shaft (see
+        # opendarts.engines.athena.tip_continuation), in this pass and the
+        # ROI-FALLBACK PASS below alike. The one exception is decided by how
+        # many cameras see the dart inside the board WITHOUT continuation:
+        # when exactly one does, that camera is continued as a lone camera
+        # (`_continue_candidate()`'s `lone_camera`).
+        seen = {
+            cam
+            for cam, d in detections.items()
+            if _select_best_candidate(
+                d["candidates"], d["calib"], cam, d["roi_polygon"], require_roi=True,
+            )[0] is not None
+        }
+        selections = {
+            cam: _select_best_candidate(
+                d["candidates"], d["calib"], cam, d["roi_polygon"], require_roi=True,
+                images=(bg_images[cam], frame_images[cam]),
+                lone_camera=seen == {cam},
             )
+            for cam, d in detections.items()
+        }
+
+        for cam, (picked, ray, best_cand_steepness, n_end_flips) in selections.items():
+            entry = per_camera[cam]
+            calib = detections[cam]["calib"]
             entry["n_end_flips"] = n_end_flips
             if picked is None:
                 entry["used"] = False
@@ -1469,6 +1549,8 @@ class AthenaEngine:
                 "elongation_ratio": picked["elongation_ratio"],
                 "tip_confidence": picked["tip_confidence"],
                 "prior_dart_contamination_suspected": contaminated,
+                # px the tip was continued down the shaft, 0.0 when it was not
+                "tip_continued_px": picked.get("tip_continued_px", 0.0),
             })
             reads.append({
                 "cam": cam, "x_mm": x_mm, "y_mm": y_mm, "sector": sector, "ring": ring,
@@ -1519,6 +1601,7 @@ class AthenaEngine:
             for cam, d in detections.items():
                 picked, ray, steepness, n_end_flips = _select_best_candidate(
                     d["candidates"], d["calib"], cam, d["roi_polygon"], require_roi=False,
+                    images=(bg_images[cam], frame_images[cam]),
                 )
                 entry = per_camera[cam]
                 entry["n_end_flips"] = n_end_flips

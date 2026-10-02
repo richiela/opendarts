@@ -29,7 +29,7 @@
       <span class="status-text"><span id="status-label">Connecting</span><span id="status-detail"></span></span>
     </button>
     <div class="readout" aria-label="Rig readout">
-      <span id="ro-oracle" data-tone="idle">ORACLE <b>—</b></span>
+      <button type="button" id="ro-oracle" class="oracle-ind" data-tone="off" aria-label="Autodarts: status and controls">ORACLE <b>—</b></button>
       <span id="ro-cams">CAMS <b>—</b></span>
       <span><b id="ro-clock">--:--:--</b></span>
     </div>
@@ -48,6 +48,7 @@
     <div class="play-board">
       <div class="board-wrap">
         <canvas id="board" aria-label="The board, with this visit's darts"></canvas>
+        <button type="button" id="oracle-play" class="oracle-ind oracle-show" data-tone="off" aria-label="Autodarts: status and controls"></button>
         <div class="veil" id="board-veil" data-tone="idle">
           <div class="offair">
             <span class="kicker" id="veil-kicker">STAND BY</span>
@@ -77,6 +78,8 @@
 
   <!-- =============================== LAB: THROWS =============================== -->
   <section id="throws" class="throws" hidden aria-label="Throws">
+    <!-- a display in its Engines layout has no bar: the oracle is said here -->
+    <div class="oracle-throws"><span id="oracle-throws" class="oracle-ind oracle-show" data-tone="off"></span></div>
     <header class="throws-head">
       <div class="banner warn" id="throws-banner" hidden></div>
       <div class="throws-top">
@@ -84,9 +87,10 @@
         <div class="throws-tools">
           <div class="tabs" id="throw-filters" role="group" aria-label="Show">
             <button type="button" data-filter="all" aria-pressed="true">All<span class="n"></span></button>
-            <button type="button" data-filter="disagree" aria-pressed="false" title="Our call differs from Autodarts, or from what a person recorded">Disagreements<span class="n"></span></button>
-            <button type="button" data-filter="split" aria-pressed="false" title="The engines did not all agree">Split vote<span class="n"></span></button>
-            <button type="button" data-filter="corrected" aria-pressed="false" title="A person recorded what actually landed">Corrected<span class="n"></span></button>
+            <button type="button" data-filter="disputed" aria-pressed="false" title="Autodarts disagrees with our call and nobody has said which is right yet">Disputed<span class="n"></span></button>
+            <button type="button" data-filter="odwrong" aria-pressed="false" title="A person recorded something other than our call: our score was changed">OD Wrong<span class="n"></span></button>
+            <button type="button" data-filter="adwrong" aria-pressed="false" title="A person recorded something other than Autodarts' call">AD Wrong<span class="n"></span></button>
+            <button type="button" data-filter="split" aria-pressed="false" title="Our own engines did not all agree">Split<span class="n"></span></button>
             <button type="button" data-filter="noread" aria-pressed="false" title="No engine could place the dart">No read<span class="n"></span></button>
           </div>
           <div class="seg" id="throw-density" role="group" aria-label="Rows">
@@ -308,6 +312,22 @@
       <button type="button" class="btn" id="sess-reset" title="Take the board as it is now as empty, and start the visit again.">Reset visit</button>
     </div>
     <div class="activity"><p class="h" style="margin:16px 0 4px"><b>Activity on this screen</b></p><ul id="sess-activity"></ul></div>
+  </div>
+</dialog>
+
+<dialog class="sheet" id="sheet-oracle" aria-labelledby="orc-title">
+  <div class="sheet-box">
+    <header class="sheet-head">
+      <div class="sess-state"><span class="dot" id="orc-dot" data-tone="idle"></span><div><h2 id="orc-title">Autodarts</h2><p id="orc-detail"></p></div></div>
+      <button type="button" class="x" data-close aria-label="Close">✕</button>
+    </header>
+    <!-- laid out like the session sheet: one start-or-stop, then the rest -->
+    <div class="sess-actions">
+      <button type="button" class="btn signal" id="orc-toggle">Start</button>
+      <button type="button" class="btn" id="orc-calibrate" title="Autodarts' own auto-calibration. Keep the board clear.">Calibrate</button>
+      <button type="button" class="btn" id="orc-reset" title="Reset Autodarts' board: clears a takeout it is stuck in.">Reset</button>
+    </div>
+    <div class="activity"><p class="h" style="margin:16px 0 4px"><b>Activity on this screen</b></p><ul id="orc-activity"></ul></div>
   </div>
 </dialog>
 

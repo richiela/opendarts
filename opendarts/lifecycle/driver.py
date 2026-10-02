@@ -32,6 +32,8 @@ import cv2
 import numpy as np
 
 from opendarts.lifecycle.state import (
+    CLEARED_NOT_PARTIAL,
+    CLEARED_STRANDED,
     DEFAULT_CONFIG,
     Action,
     Lifecycle,
@@ -111,7 +113,9 @@ class LifecycleDriver:
     rebuilt. Until it returns a non-empty dict nothing is observed.
     ``config_provider`` is an optional ``() -> LifecycleConfig``; a new
     object identity is swapped onto the live Lifecycle between ticks
-    (no rebuild, no reset).
+    (no rebuild, no reset). ``hold`` is handed to every Lifecycle built
+    (see ``Lifecycle.__init__``): ``() -> reason | None``, a reason not to
+    score the dart that just showed up.
     """
 
     MAX_ERRORS = 20
@@ -132,8 +136,10 @@ class LifecycleDriver:
         idle_heartbeat_ticks: int = 30,
         summary_interval_s: float = 300.0,
         config_provider: Callable[[], LifecycleConfig] | None = None,
+        hold: Callable[[], "str | None"] | None = None,
     ) -> None:
         self.cfg = config
+        self._hold = hold
         self._config_provider = config_provider
         self._masks_provider = masks_provider
         self._on_tick = on_tick
@@ -207,7 +213,7 @@ class LifecycleDriver:
         if not masks:
             return None
         if self._lc is None or self._masks_changed(masks):
-            self._lc = Lifecycle(masks, self.cfg)
+            self._lc = Lifecycle(masks, self.cfg, hold=self._hold)
             self._masks_sig = self._masks_signature(masks)
             self._masks = dict(masks)
             log.info("lifecycle: (re)built for cameras %s", sorted(masks))
@@ -421,7 +427,8 @@ class LifecycleDriver:
             # is the same hold; it ends when the visit clears or the takeout
             # is abandoned
             held_s = time.monotonic() - self._hold_started
-            timed_out = self._hold_ticks >= self.cfg.clear_force_frames
+            timed_out = (self.cfg.clear_force_frames is not None
+                         and self._hold_ticks >= self.cfg.clear_force_frames)
             ended = (
                 "timed out, cleared anyway" if timed_out and tick.action is Action.CLEARED
                 else "board empty, cleared" if tick.action is Action.CLEARED
@@ -432,19 +439,41 @@ class LifecycleDriver:
             self._write({"event": "takeout_hold", "held_s": round(held_s, 2),
                          "ticks": self._hold_ticks, "ended": ended})
             self._hold_started = None
-        if tick.removed is not None:
+        if tick.action is Action.CLEARED and tick.reason.endswith(
+            (f"({CLEARED_NOT_PARTIAL})", f"({CLEARED_STRANDED})")
+        ):
+            # a takeout the reference could not read, cleared because the
+            # board matches the empty board again
+            rule = "not a partial removal" if CLEARED_NOT_PARTIAL in tick.reason else "was stuck"
+            log.info("lifecycle: takeout cleared -- the board matches the empty board (%s; %d darts)",
+                     rule, tick.cleared or 0)
+            self._write({"event": "empty_board_clear", "rule": rule, "darts": tick.cleared})
+        if tick.removed is not None and tick.reason.startswith("not scored: "):
+            # a dart that landed while held (the oracle on and not ready):
+            # nothing wrong with the detection, so no picture is kept --
+            # the line says why it was not scored
+            why = tick.reason[len("not scored: "):]
+            log.info("lifecycle: dart %d not scored -- %s (cams %s)",
+                     tick.removed.dart_index + 1, why, tick.removed.dart_cams)
+            self._write({"event": "held", "why": why, "dart_index": tick.removed.dart_index,
+                         "dart_cams": tick.removed.dart_cams})
+        elif tick.removed is not None:
+            # a would-be dart refused: "a removal, not a dart" or "seen by
+            # one camera only" -- each logged and kept under its own name
+            kind = "removal" if tick.reason == "a removal, not a dart" else "single-camera"
             self._removals += 1
-            evidence = self._save_removal(tick)
+            evidence = self._save_removal(tick, kind)
             log.info(
-                "lifecycle: a would-be dart was a removal, not scored (dart %d, cams %s) -- "
-                "evidence %s", tick.removed.dart_index + 1, tick.removed.dart_cams, evidence)
-            self._write({"event": "removal", "dart_index": tick.removed.dart_index,
+                "lifecycle: a would-be dart was %s, not scored (dart %d, cams %s) -- "
+                "evidence %s", "a removal" if kind == "removal" else "seen by one camera only",
+                tick.removed.dart_index + 1, tick.removed.dart_cams, evidence)
+            self._write({"event": kind, "dart_index": tick.removed.dart_index,
                          "dart_cams": tick.removed.dart_cams, "evidence": evidence})
 
-    def _save_removal(self, tick: Tick) -> str | None:
+    def _save_removal(self, tick: Tick, kind: str = "removal") -> str | None:
         if self._removals > self.MAX_REMOVAL_DIRS or tick.removed is None:
             return None
-        d = self.evidence_dir / f"removal-{self._removals:03d}"
+        d = self.evidence_dir / f"{kind}-{self._removals:03d}"
         try:
             d.mkdir(parents=True, exist_ok=True)
             for cam, img in tick.removed.bg.items():

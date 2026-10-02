@@ -172,7 +172,8 @@ const S = {
   camStatusReason: '',
   build: null,
   ad: null,                  // runtime.ad, ordering-stamped
-  adBoard: {status: null, age: null},
+  adBoard: {status: null, since: null},
+  oracleHold: null,   // why OD is holding for the oracle ({code, reason}), or null -- the server's answer   // Autodarts' board, and since when (ms, this clock)
   activity: [],
 };
 

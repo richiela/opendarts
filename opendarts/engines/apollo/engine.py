@@ -82,19 +82,30 @@ airtight.
 """
 from __future__ import annotations
 
+import dataclasses
 import math
 
 import numpy as np
 
 from opendarts.engines.base import EngineResult
 from opendarts.engines.apollo.board_roi import reject_outside_roi
+from opendarts.engines.athena.tip_continuation import continue_tip
+from opendarts.engines.apollo.cross_view import (
+    SAME_DETECTION_PX,
+    BlobOption,
+    CrossViewPick,
+    select_blobs,
+    wire_tail,
+)
 from opendarts.engines.apollo.confidence import compute_confidence
 from opendarts.engines.apollo.prior_dart_context import PriorDartLinePx
 from opendarts.engines.apollo.scoring import MAX_RAY_DISAGREEMENT_MM, score_dart
 from opendarts.engines.apollo.tip_detection import (
     PRECOMPUTE_REQUIREMENTS,
     TIP_CLUSTER_OFF_AXIS_MIN_PERP_PX,
+    TipDetectionResult,
     detect_tip,
+    refine_tip_half_max,
 )
 from opendarts.imageops import DiffCrop
 from opendarts.geometry.board import DOUBLE_OUTER_RADIUS_MM, sector_ring_for_point
@@ -1227,6 +1238,191 @@ def score_result_to_engine_result(result: ScoreResult) -> EngineResult:
     )
 
 
+def _cross_view_pick(cams, bg_images, frame_images, calibration, precomputed) -> CrossViewPick | None:
+    cams = [c for c in cams if bg_images[c].shape == frame_images[c].shape]
+    try:
+        return select_blobs(
+            {c: bg_images[c] for c in cams},
+            {c: frame_images[c] for c in cams},
+            {c: calibration[c] for c in cams},
+            precomputed,
+        )
+    except AttributeError:
+        # A calibration missing the real CameraCalibration fields (a test
+        # double) -- no cross-view opinion, not a crash; same convention
+        # as `_per_camera_vote_override()`.
+        return None
+
+
+def _is_wire_tail(bg, frame, tip_px, calib) -> bool:
+    try:
+        return wire_tail(bg, frame, tip_px, calib)
+    except AttributeError:
+        return False
+
+
+def _with_half_max(det: TipDetectionResult, bg, frame) -> TipDetectionResult:
+    if det.ok and det.tip_px is not None and det.far_end_px is not None:
+        new_tip = refine_tip_half_max(bg, frame, det.tip_px, det.far_end_px)
+        det.diagnostics["half_max_move_px"] = float(
+            np.hypot(new_tip[0] - det.tip_px[0], new_tip[1] - det.tip_px[1])
+        )
+        det.tip_px = new_tip
+    return det
+
+
+def _camera_detection(
+    bg, frame, calib, cross_pick: CrossViewPick | None, cam: int,
+    prior_line, pc_kwargs: dict,
+) -> TipDetectionResult:
+    """One camera's tip for `ApolloEngine.score()` (2026-09-28).
+
+    Without a cross-view pick this is `detect_tip()` plus the half-max
+    tip refinement (`tip_detection.refine_tip_half_max()`), except that
+    a tip running along a board wire is never extended further along
+    it -- the one right call the refinement broke on its own (047-S5
+    cam0) was exactly that. With a pick, a camera the pick drops
+    reports no tip; a pick that IS Apollo's own detection keeps that
+    detection whole (its alt candidate and diagnostics feed later
+    tiers); any other pick becomes a plain tip + far end.
+    """
+    if cross_pick is not None:
+        option: BlobOption | None = cross_pick.picks.get(cam)
+        if option is None:
+            return TipDetectionResult(
+                ok=False, tip_px=None,
+                reason="cross-view: no blob in this camera fits the other views",
+            )
+        if not option.flip and not option.wire:
+            det = _with_half_max(
+                detect_tip(bg, frame, prior_dart_line_px=prior_line, **pc_kwargs), bg, frame,
+            )
+            if (
+                det.ok and det.far_end_px is not None
+                and np.linalg.norm(np.subtract(det.far_end_px, option.far)) < SAME_DETECTION_PX
+            ):
+                return det
+        tip = option.tip if option.wire else refine_tip_half_max(bg, frame, option.tip, option.far)
+        return TipDetectionResult(ok=True, tip_px=tip, reason="ok", diagnostics={}, far_end_px=option.far)
+    det = detect_tip(bg, frame, prior_dart_line_px=prior_line, **pc_kwargs)
+    if det.ok and det.far_end_px is not None and _is_wire_tail(bg, frame, det.tip_px, calib):
+        return det
+    return _with_half_max(det, bg, frame)
+
+
+# 2026-09-29 -- carrying the tip across a gap to the needle. When a dart
+# shows up in pieces in a camera (the needle faint over the dark surround
+# or a black bed), Apollo's tip is the end of the barrel, 25-60px short.
+# With two such cameras no 3-camera fit holds, and the 2-of-3 fallback can
+# keep a pair that meets well off the board: #1292 (D15) met 23.6mm up and
+# read outside. Athena's `continue_tip()` walks on down the shaft across
+# the gap; this uses it unchanged on each camera's own axis.
+#
+# Carried tips are kept only when the triangulated point they give sits at
+# least `CARRIED_TIP_MIN_GAIN_MM` closer to the board plane than the
+# original tips' -- a real needle end pulls the point onto the board, a
+# walk up the flight or along a wire pushes it off. Evidence (offline,
+# 2,308 packages, 1,934 judged): Apollo 1923 -> 1928 (+5 -0; held-out
+# sessions +4 -0), Zeus right on all 1,934. Judged blind in the images,
+# the kept carries were right 45 times to 5; ungated they were 70 to 10,
+# the losses runaways up the flight or onto a wire -- the gate removes
+# both ungated Apollo losses (g1-026-OB, 019-S5). Talos carries its tips
+# the same way (talos/engine.py, after its cross-view step -- carried
+# before it, its own-detection test failed and it had no score).
+CARRIED_TIP_MIN_GAIN_MM = 1.0
+# A shaft shorter than this in the image gives no direction to walk.
+CARRY_MIN_AXIS_PX = 5.0
+
+
+@dataclasses.dataclass
+class _TipSet:
+    """Every per-camera input `ApolloEngine.score()` scores from, built
+    from one set of detections."""
+
+    tip_pixels: dict = dataclasses.field(default_factory=dict)
+    alt_tip_pixels: dict = dataclasses.field(default_factory=dict)
+    far_end_recoveries: dict = dataclasses.field(default_factory=dict)
+    suspected_cams: set = dataclasses.field(default_factory=set)
+    tip_diagnostics: dict = dataclasses.field(default_factory=dict)
+    ungated_tip_pixels: dict = dataclasses.field(default_factory=dict)
+    ungated_alt_tip_pixels: dict = dataclasses.field(default_factory=dict)
+    own_tip_line_px: dict = dataclasses.field(default_factory=dict)
+    genuine_cams: set = dataclasses.field(default_factory=set)
+    recovery_cams: set = dataclasses.field(default_factory=set)
+
+
+def _add_detection(ts: _TipSet, cam: int, det: TipDetectionResult, calib) -> None:
+    if det.ok and det.tip_px is not None:
+        ts.ungated_tip_pixels[cam] = det.tip_px
+        if det.alt_tip_px is not None:
+            ts.ungated_alt_tip_pixels[cam] = det.alt_tip_px
+        if det.far_end_px is not None:
+            ts.own_tip_line_px[cam] = (det.tip_px, det.far_end_px)
+    # 2026-08-12 -- gate every raw detect_tip() result through the
+    # board-ROI filter before it can reach score_dart(). This
+    # engine was originally built before that gate existed and
+    # was missing it -- caught by a real corpus-wide before/after
+    # comparison actually failing, not by inspection.
+    det = reject_outside_roi(det, calib)
+    if det.ok and det.tip_px is not None:
+        ts.tip_pixels[cam] = det.tip_px
+        ts.tip_diagnostics[cam] = det.diagnostics
+        if det.alt_tip_px is not None:
+            ts.alt_tip_pixels[cam] = det.alt_tip_px
+        if det.diagnostics.get("prior_dart_contamination_suspected"):
+            ts.suspected_cams.add(cam)
+    elif det.diagnostics.get("board_roi_far_end_inside") and det.far_end_px is not None:
+        ts.far_end_recoveries[cam] = det.far_end_px
+
+
+def _score_tip_set(ts: _TipSet, calibration) -> ScoreResult:
+    """The primary triangulation, with the last-resort end flip (see the
+    comment above its call in `ApolloEngine.score()`)."""
+    ts.genuine_cams = set(ts.tip_pixels)
+    if len(ts.tip_pixels) < 2:
+        ts.tip_pixels.update(ts.far_end_recoveries)
+        ts.recovery_cams = set(ts.far_end_recoveries) - ts.genuine_cams
+    return score_dart(ts.tip_pixels, calibration, alt_tip_pixels=ts.alt_tip_pixels or None)
+
+
+def _continued_detections(bg_images, frame_images, dets) -> dict[int, tuple[TipDetectionResult, float]]:
+    """`{cam: (detection with the tip carried on, px moved)}` for every
+    camera whose tip `continue_tip()` moves; cameras it leaves alone are
+    absent."""
+    out = {}
+    for cam, det in dets.items():
+        if not det.ok or det.tip_px is None or det.far_end_px is None:
+            continue
+        axis = np.subtract(det.far_end_px, det.tip_px).astype(float)  # tip -> flight
+        n = float(np.hypot(*axis))
+        if n < CARRY_MIN_AXIS_PX:
+            continue
+        new_tip, move = continue_tip(
+            bg_images[cam], frame_images[cam],
+            (float(det.tip_px[0]), float(det.tip_px[1])), (axis[0] / n, axis[1] / n),
+        )
+        if move:
+            out[cam] = (dataclasses.replace(det, tip_px=new_tip, diagnostics=dict(det.diagnostics)), move)
+    return out
+
+
+def _tip_height_mm(result: ScoreResult) -> float | None:
+    t = result.triangulation if result.ok else None
+    if t is None or t.point_xyz is None:
+        return None
+    return float(t.point_xyz[2])
+
+
+def _carried_tips_closer_to_board(carried: ScoreResult, original: ScoreResult) -> bool:
+    if not carried.ok:
+        return False
+    z0 = _tip_height_mm(original)
+    if z0 is None:
+        return True
+    z = _tip_height_mm(carried)
+    return z is not None and abs(z) < abs(z0) - CARRIED_TIP_MIN_GAIN_MM
+
+
 class ApolloEngine:
     """The registry entry named "Apollo" -- see opendarts/engines/registry.py."""
 
@@ -1343,36 +1539,32 @@ class ApolloEngine:
         # persisted is a side effect of reusing the existing diagnostics
         # channel, not the reason this exists.
         own_tip_line_px: PriorDartLinePx = {}
+        # 2026-09-28 -- cross-view blob selection, see opendarts/engines/
+        # apollo/cross_view.py's module docstring for the full write-up.
+        # Chooses each camera's blob by how well it fits the other two
+        # views in 3D; None when no combination earns trust, in which case
+        # every camera below runs exactly as it did before.
+        cross_pick = _cross_view_pick(cams, bg_images, frame_images, calibration, precomputed)
+        dets: dict[int, TipDetectionResult] = {}
+        tip_set = _TipSet()
         for cam in cams:
             prior_line = prior_dart_line_px.get(cam) if prior_dart_line_px else None
             # The `precomputed` keyword is only passed when there is a
             # bundle for this camera -- test doubles for detect_tip()
             # keep the plain signature (same discipline Zeus applies).
             pc_kwargs = {"precomputed": precomputed[cam]} if precomputed and cam in precomputed else {}
-            det = detect_tip(
-                bg_images[cam], frame_images[cam], prior_dart_line_px=prior_line, **pc_kwargs
+            dets[cam] = _camera_detection(
+                bg_images[cam], frame_images[cam], calibration[cam],
+                cross_pick, cam, prior_line, pc_kwargs,
             )
-            if det.ok and det.tip_px is not None:
-                ungated_tip_pixels[cam] = det.tip_px
-                if det.alt_tip_px is not None:
-                    ungated_alt_tip_pixels[cam] = det.alt_tip_px
-                if det.far_end_px is not None:
-                    own_tip_line_px[cam] = (det.tip_px, det.far_end_px)
-            # 2026-08-12 -- gate every raw detect_tip() result through the
-            # board-ROI filter before it can reach score_dart(). This
-            # engine was originally built before that gate existed and
-            # was missing it -- caught by a real corpus-wide before/after
-            # comparison actually failing, not by inspection.
-            det = reject_outside_roi(det, calibration[cam])
-            if det.ok and det.tip_px is not None:
-                tip_pixels[cam] = det.tip_px
-                tip_diagnostics[cam] = det.diagnostics
-                if det.alt_tip_px is not None:
-                    alt_tip_pixels[cam] = det.alt_tip_px
-                if det.diagnostics.get("prior_dart_contamination_suspected"):
-                    suspected_cams.add(cam)
-            elif det.diagnostics.get("board_roi_far_end_inside") and det.far_end_px is not None:
-                far_end_recoveries[cam] = det.far_end_px
+            _add_detection(tip_set, cam, dets[cam], calibration[cam])
+        # 2026-09-29 -- the same cameras with each tip carried down the
+        # shaft past a gap to the needle, when a dart shows up in pieces
+        # (see `_continued_detections()`). Kept only if it lands the
+        # triangulated point closer to the board -- decided once, below,
+        # so every later tier (overrides, fallbacks) scores the one set
+        # of tips the gate chose.
+        continued = _continued_detections(bg_images, frame_images, dets)
 
         # LAST-RESORT END FLIP, added 2026-08-14. A camera the ROI gate
         # rejected whose component's OTHER end IS on-board is, physically,
@@ -1403,13 +1595,32 @@ class ApolloEngine:
         # negative at any setting, and positive on a DIFFERENT throw each
         # time, which is what distinguishes a structural rule from a
         # coincidence at one operating point.
-        genuine_cams = set(tip_pixels)
-        recovery_cams: set[int] = set()
-        if len(tip_pixels) < 2:
-            tip_pixels.update(far_end_recoveries)
-            recovery_cams = set(far_end_recoveries) - genuine_cams
-
-        result = score_dart(tip_pixels, calibration, alt_tip_pixels=alt_tip_pixels or None)
+        result = _score_tip_set(tip_set, calibration)
+        tip_continuation_diag = None
+        if continued:
+            carried = _TipSet()
+            for cam, det in dets.items():
+                _add_detection(carried, cam, continued[cam][0] if cam in continued else det, calibration[cam])
+            carried_result = _score_tip_set(carried, calibration)
+            kept = _carried_tips_closer_to_board(carried_result, result)
+            tip_continuation_diag = {
+                "moved_px": {str(c): round(move, 1) for c, (_, move) in continued.items()},
+                "kept": kept,
+                "height_mm": _tip_height_mm(carried_result),
+                "height_without_mm": _tip_height_mm(result),
+            }
+            if kept:
+                tip_set, result = carried, carried_result
+        tip_pixels = tip_set.tip_pixels
+        alt_tip_pixels = tip_set.alt_tip_pixels
+        far_end_recoveries = tip_set.far_end_recoveries
+        suspected_cams = tip_set.suspected_cams
+        tip_diagnostics = tip_set.tip_diagnostics
+        ungated_tip_pixels = tip_set.ungated_tip_pixels
+        ungated_alt_tip_pixels = tip_set.ungated_alt_tip_pixels
+        own_tip_line_px = tip_set.own_tip_line_px
+        genuine_cams = tip_set.genuine_cams
+        recovery_cams = tip_set.recovery_cams
 
         # 2026-08-17 -- genuine-anchored recovery arbitration. A flipped
         # far end is a WEAKER observation than a gate-passing primary
@@ -1901,6 +2112,10 @@ class ApolloEngine:
         # cached_frames fast path, already treats "empty dict" and "key
         # missing" identically via a plain .get(cam) per-camera lookup).
         engine_result.diagnostics["own_tip_line_px"] = own_tip_line_px
+        if cross_pick is not None:
+            engine_result.diagnostics["cross_view"] = cross_pick.diagnostics()
+        if tip_continuation_diag is not None:
+            engine_result.diagnostics["tip_continuation"] = tip_continuation_diag
         if low_confidence_fallback_used:
             # See `LOW_CONFIDENCE_FALLBACK_CONFIDENCE`'s own docstring:
             # `score_result_to_engine_result()`'s normal `compute_

@@ -105,6 +105,7 @@ const Conn = (() => {
     el.dataset.tone = p.tone;
     $('#conn-title').textContent = {offline: 'RIG OFFLINE', connecting: 'CONNECTING', stopped: 'SCORING IS OFF', nocapture: 'NO CAPTURE', starting: 'STARTING'}[p.key] || p.label.toUpperCase();
     $('#conn-detail').textContent = p.key === 'stopped' ? 'New darts will not appear until scoring starts.' : p.detail;
+    el.dataset.hold = p.key === 'held' ? (p.hold.code || '') : '';
     measure();
   }
   // The page below moves down by the strip's real height -- one line on a

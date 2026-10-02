@@ -17,6 +17,7 @@ pick.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -69,69 +70,21 @@ def fit_shaft_line_px(
     into a zero full frame before labeling). Must be None for a frame the
     prior-dart erase modified (the caller handles that).
     """
-    import cv2
-
-    # Frozen local copy, not opendarts.engines.apollo.tip_detection --
-    # see opendarts/engines/talos/blob_detection.py's own module note for
-    # why this is Talos's own private dependency, not a live import.
     from opendarts.engines.talos.blob_detection import (
-        DIFF_THRESHOLD,
-        DILATE_KERNEL_PX,
         MIN_ELONGATION_RATIO,
-        OPEN_KERNEL_PX,
-        PRECOMPUTE_REQUIREMENTS,
         TOP_K_AREA_CANDIDATES,
         _component_stats_in_bbox,
-        _diff_mask,
         _find_companion_end,
         _locate_tip_in_component,
     )
-    from opendarts.imageops import ellipse_kernel, morph_on_bbox, threshold_mask
 
     if bg_bgr.shape != frame_bgr.shape:
         return None
-
-    pc = precomputed
-    if pc is not None and not pc.accepts(PRECOMPUTE_REQUIREMENTS, bg_bgr.shape):
-        pc = None
-    if pc is None:
-        img_h, img_w = bg_bgr.shape[:2]
-        bg_gray = cv2.cvtColor(bg_bgr, cv2.COLOR_BGR2GRAY)
-        frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        mask = _diff_mask(bg_gray, frame_gray)
-        origin = (0, 0)
-    else:
-        img_h, img_w = pc.img_h, pc.img_w
-        bg_gray = pc.bg_gray
-        mask = threshold_mask(pc.diff_blur, DIFF_THRESHOLD)  # crop-sized
-        origin = pc.origin
-    # 2026-09-05 perf pass: this function is ~94% of Talos's per-throw
-    # time, and the full-frame 31px ellipse dilate below was ~46% of it
-    # on its own (OpenCV does not parallelise ellipse kernels). It now
-    # runs on the opened mask's padded non-zero bounding box (median ~4%
-    # of the frame), bit-identical -- see opendarts.imageops.morph_on_bbox.
-    # The 3x3 opening runs on the whole (crop) array: before it, above-
-    # threshold sensor noise covers most of the frame, so there is
-    # nothing to crop to yet.
-    opened = cv2.morphologyEx(mask, cv2.MORPH_OPEN, ellipse_kernel(OPEN_KERNEL_PX))
-    dilated = morph_on_bbox(opened, cv2.MORPH_DILATE, ellipse_kernel(DILATE_KERNEL_PX))
-    if pc is not None:
-        dilated = pc.paste_full(dilated)
-    n, comp_labels, stats, _ = cv2.connectedComponentsWithStats(dilated, connectivity=8)
-    if n <= 1:
+    comps = shaft_components(bg_bgr, frame_bgr, precomputed)
+    if comps is None:
         return None
-
-    candidates = []
-    bboxes: dict[int, tuple[int, int, int, int]] = {}
-    for i in range(1, n):
-        x, y, w, h, area = (int(v) for v in stats[i])
-        bboxes[i] = (x, y, w, h)
-        if w > 0.6 * img_w or h > 0.6 * img_h:
-            continue
-        candidates.append((area, i))
-    if not candidates:
-        return None
-    candidates.sort(reverse=True)
+    comp_labels, opened, origin, bg_gray = comps.labels, comps.opened, comps.origin, comps.bg_gray
+    bboxes, candidates = comps.bboxes, comps.candidates
     top = candidates[:TOP_K_AREA_CANDIDATES]
 
     # Per-label pixels from each label's own bbox (same pixels, same
@@ -202,6 +155,99 @@ def fit_shaft_line_px(
         )
         return p1, p2, diag
     return p1, p2, diag
+
+
+@dataclass
+class ShaftComponents:
+    """`fit_shaft_line_px()`'s front end for one (bg, frame) pair: the
+    opened mask and the labelled dilated components, ranked by area.
+    Split out 2026-09-28 so `opendarts.engines.talos.cross_view` can rank
+    the SAME components instead of recomputing them."""
+
+    img_h: int
+    img_w: int
+    bg_gray: np.ndarray
+    origin: tuple[int, int]
+    opened: np.ndarray
+    labels: np.ndarray
+    bboxes: dict[int, tuple[int, int, int, int]]
+    # (area, label) of every component that is not frame-spanning,
+    # largest first -- the order the dart-blob pick walks.
+    candidates: list[tuple[int, int]]
+
+
+_COMPONENTS_MEMO: list[tuple[np.ndarray, np.ndarray, object, ShaftComponents | None]] = []
+_COMPONENTS_MEMO_SIZE = 3  # one per camera: a score() call's selection then its fits
+
+
+def shaft_components(
+    bg_bgr: np.ndarray, frame_bgr: np.ndarray, precomputed: "DiffCrop | None" = None,
+) -> ShaftComponents | None:
+    """The diff / threshold / open / dilate / label front end of
+    `fit_shaft_line_px()`, memoized per exact (bg, frame, precomputed)
+    objects; None when nothing but frame-spanning change is left. Callers
+    must have checked that the two shapes match."""
+    import cv2
+
+    # Frozen local copy, not opendarts.engines.apollo.tip_detection --
+    # see opendarts/engines/talos/blob_detection.py's own module note for
+    # why this is Talos's own private dependency, not a live import.
+    from opendarts.engines.talos.blob_detection import (
+        DIFF_THRESHOLD,
+        DILATE_KERNEL_PX,
+        OPEN_KERNEL_PX,
+        PRECOMPUTE_REQUIREMENTS,
+        _diff_mask,
+    )
+    from opendarts.imageops import ellipse_kernel, morph_on_bbox, threshold_mask
+
+    for bg0, fr0, pc0, comps in _COMPONENTS_MEMO:
+        if bg0 is bg_bgr and fr0 is frame_bgr and pc0 is precomputed:
+            return comps
+    pc = precomputed
+    if pc is not None and not pc.accepts(PRECOMPUTE_REQUIREMENTS, bg_bgr.shape):
+        pc = None
+    if pc is None:
+        img_h, img_w = bg_bgr.shape[:2]
+        bg_gray = cv2.cvtColor(bg_bgr, cv2.COLOR_BGR2GRAY)
+        frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        mask = _diff_mask(bg_gray, frame_gray)
+        origin = (0, 0)
+    else:
+        img_h, img_w = pc.img_h, pc.img_w
+        bg_gray = pc.bg_gray
+        mask = threshold_mask(pc.diff_blur, DIFF_THRESHOLD)  # crop-sized
+        origin = pc.origin
+    # 2026-09-05 perf pass: this front end is ~94% of Talos's per-throw
+    # time, and the full-frame 31px ellipse dilate below was ~46% of it
+    # on its own (OpenCV does not parallelise ellipse kernels). It now
+    # runs on the opened mask's padded non-zero bounding box (median ~4%
+    # of the frame), bit-identical -- see opendarts.imageops.morph_on_bbox.
+    # The 3x3 opening runs on the whole (crop) array: before it, above-
+    # threshold sensor noise covers most of the frame, so there is
+    # nothing to crop to yet.
+    opened = cv2.morphologyEx(mask, cv2.MORPH_OPEN, ellipse_kernel(OPEN_KERNEL_PX))
+    dilated = morph_on_bbox(opened, cv2.MORPH_DILATE, ellipse_kernel(DILATE_KERNEL_PX))
+    if pc is not None:
+        dilated = pc.paste_full(dilated)
+    n, comp_labels, stats, _ = cv2.connectedComponentsWithStats(dilated, connectivity=8)
+    comps = None
+    if n > 1:
+        candidates = []
+        bboxes: dict[int, tuple[int, int, int, int]] = {}
+        for i in range(1, n):
+            x, y, w, h, area = (int(v) for v in stats[i])
+            bboxes[i] = (x, y, w, h)
+            if w > 0.6 * img_w or h > 0.6 * img_h:
+                continue
+            candidates.append((area, i))
+        if candidates:
+            candidates.sort(reverse=True)
+            comps = ShaftComponents(img_h, img_w, bg_gray, origin, opened, comp_labels, bboxes, candidates)
+    _COMPONENTS_MEMO.append((bg_bgr, frame_bgr, precomputed, comps))
+    if len(_COMPONENTS_MEMO) > _COMPONENTS_MEMO_SIZE:
+        del _COMPONENTS_MEMO[0]
+    return comps
 
 
 def _shaft_line_through_tip(

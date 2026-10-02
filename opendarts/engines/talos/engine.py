@@ -65,8 +65,11 @@ import math
 
 import numpy as np
 
+from opendarts.engines.apollo.engine import CARRIED_TIP_MIN_GAIN_MM, CARRY_MIN_AXIS_PX
+from opendarts.engines.athena.tip_continuation import continue_tip
 from opendarts.engines.base import EngineResult
 from opendarts.engines.talos.confidence import calibrated_confidence, throw_confidence
+from opendarts.engines.talos.cross_view import camera_fit, select_talos_blobs
 from opendarts.engines.talos.consensus import (
     FAR_CAP_RADIUS_MM,
     _pair_if_sector_compromise,
@@ -77,6 +80,7 @@ from opendarts.engines.talos.consensus import (
 )
 from opendarts.engines.talos.plane_geometry import (
     BOARD_HIT_Z_MM,
+    MAX_PLAUSIBLE_TILT_DEG,
     _pixel_board_xy,
     dart_axis_xy_at_z,
     intersect_planes_with_board,
@@ -96,7 +100,7 @@ from opendarts.pipeline import CameraCalibration, ScoreResult
 # historically lived) or opendarts.engines.apollo.scoring (where it lives
 # today, but has kept evolving independently since Talos's own lineage
 # diverged from it).
-from opendarts.engines.talos.ray_fallback import score_dart
+from opendarts.engines.talos.ray_fallback import prefer_pair_on_board, score_dart
 
 
 def _override_observation(reason: str) -> str:
@@ -219,19 +223,118 @@ def score(
                 "prior_n_priors": len(tuple(prior_board_xy_mm)),
             }
     common = sorted(set(bg_images) & set(frame_images) & set(calibration))
+    # 2026-09-28 -- cross-view blob selection, see opendarts/engines/
+    # talos/cross_view.py's module docstring for the full write-up.
+    # Chooses each camera's blob by how well it fits the other two views
+    # in 3D; None when no combination earns trust, in which case every
+    # camera below runs exactly as it did before. Not run on darts 2/3
+    # with prior-dart erasing: the erase rewrites frames, and the
+    # selection was measured (and audited) on the frames as captured.
+    cross_pick = None
+    if not prior_board_xy_mm:
+        cross_pick = select_talos_blobs(bg_images, frame_images, calibration, precomputed)
+    own_fits: dict = {}
+    fits: dict = {}
+    for cam in common:
+        if cam in prior_fits:
+            fits[cam] = own_fits[cam] = prior_fits[cam]
+            continue
+        # `precomputed` is only passed when there is a bundle for this
+        # camera -- test doubles keep the plain two-argument signature.
+        pc_kwargs = {"precomputed": precomputed[cam]} if precomputed and cam in precomputed else {}
+        fitted = own_fits[cam] = fit_shaft_line_px(bg_images[cam], frame_images[cam], **pc_kwargs)
+        if cross_pick is not None:
+            fitted = camera_fit(fitted, calibration[cam], cross_pick, cam)
+        fits[cam] = fitted
+    guard_extra: dict = {}
+    if cross_pick is not None and _n_fitted(fits) < 2 and _n_fitted(own_fits) > _n_fitted(fits):
+        # 2026-09-29 -- camera_fit() drops a camera whose replacement blob
+        # sits up the shaft (SWAP_MAX_TIP_HEIGHT_MM); were that to happen
+        # on enough cameras to leave fewer than two, Talos would have no
+        # score. Every engine must score, so the cross-view pick yields to
+        # Talos's own fits. Never met on the 2,308-package corpus (136
+        # darts lose one camera this way, none two).
+        fits = own_fits
+        guard_extra = {"cross_view_guard": "fewer than 2 cameras survived the cross-view pick"}
+
+    # 2026-09-29 -- carrying the tip across a gap to the needle, the same
+    # rule Apollo uses (see CARRIED_TIP_MIN_GAIN_MM in apollo/engine.py):
+    # each camera's tip -- the one camera_fit() settled on, not the raw
+    # fit, or its own-detection test fails and every camera empties --
+    # is walked on down the shaft with Athena's continue_tip(), and the
+    # carried tips are kept only when the pre-slide ray point they give
+    # sits at least CARRIED_TIP_MIN_GAIN_MM closer to the board plane.
+    # A carried set that does not score never replaces one that does.
+    # Evidence (offline, 2,308 packages, 1,934 judged): Talos 1921 ->
+    # 1926 (+5 -0; held-out sessions +3 -0), Zeus right on all 1,934,
+    # no dart without a score; judged blind in the images the kept
+    # carries were right 91 times to 9. Ungated it was +7 -3, the losses
+    # the centerline overrides and a wire coin-flip amplifying 3px moves.
+    result, height = _score_fits(fits, common, calibration, cross_pick, {**prior_extra, **guard_extra})
+    carried = _carried_fits(bg_images, frame_images, fits)
+    if not carried:
+        return result
+    carried_result, carried_height = _score_fits(
+        {**fits, **{cam: fitted for cam, (fitted, _) in carried.items()}},
+        common, calibration, cross_pick, {**prior_extra, **guard_extra},
+    )
+    kept = carried_result.ok and (
+        not result.ok
+        or (carried_height is not None and (height is None or abs(carried_height) < abs(height) - CARRIED_TIP_MIN_GAIN_MM))
+    )
+    chosen = carried_result if kept else result
+    if chosen.diagnostics is not None:
+        chosen.diagnostics["tip_continuation"] = {
+            "moved_px": {str(c): round(move, 1) for c, (_, move) in carried.items()},
+            "kept": bool(kept),
+            "height_mm": carried_height,
+            "height_without_mm": height,
+        }
+    return chosen
+
+
+def _n_fitted(fits: dict) -> int:
+    return sum(1 for fitted in fits.values() if fitted is not None)
+
+
+def _carried_fits(bg_images, frame_images, fits: dict) -> dict:
+    """`{cam: (fit with its tip carried on, px moved)}` for every camera
+    whose tip `continue_tip()` moves; cameras it leaves alone are absent.
+    Only the tip changes -- the shaft line, and so the plane, stay."""
+    out = {}
+    for cam, fitted in fits.items():
+        if fitted is None:
+            continue
+        p1, p2, diag = fitted
+        tip = diag.get("tip_px")
+        if not tip:
+            continue
+        far = max((p1, p2), key=lambda p: math.hypot(p[0] - tip[0], p[1] - tip[1]))
+        axis = np.subtract(far, tip).astype(float)  # tip -> flight
+        n = float(np.hypot(*axis))
+        if n < CARRY_MIN_AXIS_PX:
+            continue
+        new_tip, move = continue_tip(
+            bg_images[cam], frame_images[cam],
+            (float(tip[0]), float(tip[1])), (axis[0] / n, axis[1] / n),
+        )
+        if move:
+            out[cam] = ((p1, p2, {**diag, "tip_px": (float(new_tip[0]), float(new_tip[1]))}), move)
+    return out
+
+
+def _score_fits(fits: dict, common, calibration, cross_pick, prior_extra: dict):
+    """Talos's scoring from one set of per-camera fits: `(result, the
+    pre-slide ray point's height off the board in mm, or None when the
+    ray triangulation was not what scored)`."""
     planes: list[tuple[int, np.ndarray, float]] = []
     line_diags: dict[int, dict] = {}
     dropped: dict[int, dict] = {}
     ray_pixels: dict[int, tuple[float, float]] = {}
     cl_pixels: dict[int, tuple[float, float]] = {}
+    ray_height = None
     for cam in common:
-        if cam in prior_fits:
-            fitted = prior_fits[cam]
-        else:
-            # `precomputed` is only passed when there is a bundle for this
-            # camera -- test doubles keep the plain two-argument signature.
-            pc_kwargs = {"precomputed": precomputed[cam]} if precomputed and cam in precomputed else {}
-            fitted = fit_shaft_line_px(bg_images[cam], frame_images[cam], **pc_kwargs)
+        fitted = fits.get(cam)
         if fitted is None:
             continue
         p1, p2, line_diag = fitted
@@ -272,8 +375,10 @@ def score(
     plane_list = [(n, c) for _, n, c in planes]
     axis_xy = dart_axis_xy_at_z(plane_list) if len(plane_list) >= 2 else None
 
-    def _finish(result: EngineResult) -> EngineResult:
-        return _stamp_confidence(result, cl_pixels, calibration, axis_xy)
+    def _finish(result: EngineResult):
+        if cross_pick is not None and result.diagnostics is not None:
+            result.diagnostics["cross_view"] = cross_pick.diagnostics()
+        return _stamp_confidence(result, cl_pixels, calibration, axis_xy), ray_height
 
     if len(use) == 1:
         cam, px = next(iter(use.items()))
@@ -308,11 +413,14 @@ def score(
         use = ray_pixels
 
     if len(use) >= 2:
-        ray_scored = score_dart(use, calibration)
+        ray_scored = prefer_pair_on_board(score_dart(use, calibration), use, calibration)
         if ray_scored.ok:
             tri = ray_scored.triangulation
             xyz = None if tri is None else getattr(tri, "point_xyz", None)
-            slid_xy = slide_point_along_dart_axis(xyz, plane_list)
+            ray_height = None if xyz is None else float(xyz[2])
+            slid_xy = slide_point_along_dart_axis(
+                xyz, plane_list, max_tilt_deg=MAX_PLAUSIBLE_TILT_DEG,
+            )
             if slid_xy is not None:
                 sector, ring = sector_ring_for_point(slid_xy[0], slid_xy[1])
                 extra = {

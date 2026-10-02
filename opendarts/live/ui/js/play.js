@@ -38,7 +38,104 @@ function rigPhase() {
   const n = trig.dart_count === undefined || trig.dart_count === null ? null : trig.dart_count;
   const fn = TRIGGER_DETAIL[trig.state];
   if (trig.state === 'TAKEOUT_WAITING') return {key: 'takeout', tone: 'warn', label: 'Remove darts', detail: fn(n)};
+  const hold = heldBy();
+  if (hold) return hold;
   return {key: 'ready', tone: 'live', label: 'Ready', detail: fn ? fn(n) : trig.state};
+}
+
+// The oracle's one status -- Autodarts' board, as every indicator shows it
+// (bar readout, Play, a display in any layout) and as its sheet explains it.
+// Grey: not in play (off / no listener / not connected). Red: its board is
+// stopped. Yellow: takeout; blinking once it has been stuck there
+// ORACLE_STUCK_S. Green: ready and scoring alongside.
+const ORACLE_STUCK_S = 30;
+function adBoardAge() {
+  const b = S.adBoard || {};
+  return typeof b.since === 'number' ? Math.max(0, (Date.now() - b.since) / 1000) : null;
+}
+function oracleState() {
+  const ad = S.ad || (S.runtime && S.runtime.ad);
+  const cfg = S.config;
+  const b = S.adBoard || {};
+  const off = (key, word, label, detail) => ({key, tone: 'off', word, label, detail, blink: false, live: false});
+  if (!S.connected) return off('unknown', '—', 'Autodarts: unknown', 'OpenDarts itself cannot be reached, so neither can its oracle.');
+  if (cfg && cfg.ad_enabled === false) return off('off', 'OFF', 'Autodarts is off', 'Switched off in Rig › Autodarts — never contacted.');
+  if (ad && ad.available === false) return off('none', 'NONE', 'No Autodarts here', (ad && ad.reason) || 'This rig has no Autodarts listener.');
+  if (!ad || !ad.connected) {
+    return off('offline', 'OFFLINE', 'Autodarts is offline',
+      'OpenDarts cannot reach it' + (cfg && cfg.ad_base_url ? ' at ' + cfg.ad_base_url : '') + ' — no comparisons are being recorded.');
+  }
+  // Autodarts reads OD's virtual cameras; it can lose them (e.g. ~a minute
+  // after OD's process dies) while its own status still says ready. The
+  // rig sees its camera fps fall to 0 and reports cameras_down: not ready,
+  // like stopped -- red, no grace, no blink.
+  if (b.status === 'cameras_down') {
+    return {key: 'cameras', tone: 'stopped', word: 'CAMERAS DOWN', label: 'Autodarts’ cameras are down',
+      detail: 'It is getting no frames, so it cannot see the board and nothing is compared.', blink: false, live: true};
+  }
+  if (b.status === 'stopped') {
+    return {key: 'stopped', tone: 'stopped', word: 'STOPPED', label: 'Autodarts has stopped', detail: 'Its board is not scoring, so nothing is compared. Start it here.', blink: false, live: true};
+  }
+  if (b.status === 'takeout') {
+    const age = adBoardAge();
+    if (age !== null && age >= ORACLE_STUCK_S) {
+      return {key: 'stuck', tone: 'takeout', word: 'STUCK', label: 'Autodarts is stuck in takeout',
+        detail: 'For ' + duration(age) + ' — it is not scoring. Clear the board, or reset it.', blink: true, live: true};
+    }
+    return {key: 'takeout', tone: 'takeout', word: 'TAKEOUT', label: 'Autodarts: takeout', detail: 'Waiting for the darts to come out.', blink: false, live: true};
+  }
+  if (b.status === 'ready') {
+    return {key: 'ready', tone: 'ready', word: 'READY', label: 'Autodarts is ready', detail: 'Scoring alongside — every throw is compared.', blink: false, live: true};
+  }
+  return off('connected', 'CONNECTED', 'Autodarts is connected', 'Its board has not said what it is doing yet.');
+}
+
+// The rig's own LED, in the oracle's colours so the two lights read alike:
+// grey = not connected, red = stopped (not scoring), yellow = on its way or
+// waiting on you (starting, calibrating, warming up, darts to remove),
+// green = ready for a dart.
+const RIG_LED = {
+  offline: 'off', connecting: 'off',
+  stopped: 'stopped', nocapture: 'stopped',
+  starting: 'takeout', calibrating: 'takeout', warming: 'takeout', takeout: 'takeout',
+  ready: 'ready',
+};
+const rigLed = (p) => p.led || RIG_LED[p.key] || 'off';
+
+// Holding for the oracle (opendarts/live/oracle_hold.py): with the oracle
+// on, OD does not score while Autodarts is stopped, offline or stuck in
+// takeout -- and says so, by name, wherever the rig's status is shown. The
+// server's answer is used as given, except that a takeout gets the same
+// grace the scoring gate gives it: Autodarts enters takeout a moment before
+// OD at the end of a visit, and that is not a hold.
+const HOLD_GRACE_S = 3;
+function heldBy() {
+  const h = S.oracleHold;
+  if (!h || !h.code) return null;
+  if (h.code === 'takeout') {
+    const age = adBoardAge();
+    if (age !== null && age < HOLD_GRACE_S) return null;
+  }
+  const reason = h.reason || 'oracle not ready';
+  const what = {
+    takeout: 'Autodarts is in takeout. Pull the darts, then Reset.',
+    stopped: 'Autodarts has stopped. Start it, or Reset.',
+    offline: 'OpenDarts cannot reach Autodarts.',
+    cameras: 'Autodarts is getting no frames from its cameras.',
+    unknown: 'Autodarts has not said it is ready.',
+  }[h.code] || '';
+  // A takeout hold is yellow, like any takeout. Every other hold is PURPLE
+  // -- the cabinet strip's "OD ready, held by the oracle" -- never red: red
+  // is OD itself not running, and a red light while Autodarts was the one
+  // stopped read as "OD isn't started".
+  if (h.code === 'takeout') {
+    return {key: 'held', tone: 'warn', led: 'takeout', label: reason.charAt(0).toUpperCase() + reason.slice(1),
+      title: 'Oracle in takeout', detail: 'Not scoring — ' + what, hold: h};
+  }
+  const why = {stopped: 'stopped', offline: 'offline', cameras: 'cameras down', unknown: 'not ready'}[h.code]
+    || reason.replace(/^oracle\s+/, '');
+  return {key: 'held', tone: 'held', led: 'waiting', label: 'Waiting on oracle: ' + why,
+    title: 'Waiting on oracle', detail: 'OpenDarts is ready; not scoring — ' + what, hold: h};
 }
 
 // A throw as the scoreboard reads it: the corrected call when a person
@@ -122,14 +219,16 @@ const Play = (() => {
     if (!show) return;
     veil.dataset.tone = p.tone;
     veil.dataset.key = p.key;
-    $('#veil-kicker').textContent = {offline: 'NO SIGNAL', nocapture: 'OFF AIR', stopped: 'OFF AIR'}[p.key] || 'STAND BY';
+    $('#veil-kicker').textContent = {offline: 'NO SIGNAL', nocapture: 'OFF AIR', stopped: 'OFF AIR', held: 'ON HOLD'}[p.key] || 'STAND BY';
     $('#veil-title').textContent = {
       offline: 'Can’t reach the rig', connecting: 'Connecting', nocapture: 'No capture here',
       stopped: 'Scoring is off', starting: 'Starting', calibrating: 'Calibrating',
-    }[p.key] || p.label;
+    }[p.key] || p.title || p.label;
     $('#veil-detail').textContent = p.detail;
     const btn = $('#veil-start');
-    btn.hidden = p.key !== 'stopped';
+    // Stopped: start scoring. Held: one Reset clears OD and the oracle both.
+    btn.hidden = p.key !== 'stopped' && p.key !== 'held';
+    btn.firstChild.textContent = p.key === 'held' ? 'RESET BOTH ▸' : 'START SCORING ▸';
     btn.disabled = !!Session.busy;
     $('#veil-spin').hidden = !(p.tone === 'busy' || p.key === 'connecting' || p.key === 'offline');
   }
@@ -193,7 +292,7 @@ const Play = (() => {
   }
   $('#missed-open').addEventListener('click', openMissed);
   $('#missed-save').addEventListener('click', saveMissed);
-  $('#veil-start').addEventListener('click', () => Session.start());
+  $('#veil-start').addEventListener('click', () => (rigPhase().key === 'held' ? Session.reset() : Session.start()));
 
   // Under the board, who scored it: the primary engine, its voters, the
   // cameras. The rig's credits, the way a broadcast names its team.

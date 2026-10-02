@@ -8097,13 +8097,22 @@ def _wait_for_next_frame(
 def _build_lifecycle_driver(
     *,
     lifecycle_settings_store: "LifecycleSettingsStore | None" = None,
+    ad_ws_listener: "AdWsListener | None" = None,
 ) -> "LifecycleDriver":
     """The one lifecycle (opendarts/lifecycle/) that drives this loop. There is
-    no fallback trigger: if this cannot be built the loop must not start."""
+    no fallback trigger: if this cannot be built the loop must not start.
+
+    With a listener, the lifecycle is also held while the oracle is on and
+    not ready (opendarts/live/oracle_hold.py): a dart that lands then is not
+    scored. The listener's own on/off switch is read live, so turning the
+    oracle off lifts the hold without a restart."""
     from opendarts.lifecycle.driver import LifecycleDriver
     from opendarts.live.logging_setup import DEFAULT_LOG_DIR
+    from opendarts.live.oracle_hold import hold_reason_provider
 
     kwargs: dict = {}
+    if ad_ws_listener is not None:
+        kwargs["hold"] = hold_reason_provider(ad_ws_listener)
     if lifecycle_settings_store is not None:
         kwargs["config"] = lifecycle_settings_store.get()
         kwargs["config_provider"] = lifecycle_settings_store.get
@@ -8947,6 +8956,7 @@ def run_capture_loop_body(
 
     lifecycle = _build_lifecycle_driver(
         lifecycle_settings_store=lifecycle_settings_store,
+        ad_ws_listener=ad_ws_listener,
     )
     lifecycle_adapter = LifecycleTriggerAdapter(max_darts=MAX_DARTS_PER_TURN)
     _lifecycle_waiting_logged_at: float | None = None

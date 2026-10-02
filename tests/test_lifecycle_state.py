@@ -579,17 +579,36 @@ def test_tick_as_dict_is_json_friendly():
 
 
 def test_multi_camera_any_camera_dart_and_all_camera_stability():
+    # Any one camera can be the one that detects the dart; another only has
+    # to see a trace of it (a dart is on the board every camera watches).
     masks = {0: board_mask(), 1: board_mask()}
     lc = Lifecycle(masks, LifecycleConfig(warmup_stable_frames=3))
     s0, s1 = Scene(), Scene()
     for _ in range(6):
         lc.observe({0: s0.render(), 1: s1.render()})
     assert lc.phase is Phase.IDLE
-    s1.darts.append((CX - 2, CY - 60, 16, 100))  # visible in cam 1 only
+    s1.darts.append((CX - 2, CY - 60, 16, 100))  # the dart, clear in cam 1
+    s0.darts.append((CX - 2, CY - 60, 12, 40))   # only a trace of it in cam 0
     ticks = [lc.observe({0: s0.render(), 1: s1.render()}) for _ in range(8)]
     commits = [t for t in ticks if t.action is Action.COMMIT]
     assert len(commits) == 1 and commits[0].commit.dart_cams == [1]
     assert set(commits[0].commit.bg) == {0, 1}
+
+
+def test_a_change_in_one_camera_alone_is_not_a_dart():
+    # 2026-09-28: a hand behind the board, inside cam1's board area only,
+    # every other camera at exactly zero -- scored as three OUTs.
+    masks = {0: board_mask(), 1: board_mask()}
+    lc = Lifecycle(masks, LifecycleConfig(warmup_stable_frames=3))
+    s0, s1 = Scene(), Scene()
+    for _ in range(6):
+        lc.observe({0: s0.render(), 1: s1.render()})
+    s1.darts.append((CX - 2, CY - 60, 16, 100))  # cam 1 only; cam 0 sees nothing
+    ticks = [lc.observe({0: s0.render(), 1: s1.render()}) for _ in range(20)]
+    assert not any(t.action is Action.COMMIT for t in ticks)
+    refused = [t for t in ticks if t.reason == "seen by one camera only"]
+    assert len(refused) == 1 and refused[0].removed is not None
+    assert lc.dart_count == 0 and lc.phase is Phase.IDLE
 
 
 def test_reset_forgets_darts():

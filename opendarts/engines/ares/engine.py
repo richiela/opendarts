@@ -201,6 +201,19 @@ before/after full local corpus replay (the session corpus,
 951 throws, all 5 engines): Zeus 945/951, Apollo 938/951, Ares
 935/950, Talos 929/951, Athena 928/951, byte-identical before and
 after this field was added.
+
+Collinear-fragment merge, 2026-09-28 (see detection.py's MERGE_*
+constants): a dart that breaks into pieces in one camera gave that
+camera no line or a short weak one; `detect_candidates()` now also
+offers linked collinear pieces refit as one candidate, and consensus
+chooses among originals and merges as it always has. A rule letting a
+merge replace only a WEAK existing line was built and measured
+(threshold 0.15-0.45): it never caught the audited bad merges -- they
+fill a missing line or replace lines as weak as the good ones' (0.18-
+0.25 vs 0.11-0.30); catching even one (g2-006) needs a threshold within
+0.004 of that dart's own line weight, and every lower setting also
+blocks confirmed fixes. Left out; per-candidate `merged_fragments` is
+recorded so merged selections are visible in every package.
 """
 from __future__ import annotations
 
@@ -598,6 +611,7 @@ def _candidate_record(
         "tip_px": read.cand.tip_px,
         "base_px": read.cand.base_px,
         "degraded": read.cand.degraded,
+        "merged_fragments": read.cand.merged_fragments,
         "centerline_failure": read.cand.diagnostics.get("centerline_failure"),
         "area_px": read.cand.area_px,
         "shaft_len_px": read.cand.shaft_len_px,
@@ -900,6 +914,7 @@ class AresEngine:
                 "tip_xy_mm": read.tip_xy,
                 "has_line": read.line is not None,
                 "degraded": read.cand.degraded,
+                "merged_fragments": read.cand.merged_fragments,
                 "area_px": read.cand.area_px,
                 "shaft_len_px": read.cand.shaft_len_px,
                 "mean_width_px": read.cand.mean_width_px,

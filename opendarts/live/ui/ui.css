@@ -21,13 +21,13 @@
   /* SHOW -- always dark: a scoreboard in a dim room */
   --s-ink: #060810; --s-navy: #0c1224; --s-navy2: #141d38; --s-navy3: #1c2748;
   --s-text: #f4f6fb; --s-dim: #8a93ad; --s-dim2: #4f5874;
-  --volt: #ffd21f; --onair: #e3262d; --standby: #3d6bff;
+  --volt: #ffd21f; --onair: #e3262d; --standby: #3d6bff; --s-held: #a56bff;
   --s-d1: #35d0b8; --s-d2: #ff9b3d; --s-d3: #ff5a4f;
 
   /* LAB -- paper by default; blueprint in the dark theme */
   --paper: #ece7dc; --paper-grid: #e2dccd; --paper-fine: rgba(0, 0, 0, .03); --card: #f6f2ea;
   --ink: #15140f; --ink2: #4d4a42; --ink3: #726d60; --rule: #cbc4b3;
-  --signal: #ff4f00; --ok: #1d7a4b; --warn: #b86e00; --bad: #c8321f;
+  --signal: #ff4f00; --ok: #1d7a4b; --warn: #b86e00; --bad: #c8321f; --held: #7a3fc4;
   --signal-wash: rgba(255, 79, 0, .08); --warn-wash: rgba(184, 110, 0, .08);
   --l-d1: #0f8f7c; --l-d2: #c56a12; --l-d3: #d8392e;
   --scrim: rgba(4, 5, 8, .6);
@@ -45,7 +45,7 @@
 :root[data-theme="dark"] {
   --paper: #0f2138; --paper-grid: #16304f; --paper-fine: rgba(160, 200, 255, .045); --card: #132a45;
   --ink: #e6eefb; --ink2: #a9bbd6; --ink3: #6f86a8; --rule: #274566;
-  --signal: #ff7a3d; --ok: #4fd08f; --warn: #f2b14a; --bad: #ff6b5a;
+  --signal: #ff7a3d; --ok: #4fd08f; --warn: #f2b14a; --bad: #ff6b5a; --held: #b58cff;
   --signal-wash: rgba(255, 122, 61, .12); --warn-wash: rgba(242, 177, 74, .1);
   --l-d1: #3fd6bf; --l-d2: #ffa552; --l-d3: #ff6f64;
   color-scheme: dark;
@@ -54,7 +54,7 @@
   :root:not([data-theme]) {
     --paper: #0f2138; --paper-grid: #16304f; --paper-fine: rgba(160, 200, 255, .045); --card: #132a45;
     --ink: #e6eefb; --ink2: #a9bbd6; --ink3: #6f86a8; --rule: #274566;
-    --signal: #ff7a3d; --ok: #4fd08f; --warn: #f2b14a; --bad: #ff6b5a;
+    --signal: #ff7a3d; --ok: #4fd08f; --warn: #f2b14a; --bad: #ff6b5a; --held: #b58cff;
     --signal-wash: rgba(255, 122, 61, .12); --warn-wash: rgba(242, 177, 74, .1);
     --l-d1: #3fd6bf; --l-d2: #ffa552; --l-d3: #ff6f64;
     color-scheme: dark;
@@ -105,7 +105,7 @@ main > section { height: 100%; }
 .status { display: flex; align-items: stretch; min-width: 0; }
 .status-tag, .status-dot { flex: none; }
 .readout { display: flex; font: 13px var(--mono); letter-spacing: .1em; color: var(--ink3); }
-.readout > span { padding: 6px 14px; border-left: 1px solid var(--rule); white-space: nowrap; }
+.readout > span, .readout > button { padding: 6px 14px; border-left: 1px solid var(--rule); white-space: nowrap; font: inherit; letter-spacing: inherit; color: inherit; }
 .readout b { color: var(--ink); font-weight: 600; }
 .readout [data-tone="live"] b { color: var(--ok); } .readout [data-tone="warn"] b { color: var(--warn); } .readout [data-tone="bad"] b { color: var(--bad); }
 .speaker { display: grid; place-items: center; min-width: 44px; height: 40px; gap: 6px; grid-auto-flow: column; padding: 0 10px; }
@@ -128,6 +128,7 @@ body[data-view="play"] .status-tag > span, body[data-view="play"] .status-text >
 body[data-view="play"] .status[data-tone="live"] .status-tag, body[data-view="play"] .status[data-tone="warn"] .status-tag { background: var(--onair); }
 body[data-view="play"] .status[data-tone="busy"] .status-tag { background: var(--standby); }
 body[data-view="play"] .status[data-tone="bad"] .status-tag { background: #5b1414; }
+body[data-view="play"] .status[data-tone="held"] .status-tag { background: var(--s-held); }
 body[data-view="play"] .status-tag i { width: 10px; height: 10px; border-radius: 50%; background: #fff; box-shadow: 0 0 12px #fff; transform: skewX(12deg); }
 body[data-view="play"] .status:not([data-tone="live"]):not([data-tone="warn"]) .status-tag i { display: none; }
 body[data-view="play"] .status-text { background: var(--s-navy2); overflow: hidden; gap: 0; }
@@ -149,17 +150,24 @@ body:not([data-view="play"]) .status { align-items: center; gap: 8px; padding: 6
 body:not([data-view="play"]) .status-tag { display: none; }
 body:not([data-view="play"]) .status-text { display: flex; gap: 8px; min-width: 0; }
 body:not([data-view="play"]) #status-label { color: var(--ink); font-weight: 600; }
-body:not([data-view="play"]) .status[data-tone="live"] #status-label { color: var(--ok); }
-body:not([data-view="play"]) .status[data-tone="warn"] #status-label { color: var(--warn); }
-body:not([data-view="play"]) .status[data-tone="bad"] #status-label { color: var(--bad); }
-body:not([data-view="play"]) .status[data-tone="busy"] #status-label { color: var(--signal); }
+/* the word takes its LED's colour, as the oracle's does */
+body:not([data-view="play"]) .status[data-led="ready"] #status-label { color: var(--ok); }
+body:not([data-view="play"]) .status[data-led="takeout"] #status-label { color: var(--warn); }
+body:not([data-view="play"]) .status[data-led="stopped"] #status-label { color: var(--bad); }
+body:not([data-view="play"]) .status[data-led="off"] #status-label { color: var(--ink3); }
 body:not([data-view="play"]) #status-detail { overflow: hidden; text-overflow: ellipsis; max-width: 28ch; }
 body:not([data-view="play"]) #status-detail:empty { display: none; }
 .status-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ink3); align-self: center; }
-.status[data-tone="live"] .status-dot { background: var(--ok); }
-.status[data-tone="warn"] .status-dot { background: var(--warn); }
-.status[data-tone="bad"] .status-dot { background: var(--bad); }
-.status[data-tone="busy"] .status-dot { background: var(--signal); animation: pulse 1.1s ease-in-out infinite; }
+/* the rig's LED, in the oracle's colours (play.js RIG_LED): grey not
+   connected, red stopped, yellow on its way / waiting on you, green ready */
+.status[data-led="stopped"] .status-dot, .dot[data-led="stopped"] { background: var(--bad); }
+.status[data-led="takeout"] .status-dot, .dot[data-led="takeout"] { background: var(--warn); }
+.status[data-led="ready"] .status-dot, .dot[data-led="ready"] { background: var(--ok); }
+.status[data-led="off"] .status-dot, .dot[data-led="off"] { background: var(--ink3); }
+/* purple: OD is ready, but holding for the oracle (play.js heldBy) */
+.status[data-led="waiting"] .status-dot, .dot[data-led="waiting"] { background: var(--held); }
+body:not([data-view="play"]) .status[data-led="waiting"] #status-label { color: var(--held); }
+.status[data-tone="busy"] .status-dot, .dot[data-led][data-tone="busy"] { animation: pulse 1.1s ease-in-out infinite; }
 body:not([data-view="play"]) .speaker { border-left: 1px solid var(--rule); color: var(--ink2); height: 34px; font: 13px var(--mono); letter-spacing: .1em; }
 body:not([data-view="play"]) .speaker[data-state="blocked"] { color: var(--warn); }
 @keyframes pulse { 50% { opacity: .3; } }
@@ -252,6 +260,7 @@ body.kiosk .bar:hover, body.kiosk .bar:focus-within { transform: none; }
 .offair .kicker { font: 800 20px var(--show); letter-spacing: .3em; color: var(--s-dim); }
 .veil[data-tone="busy"] .kicker { color: #8fb0ff; }
 .veil[data-tone="bad"] .kicker { color: #ff8a80; }
+.veil[data-tone="held"] .kicker { color: var(--s-held); }
 .offair h1 { font: italic 900 clamp(64px, 10vh, 110px)/.9 var(--show); letter-spacing: -.01em; text-transform: uppercase; text-shadow: 0 6px 40px rgba(0, 0, 0, .6); }
 .offair p { font: 600 clamp(20px, 2.4vh, 26px)/1.3 var(--show); letter-spacing: .05em; color: var(--s-dim); max-width: 36ch; }
 .offair p:empty { display: none; }
@@ -739,7 +748,9 @@ body.display .calib-hide { display: none; }
   padding: 10px 32px; font: 13px var(--mono); letter-spacing: .08em; background: var(--ink); color: var(--paper); }
 .conn b { font-weight: 600; letter-spacing: .18em; }
 .conn[data-tone="bad"] { background: var(--bad); color: #fff; }
+.conn[data-tone="held"] { background: var(--held); color: #fff; }
 .conn[data-tone="busy"] { background: var(--signal); color: #fff; }
+.conn[data-tone="warn"] { background: var(--warn); color: #fff; }
 .conn[data-tone="bad"]::before { content: ""; width: 10px; height: 10px; border-radius: 50%; background: #fff; animation: pulse 1.1s ease-in-out infinite; align-self: center; }
 body.display .conn { font-size: clamp(14px, 1.6vh, 22px); padding: 14px 32px; }
 body.display[data-view="split"] .conn { left: calc(100% / 1.95); }
@@ -748,6 +759,44 @@ body.conn-on .throws, body.conn-on .rig { padding-top: var(--conn-h, 42px); }   
 body.conn-on .group { scroll-margin-top: 16px; }
 @media (max-width: 640px) { .conn { padding: 7px 16px; gap: 2px 12px; font-size: 11.5px; letter-spacing: .04em; } }
 
+
+/* ==========================================================================
+   THE ORACLE -- Autodarts' board, one indicator wherever it shows
+   (play.js oracleState). Grey not in play, red stopped, yellow takeout
+   (blinking once stuck), green ready.
+   ========================================================================== */
+.oracle-ind { --oc: var(--ink3); display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+.oracle-ind[data-tone="stopped"] { --oc: var(--bad); }
+.oracle-ind[data-tone="takeout"] { --oc: var(--warn); }
+.oracle-ind[data-tone="ready"] { --oc: var(--ok); }
+.oracle-ind .od { width: 9px; height: 9px; border-radius: 50%; background: var(--oc); flex: none; }
+.oracle-ind b { color: var(--oc); }
+.oracle-ind[data-blink="on"], .dot[data-blink="on"] { animation: oracle-blink 1s ease-in-out infinite; }
+@keyframes oracle-blink { 50% { opacity: .2; } }
+body.display .oracle-ind { cursor: default; }
+.readout .oracle-ind:hover { color: var(--ink); }
+
+/* the show's chip: on the Play board and a display, read from the oche */
+.oracle-show { --oc: var(--s-dim); position: absolute; z-index: 4; transform: skewX(-12deg); background: var(--s-navy2);
+  padding: 6px 14px; gap: 10px; font: 800 clamp(14px, 1.7vh, 22px) var(--show); letter-spacing: .14em; color: var(--s-dim); box-shadow: 0 6px 20px rgba(0, 0, 0, .35); }
+.oracle-show > * { transform: skewX(12deg); }
+.oracle-show .ol { color: var(--s-dim); }
+.oracle-show b { font-weight: 800; }
+.oracle-show .od { width: 10px; height: 10px; }
+.oracle-show[data-tone="ready"] { --oc: #3ddc84; }
+.oracle-show[data-tone="takeout"] { --oc: var(--volt); }
+.oracle-show[data-tone="stopped"] { background: #c8321f; }
+.oracle-show[data-tone="stopped"] .ol, .oracle-show[data-tone="stopped"] b { color: #fff; }
+.oracle-show[data-tone="stopped"] .od { background: #fff; }
+.oracle-show[data-blink="on"] { background: var(--volt); }
+.oracle-show[data-blink="on"] .ol, .oracle-show[data-blink="on"] b { color: var(--s-ink); }
+.oracle-show[data-blink="on"] .od { background: var(--s-ink); }
+#oracle-play { left: 0; top: 0; }
+.throws { position: relative; }
+.oracle-throws { display: none; position: absolute; top: 24px; right: 32px; z-index: 6; }
+.oracle-throws .oracle-show { position: static; }
+body.display[data-view="throws"] .oracle-throws { display: block; }
+body.display.conn-on .oracle-throws { top: calc(var(--conn-h, 42px) + 16px); }
 
 /* ==========================================================================
    SHEETS -- lab cards, over either register

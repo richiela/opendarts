@@ -173,3 +173,37 @@ def test_driver_logs_the_empty_board_guards_and_keeps_removal_evidence(tmp_path,
     lines = [json.loads(l) for l in (tmp_path / "lifecycle-guards.jsonl").read_text().splitlines()]
     assert any(l.get("event") == "takeout_hold" for l in lines)
     assert any(l.get("event") == "removal" for l in lines)
+
+
+def test_driver_logs_a_takeout_cleared_because_the_board_is_empty(tmp_path, caplog):
+    import logging
+    from opendarts.lifecycle.signals import to_small_gray
+    from opendarts.lifecycle.state import Phase
+    from tests.test_lifecycle_stranded_takeout import DART_A, DART_B, DART_C
+
+    masks = {0: board_mask()}
+    drv = LifecycleDriver(log_dir=tmp_path, masks_provider=lambda: masks, run_id="stranded",
+                          config=LifecycleConfig(warmup_stable_frames=3))
+    s = Scene()
+    caplog.set_level(logging.INFO, logger="opendarts.lifecycle.driver")
+    for _ in range(6):
+        drv.observe({0: s.render()})
+    for d in (DART_A, DART_B, DART_C):
+        s.darts.append(d)
+        for _ in range(15):
+            drv.observe({0: s.render()})
+    # stranded as on the Pi: the pulled board adopted, the darts still counted
+    s.darts = []
+    frame = s.render()
+    lc = drv.lifecycle
+    lc._adopt({0: frame}, {0: to_small_gray(frame)})
+    lc._partial_adopted, lc.phase = True, Phase.IDLE
+    lc._c.reset_idle()
+    for _ in range(45):
+        drv.observe({0: s.render()})
+    drv.close()
+
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("takeout cleared -- the board matches the empty board (was stuck; 3 darts)" in m for m in msgs)
+    lines = [json.loads(l) for l in (tmp_path / "lifecycle-stranded.jsonl").read_text().splitlines()]
+    assert any(l.get("event") == "empty_board_clear" and l.get("rule") == "was stuck" for l in lines)

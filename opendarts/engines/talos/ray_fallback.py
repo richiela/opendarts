@@ -361,3 +361,80 @@ def score_dart(
     )
 
 
+
+
+# 2026-09-28 -- two gates on what `score_dart()` above accepts, applied
+# AFTER it (the frozen function itself is untouched). Both come from the
+# same physical fact: a dart's tip is ON the board, and any two rays
+# meet somewhere, so agreement alone does not make a point the tip.
+#
+# PAIR_MAX_BOARD_Z_MM: the 2-of-3 fallback takes the lowest-disagreement
+# pair even when it meets 13-48mm off the board (7 of Talos's 17 corpus
+# misses: 049-S1, g1-048-S13, g1-012-T18 ...). Every pair this rejects
+# on the corpus met 18-26mm up; its replacement met within -3..+7.6mm
+# and was closer to the oracle's tip on 6 of 7 darts. 5mm and 12mm give
+# the same calls.
+PAIR_MAX_BOARD_Z_MM = 8.0
+# TIGHT_*: a 3-ray set is accepted up to MAX_RAY_DISAGREEMENT_MM (10mm),
+# but above TIGHT_FULL_SPREAD_MM one ray is off (047-S5's wire tail,
+# 098-S5); a pair that agrees to TIGHT_PAIR_SPREAD_MM near the board is
+# then the better reading. On 68 corpus darts with an oracle tip, the
+# camera this leaves out was the one farthest from that tip 65 times
+# (median 22px off vs 3.5px for the kept two). 3/8mm and 1.5/3mm give
+# the same calls within one dart.
+TIGHT_FULL_SPREAD_MM = 5.0
+TIGHT_PAIR_SPREAD_MM = 2.0
+
+
+def prefer_pair_on_board(
+    result: ScoreResult,
+    tip_pixels: dict[int, tuple[float, float]],
+    calibrations: dict[int, CameraCalibration],
+) -> ScoreResult:
+    """`result` from `score_dart()`, or a better-agreeing camera pair
+    whose point lies on the board (see the constants above)."""
+    if not result.ok or result.triangulation is None:
+        return result
+    cams = sorted(set(tip_pixels) & set(calibrations))
+    pair_max = MAX_RAY_DISAGREEMENT_MM_FALLBACK_PAIR
+    if result.outlier_camera is None:
+        if len(cams) < 3 or (result.max_ray_disagreement_mm or 0.0) <= TIGHT_FULL_SPREAD_MM:
+            return result
+        pair_max = TIGHT_PAIR_SPREAD_MM
+    elif float(result.triangulation.point_xyz[2]) <= PAIR_MAX_BOARD_Z_MM:
+        return result
+    rays = {
+        c: back_project_ray(
+            tip_pixels[c], calibrations[c].camera_matrix, calibrations[c].dist_coeffs,
+            calibrations[c].rvec, calibrations[c].tvec, cam=c,
+        )
+        for c in cams
+    }
+    best = None
+    for pair in itertools.combinations(cams, 2):
+        tri = triangulate([rays[c] for c in pair])
+        if not tri.ok:
+            continue
+        spread = max(tri.per_ray_distance_mm)
+        if spread > pair_max or abs(float(tri.point_xyz[2])) > PAIR_MAX_BOARD_Z_MM:
+            continue
+        if best is None or spread < best[0]:
+            best = (spread, tri, pair)
+    if best is None:
+        return result
+    spread, tri, pair = best
+    x, y = float(tri.point_xyz[0]), float(tri.point_xyz[1])
+    sector, ring = sector_ring_for_point(x, y)
+    return ScoreResult(
+        ok=True,
+        sector=sector,
+        ring=ring,
+        board_xy_mm=(x, y),
+        triangulation=tri,
+        n_cameras_used=2,
+        cameras_used=tuple(pair),
+        reason=result.reason,
+        max_ray_disagreement_mm=spread,
+        outlier_camera=next(c for c in cams if c not in pair),
+        alt_candidates_used=result.alt_candidates_used,
+    )

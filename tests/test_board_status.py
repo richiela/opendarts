@@ -24,6 +24,7 @@ by name.
 from __future__ import annotations
 
 from opendarts.live.board_status import (
+    BOARD_STATUS_CAMERAS_DOWN,
     BOARD_STATUS_COLOR,
     BOARD_STATUS_READY,
     BOARD_STATUS_STOPPED,
@@ -56,9 +57,12 @@ def test_the_four_constants_are_pairwise_distinct():
     ) == 4
 
 
-def test_board_status_color_covers_exactly_the_four_names_with_no_extras():
+def test_board_status_color_covers_exactly_the_five_names_with_no_extras():
+    # cameras_down (2026-10-01) is OD's own reading, not one of Autodarts'
+    # states: running by its account, but no frames from its cameras.
     assert set(BOARD_STATUS_COLOR) == {
         BOARD_STATUS_STOPPED, BOARD_STATUS_READY, BOARD_STATUS_TAKEOUT, BOARD_STATUS_UNKNOWN,
+        BOARD_STATUS_CAMERAS_DOWN,
     }
 
 
@@ -67,6 +71,7 @@ def test_board_status_colors_match_the_documented_traffic_light_convention():
     assert BOARD_STATUS_COLOR[BOARD_STATUS_READY] == "green"
     assert BOARD_STATUS_COLOR[BOARD_STATUS_TAKEOUT] == "yellow"
     assert BOARD_STATUS_COLOR[BOARD_STATUS_UNKNOWN] == "grey"
+    assert BOARD_STATUS_COLOR[BOARD_STATUS_CAMERAS_DOWN] == "red"
 
 
 # ---------------------------------------------------------------------------

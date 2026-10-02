@@ -27,6 +27,7 @@ now, before any live traffic:
   "event": "hello",
   "running": false,
   "status": "no_live_capture",
+  "hold": null,
   "visit": null,
   "n_darts": 0,
   "darts": [],
@@ -48,6 +49,7 @@ You never need to merge — replace your local state with each message.
 | `event` | why this was sent (see below) |
 | `running` | is the capture loop running |
 | `status` | board state — `throw`, `takeout`, `stopped`, `connecting`, `camera_error`, `no_live_capture` |
+| `hold` | why a running board says `takeout` with no turn to clear: OD's oracle is on and not ready, and a dart thrown now will **not** score (`"oracle in takeout"`, `"oracle stopped"`, `"oracle offline"`, `"oracle cameras down"`, `"oracle status unknown"`). `null` otherwise. Show it to the player |
 | `visit` | id of the turn in progress, or `null` |
 | `n_darts` | darts thrown this turn |
 | `darts` | the darts, in throw order |
@@ -98,6 +100,7 @@ for latency work.
 | `visit_complete` | the turn ended — board cleared |
 | `manual_reset` | the turn was abandoned by an operator Reset |
 | `takeout_started` | darts are being removed (the board clearing is then `visit_complete`) |
+| `hold_started` / `hold_released` / `hold_changed` | a hold began, lifted, or changed reason (see `hold`). Not a turn's takeout: no `visit_complete` follows a hold |
 | `started` / `stopped` | capture loop started or stopped |
 | `connecting` | cameras opening |
 | `camera_error` / `camera_error_cleared` | a camera failed or recovered |

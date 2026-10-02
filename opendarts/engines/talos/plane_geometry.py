@@ -316,13 +316,22 @@ def slide_point_along_dart_axis(
     point_xyz,
     planes: list[tuple[np.ndarray, float]],
     z_mm: float = BOARD_HIT_Z_MM,
+    max_tilt_deg: float | None = None,
 ) -> tuple[float, float] | None:
     """Slide a triangulated 3D point along Talos's dart axis to z=z_mm.
 
     `point_xyz` is score_dart's closest-point of cap rays (usually in
     front of the wire face). The dart axis is intersect_planes_with_board
     of the shaft planes. Returns (x, y) at the sisal plane, or None if
-    the axis cannot be reconstructed.
+    the axis cannot be reconstructed -- or, with `max_tilt_deg`, if it
+    leans further from the board normal than a stuck dart can.
+
+    2026-09-28, `max_tilt_deg`: the engine passes MAX_PLAUSIBLE_TILT_DEG.
+    An axis beyond it (two nearly parallel planes, say) is not a dart
+    axis, and sliding along it moves the point sideways by millimetres:
+    on the corpus it fired on 5 darts, 3 of which it had moved 11-54mm
+    (g1-048-OUT: 2.3mm from the oracle kept instead of 8.9mm; 109-OUT: a
+    61mm slide prevented).
     """
     if point_xyz is None or len(planes) < 2:
         return None
@@ -331,6 +340,10 @@ def slide_point_along_dart_axis(
         return None
     _xy, geom = hit
     direction = np.asarray(geom["direction"], dtype=np.float64)
+    if max_tilt_deg is not None:
+        tilt = math.degrees(math.acos(min(1.0, abs(direction[2]) / np.linalg.norm(direction))))
+        if tilt > max_tilt_deg:
+            return None
     point = np.asarray(point_xyz, dtype=np.float64).reshape(3)
     new_hit = _hit_z(direction, point, z_mm)
     if new_hit is None:

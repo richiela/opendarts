@@ -910,6 +910,9 @@ def _build_components(
     controller = CaptureLoopController(
         snapshot_path=DEFAULT_CONFIG_PATH
     )
+    # Autodarts' camera standby follows OD's idle timeout (one setting).
+    if ad_ws_listener is not None and hasattr(ad_ws_listener, "set_standby_source"):
+        ad_ws_listener.set_standby_source(controller.get_idle_timeout_sec)
     # Same "built empty here, BEFORE either half starts, shared by
     # reference" reasoning as calibration_store/reset_request/controller
     # above -- opendarts.live.capture_daemon.EngineConfigStore's own

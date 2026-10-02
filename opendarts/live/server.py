@@ -299,8 +299,15 @@ from opendarts.live.capture_daemon import (
 from opendarts.capture.calibration_package import DEFAULT_CALIBRATION_PACKAGE_ROOT
 from opendarts.live.ad_ws_listener import AdWsListener
 from opendarts.live.heap_trim import release_freed_heap
-from opendarts.live.board_status import BOARD_STATUS_UNKNOWN
-from opendarts.capture.trigger_state import MAX_DARTS_PER_TURN
+from opendarts.live.board_status import BOARD_STATUS_STOPPED, BOARD_STATUS_UNKNOWN
+from opendarts.live.oracle_hold import oracle_hold
+from opendarts.capture.trigger_state import MAX_DARTS_PER_TURN, ThrowState
+
+# TRIGGER_STATE events carry the state's NAME ("TAKEOUT_WAITING", from
+# `trigger.state.name` in capture_daemon), not its value ("takeout_waiting").
+# Comparing against the value never matched, so the retail feed never saw
+# OD's own takeout.
+_TAKEOUT_WAITING = ThrowState.TAKEOUT_WAITING.name
 from opendarts.live.logging_setup import DEFAULT_LOG_DIR
 from opendarts.geometry.board import (
     BULL_RADIUS_MM,
@@ -2395,6 +2402,10 @@ class AppState:
                 **self._capture_status_stamp(),
             }
         )
+        # The retail feed too (`connecting`): a client that only listens
+        # there -- FlightDeck, the kiosk -- must see a Start without
+        # waiting for the capture thread's first event.
+        await self.publish_retail_state()
 
         ok_flags = await asyncio.to_thread(self.hub.open_all)
         if not any(ok_flags):
@@ -2411,6 +2422,7 @@ class AppState:
                     **self._capture_status_stamp(),
                 }
             )
+            await self.publish_retail_state()
             return {
                 "ok": False,
                 "reason": "no cameras opened",
@@ -2549,6 +2561,14 @@ class AppState:
                 **self._capture_status_stamp(),
             }
         )
+        # The retail feed too (`stopped`). The capture thread pushes no
+        # event when a session ends, so the generic publish after each live
+        # event never ran and a retail-only client (FlightDeck, the kiosk)
+        # went on believing OD was capturing after a Stop or an idle stop.
+        # Named explicitly: the generic path names nothing when the status
+        # leaves takeout (it waits for visit_complete), and a Stop during a
+        # takeout or an oracle hold would be swallowed.
+        await self.publish_retail_state("stopped")
         return {
             "ok": True, "acknowledged": acked, "reason": reason, "starting": False,
             **self.controller.meta(), **self._capture_status_stamp(),
@@ -2850,7 +2870,11 @@ class AppState:
             # truth), this is purely a forwarded broadcast so already-
             # connected tabs update immediately instead of only on their
             # next full page load.
-            await self._broadcast({**event, "ts": ts})
+            await self._broadcast({**event, "ts": ts,
+                                   "oracle_hold": self.oracle_hold_snapshot()})
+            # the oracle's state is part of OD's own readiness while it is
+            # on (retail `status`/`hold`), so a change here is a change there
+            await self.publish_retail_state()
         elif kind == "AD_CONNECTION":
             # The listener's WebSocket to Autodarts came up or went down
             # (AdWsListener's on_connection_change, 2026-09-22). This is
@@ -2870,7 +2894,9 @@ class AppState:
             # announcements raced in.
             await self._broadcast({
                 "type": "AD_CONNECTION", "ts": ts, **self.ad_connection_snapshot(),
+                "oracle_hold": self.oracle_hold_snapshot(),
             })
+            await self.publish_retail_state()
         elif kind == "CALIBRATION_STATUS":
             # Real, visible confirmation that Start's auto-calibrate step
             # ran (or was skipped because a valid calibration already
@@ -3053,9 +3079,34 @@ class AppState:
             return "connecting"
         if not self.controller.is_running():
             return "stopped"
-        if self.trigger_state == "takeout_waiting":
+        if self._in_own_takeout():
+            return "takeout"
+        # The oracle is on and not ready (opendarts/live/oracle_hold.py): OD
+        # will not score a dart now, so it is not "throw". Takeout -- "fix
+        # the board before throwing" -- whatever the oracle's own trouble;
+        # the reason is in `hold`. Not "stopped": the cameras still run, and
+        # a client treating OD as stopped may try to start it.
+        if self.oracle_hold_snapshot() is not None:
             return "takeout"
         return "throw"
+
+    def _in_own_takeout(self) -> bool:
+        """OD's own takeout: from the turn being over until its visit
+        clears. Judged by the visit, not only the trigger state: a hand
+        reaching in moves the trigger to SETTLING/MOTION_DETECTED mid-pull
+        (the feed flickered to `throw`), and VISIT_CLEARED arrives just
+        before the trigger leaves TAKEOUT_WAITING (the clear was published
+        still saying takeout, then the return to throw was never named)."""
+        n = sum(1 for t in self.visit_throws if t.get("visit_id") in (None, self.visit_id))
+        return n >= MAX_DARTS_PER_TURN or (self.trigger_state == _TAKEOUT_WAITING and n > 0)
+
+    def oracle_hold_snapshot(self) -> "dict[str, Any] | None":
+        """Why OD is holding for the oracle right now ({code, reason}), or
+        None. Read live off the listener, like ad_board_status -- one
+        source of truth for the light, the retail status and the scoring
+        gate (which asks the same function as each dart lands)."""
+        hold = oracle_hold(self.ad_ws_listener)
+        return hold.as_dict() if hold is not None else None
 
     def _build_retail_state_fields(self) -> dict[str, Any]:
         """The complete retail snapshot -- every field a `state` message
@@ -3083,6 +3134,17 @@ class AppState:
         return {
             "running": bool(self.controller is not None and self.controller.is_running()),
             "status": self.retail_status,
+            # why a running OD is in takeout without a visit to clear: the
+            # oracle is on and not ready, and a dart now would not score
+            # ("oracle in takeout" / "oracle stopped" / "oracle offline" /
+            # "oracle status unknown"); null otherwise -- including during
+            # OD's own takeout, when the oracle's takeout is just the same
+            # pull of the darts (reporting it read every visit's takeout as
+            # an oracle hold)
+            "hold": (
+                None if self._in_own_takeout()
+                else (self.oracle_hold_snapshot() or {}).get("reason")
+            ),
             "visit": self.visit_id,
             "n_darts": self.trigger_dart_count if self.trigger_dart_count is not None else len(darts),
             "darts": darts,
@@ -3146,9 +3208,22 @@ class AppState:
         if event_name is None:
             if not fields_changed:
                 return
-            event_name = self._retail_event_name_for_status_transition(
-                old_status, fields["status"]
-            )
+            old_hold = (self._last_retail_state_fields or {}).get("hold")
+            if old_hold != fields["hold"]:
+                # An oracle hold is not a turn's takeout: no visit ends when
+                # it lifts, so the status-transition names (takeout_started,
+                # then nothing until visit_complete) would leave a client
+                # waiting for a clear that never comes. Its own names, plain
+                # snapshots to any client that does not know them.
+                event_name = (
+                    "hold_started" if not old_hold
+                    else "hold_released" if not fields["hold"]
+                    else "hold_changed"
+                )
+            else:
+                event_name = self._retail_event_name_for_status_transition(
+                    old_status, fields["status"]
+                )
             if event_name is None:
                 return
         elif not fields_changed and event_name == self._last_retail_event_name:
@@ -3327,6 +3402,10 @@ class AppState:
                 if self.ad_ws_listener is not None
                 else None
             ),
+            # While the oracle is on and not ready, OD holds: it reports
+            # takeout and does not score (opendarts/live/oracle_hold.py).
+            # {code: takeout|stopped|offline|unknown, reason} or null.
+            "oracle_hold": self.oracle_hold_snapshot(),
             "calibration": {
                 # This dashboard's own last-refreshed DISPLAY data --
                 # only ever updates on an explicit manual refresh now (no
@@ -4990,10 +5069,20 @@ def create_app(
         /api/calibration/refresh's own `live_source: null` case."""
         if state.controller is not None:
             state.controller.touch() # a manual Reset counts as real activity
+        # 2026-09-28: while the oracle is on, OD's Reset resets it too -- one
+        # button clears both after a dart that landed during a hold. Sent
+        # whether or not the loop is listening; its answer rides along.
+        # Pull every dart first: like OD's own reset, the oracle takes the
+        # board as it is now as its new starting point.
+        oracle_reset = None
+        listener = state.ad_ws_listener
+        if listener is not None and listener.is_enabled():
+            oracle_reset = await asyncio.to_thread(listener.control, "reset", 5.0)
+        extra = {} if oracle_reset is None else {"oracle_reset": oracle_reset}
         if state.reset_request is None:
-            return {"requested": False, "loop_listening": False}
+            return {"requested": False, "loop_listening": False, **extra}
         state.reset_request.request()
-        return {"requested": True, "loop_listening": True, **state.reset_request.meta()}
+        return {"requested": True, "loop_listening": True, **state.reset_request.meta(), **extra}
 
     @app.post("/api/start")
     async def api_start() -> dict[str, Any]:
@@ -5018,7 +5107,17 @@ def create_app(
         module's own docstring)."""
         if state.controller is not None:
             state.controller.touch()
-        return await state.start_capture()
+        result = await state.start_capture()
+        # One press gets the board working, as Reset resets both: with the
+        # oracle on and connected but stopped (it stands down by itself after
+        # its idle time), Start starts it too -- otherwise OD comes up held,
+        # "waiting on oracle", until someone starts it by hand.
+        listener = state.ad_ws_listener
+        if (result.get("ok") and listener is not None and listener.is_enabled()
+                and listener.is_connected()
+                and listener.board_status()[0] == BOARD_STATUS_STOPPED):
+            result["oracle_start"] = await asyncio.to_thread(listener.control, "start", 15.0)
+        return result
 
     @app.post("/api/stop")
     async def api_stop() -> dict[str, Any]:
@@ -5052,6 +5151,22 @@ def create_app(
             "always_update": always_update(),
             "update_on_next_restart": update_on_next_restart(),
         }
+
+    @app.post("/api/oracle/{action}")
+    async def api_oracle_control(action: str) -> Any:
+        """Start, stop or reset Autodarts' board from OD's own dashboard
+        (the ORACLE readout's sheet) -- the same local calls Autodarts'
+        dashboard makes (AdWsListener.control). The board's new state
+        arrives the usual way, over AD's event socket, as AD_BOARD_STATUS."""
+        listener = state.ad_ws_listener
+        if listener is None:
+            return JSONResponse({"ok": False, "action": action,
+                                 "error": "Autodarts is not wired in this process"}, status_code=409)
+        if action not in listener.CONTROLS:
+            return JSONResponse({"ok": False, "action": action,
+                                 "error": f"unknown action {action!r}"}, status_code=404)
+        result = await asyncio.to_thread(listener.control, action)
+        return result if result.get("ok") else JSONResponse(result, status_code=502)
 
     @app.post("/api/restart")
     async def api_restart(body: "dict[str, Any] | None" = None) -> dict[str, Any]:
@@ -5618,6 +5733,8 @@ def create_app(
                     vcam.register.apply, enabled
                 )
                 applied.append("ad_enabled")
+                # switching the oracle on or off moves OD's own readiness
+                await state.publish_retail_state()
 
         if "camera_devices" in cleaned or "camera_urls" in cleaned:
             ok_applied, reason, restarted = await _apply_camera_assignment(cleaned)
@@ -5639,6 +5756,11 @@ def create_app(
             else:
                 state.controller.set_idle_timeout_sec(cleaned["idle_timeout_sec"])
                 applied.append("idle_timeout_sec")
+                # Autodarts' camera standby follows it; off-thread, so this
+                # answer does not wait on Autodarts.
+                listener = state.ad_ws_listener
+                if listener is not None and hasattr(listener, "sync_camera_standby_async"):
+                    listener.sync_camera_standby_async(state.controller.get_idle_timeout_sec())
 
         if "lifecycle_settings" in cleaned:
             if state.lifecycle_settings_store is None:

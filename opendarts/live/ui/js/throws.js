@@ -96,9 +96,13 @@ const Throws = (() => {
   }
   function passes(p, k) {
     if (k === 'all') return true;
-    if (k === 'corrected') return !!p.ad_operator_confirmed_ring;
+    // Disputed: Autodarts against our call, nobody has ruled. Once a person
+    // records what landed it leaves Disputed for OD Wrong (our call was not
+    // it), AD Wrong (Autodarts' was not), or both when it was neither.
+    if (k === 'disputed') return verdict(p).key === 'disputed';
+    if (k === 'odwrong') return verdict(p).key === 'wrong';
+    if (k === 'adwrong') return !!p.ad_operator_confirmed_ring && !!p.ad_matched && !sameCall({sector: p.ad_sector, ring: p.ad_ring}, truthOf(p));
     if (k === 'noread') return noRead(p);
-    if (k === 'disagree') { const v = verdict(p).key; return v === 'wrong' || v === 'disputed'; }
     if (k === 'split') {
       return sections(p).some((s) => !s.primary && s.ok !== false && !s.timed_out && s.ring && !sameCall(s, ours(p)));
     }
@@ -314,8 +318,9 @@ const Throws = (() => {
     const b = S.adBoard || {};
     const guard = S.state && S.state.config && S.state.config.disk && S.state.config.disk.guard;
     let msg = null;
-    if (S.config && S.config.ad_enabled && b.status === 'takeout' && typeof b.age === 'number' && b.age >= 30) {
-      msg = ['Autodarts is stuck in takeout', Math.round(b.age) + ' s — it is not scoring. Clear the board, or reset it.'];
+    const age = adBoardAge();
+    if (S.config && S.config.ad_enabled && b.status === 'takeout' && age !== null && age >= ORACLE_STUCK_S) {
+      msg = ['Autodarts is stuck in takeout', Math.round(age) + ' s — it is not scoring. Clear the board, or reset it.'];
     } else if (guard && guard.below_floor) {
       msg = ['Saving has stopped', 'the disk is below its ' + (guard.floor_label || '') + ' floor — ' + (guard.free_label || '') + ' free.'];
     } else if (S.config && S.config.store_packages === false) {

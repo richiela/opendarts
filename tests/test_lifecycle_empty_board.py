@@ -9,7 +9,7 @@ from __future__ import annotations
 from tests.test_lifecycle_state import CX, CY, Scene, new_lifecycle, run, warm
 
 from opendarts.lifecycle.signals import to_small_gray
-from opendarts.lifecycle.state import Action, Phase
+from opendarts.lifecycle.state import Action, LifecycleConfig, Phase
 
 DART_A = (CX - 60, CY - 60, 16, 100)
 DART_B = (CX + 40, CY - 40, 16, 90)
@@ -70,12 +70,28 @@ def test_a_real_dart_after_a_takeout_still_scores():
     assert lc.dart_count == 1
 
 
-def test_a_takeout_that_never_looks_empty_clears_after_the_wait_and_its_removal_is_not_scored():
-    # Something stays over where a dart was (a hand resting on it) long
-    # past any pull: the board must not stay in the old visit for ever.
-    # The clear it finally makes holds that hand and dart, so their later
-    # removal is a removal, not a throw.
+def test_by_default_a_takeout_waits_for_an_empty_board_however_long_it_takes():
+    # Since 2026-10-01 there is no forced clear: a dart left in keeps OD in
+    # takeout (not scoring) rather than clearing with it still in -- which
+    # put a dart in the board photo after a relaxed pull. Pulling it clears.
     lc, s = new_lifecycle(), Scene()
+    _visit_of_two(lc, s)
+    s.darts, s.blobs = [DART_B], [HAND_ON_B]
+    ticks = run(lc, s, 600)
+    assert not any(t.action is Action.CLEARED for t in ticks)
+    assert lc.dart_count == 2
+    s.darts, s.blobs = [], []
+    ticks = run(lc, s, 60)
+    assert sum(t.action is Action.CLEARED for t in ticks) == 1
+    assert not any(t.action is Action.COMMIT for t in ticks)
+    assert lc.dart_count == 0
+
+
+def test_with_a_forced_clear_set_a_takeout_that_never_looks_empty_clears_and_its_removal_is_not_scored():
+    # The opt-in (clear_force_frames=90, the old ~3 s): something stays over
+    # where a dart was long past any pull, the board clears anyway, and the
+    # later removal of that hand and dart is a removal, not a throw.
+    lc, s = new_lifecycle(LifecycleConfig(warmup_stable_frames=3, clear_force_frames=90)), Scene()
     _visit_of_two(lc, s)
     s.darts, s.blobs = [DART_B], [HAND_ON_B]
     ticks = run(lc, s, 150)

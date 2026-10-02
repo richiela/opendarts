@@ -151,6 +151,37 @@ FAT_STREAK_RESUME_MIN_THIN_BINS = 2
 # (this exact debugging session needed them repeatedly).
 N_TIP_PIXELS_AVERAGED = 3
 
+# Collinear-fragment merge (2026-09-28). A dart whose diff breaks into
+# pieces -- a black barrel over the dark beds, a thin shaft under the
+# threshold, a bright flight separated from its own tip -- reaches the
+# engine as several short or point-only candidates, so that camera gives
+# no line or a short weak one. Measured on the 1,618-dart corpus: darts
+# solved from only two lines are 22% >3mm from the oracle's tip vs 10%
+# with three, and the missing third line was usually exactly this. Pieces
+# whose centres lie on one common line are refit with THIS module's own
+# thin-run centerline fit on the union of their pixels and offered as one
+# extra candidate; the originals stay, and consensus decides. Offline:
+# +8/-0 calls, 20 darts >2mm closer to the oracle vs 4 farther, every
+# call gain a visually confirmed broken-up dart, flat across 26 constant
+# variants and holding in both halves of the corpus split by session.
+MERGE_MIN_AREA_PX = 20 # smaller than MIN_COMPONENT_AREA_PX: pieces are small
+MERGE_MAX_COMPONENTS = 12 # largest pieces considered per camera
+# Linking two pieces: each piece's median offset from the pair's common
+# line, the longest gap along it, and -- for a piece long enough to have
+# its own direction -- how far that direction may turn from the line
+# (a blob merely centred on the line, or a piece running across it, is
+# not part of the same shaft).
+MERGE_LINK_PERP_PX = 4.0
+MERGE_MAX_GAP_PX = 150.0
+MERGE_PIECE_DIR_MIN_LEN_PX = 25.0
+MERGE_PIECE_MAX_ANGLE_DEG = 8.0
+MERGE_MIN_SHAFT_LEN_PX = 60.0
+# Refit guard: every piece's centre within this of the MERGED line. The
+# sweep's trade-off point (1 / 1.5 / 2 / 3 / 4px -> +6-0 / +7-0 / +8-0 /
+# +8-1 / +10-1 calls); no guard at all doubles the darts that move >1mm
+# away from the oracle (14 -> 31).
+MERGE_MAX_PIECE_OFFSET_PX = 2.0
+
 
 @dataclass
 class DartCandidate:
@@ -173,6 +204,9 @@ class DartCandidate:
     tip_taper: float # 0..1, how much narrower the tip end is vs the base end
     degraded: bool = False
     diagnostics: dict = field(default_factory=dict)
+    # > 0: a collinear-fragment merge of this many pieces (see
+    # MERGE_MAX_PIECE_OFFSET_PX), not one diff component.
+    merged_fragments: int = 0
 
 
 @dataclass
@@ -519,6 +553,101 @@ def _degraded_candidate(pts: np.ndarray, vals: np.ndarray, area: int) -> DartCan
     )
 
 
+def _principal_axis(pts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Unweighted TLS line through `pts`: (mean, unit axis). Only used by
+    the fragment merge, whose tests are all sign-free (abs / min / max)."""
+    mu = pts.mean(axis=0)
+    c = pts - mu
+    evals, evecs = np.linalg.eigh(c.T @ c / len(c))
+    return mu, evecs[:, -1]
+
+
+def _fragments_linked(a: dict, b: dict) -> bool:
+    """Do pieces `a` and `b` lie on one common line? See the MERGE_*
+    constants above."""
+    import math
+
+    mu, ax = _principal_axis(np.vstack([a["pts"], b["pts"]]))
+    nv = np.array([-ax[1], ax[0]])
+    for c in (a, b):
+        if abs(np.median((c["pts"] - mu) @ nv)) > MERGE_LINK_PERP_PX:
+            return False
+    pa = (a["pts"] - mu) @ ax
+    pb = (b["pts"] - mu) @ ax
+    if max(pa.min(), pb.min()) - min(pa.max(), pb.max()) > MERGE_MAX_GAP_PX:
+        return False
+    cos_max = math.cos(math.radians(MERGE_PIECE_MAX_ANGLE_DEG))
+    for c in (a, b):
+        _, cax = _principal_axis(c["pts"])
+        if np.ptp(c["pts"] @ cax) >= MERGE_PIECE_DIR_MIN_LEN_PX and abs(cax @ ax) < cos_max:
+            return False
+    return True
+
+
+def _merged_candidates(frags: list[dict]) -> list[DartCandidate]:
+    """Collinear-fragment merge (see MERGE_* above): link pieces that share
+    one line (union-find; a grown group must stay collinear as a whole),
+    refit each group of two or more with `_fit_centerline()` on the union
+    of its pixels, and keep the refit only when it is a real shaft
+    (>= MERGE_MIN_SHAFT_LEN_PX) with every piece's centre within
+    MERGE_MAX_PIECE_OFFSET_PX of it. `frags`: dicts with `area`, `pts`
+    (N x 2 full-frame pixels) and `vals` (their blurred diff values)."""
+    n = len(frags)
+    parent = list(range(n))
+
+    def root(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if root(i) == root(j) or not _fragments_linked(frags[i], frags[j]):
+                continue
+            ri, rj = root(i), root(j)
+            grown = [k for k in range(n) if root(k) == ri] + [k for k in range(n) if root(k) == rj]
+            mu, ax = _principal_axis(np.vstack([frags[k]["pts"] for k in grown]))
+            nv = np.array([-ax[1], ax[0]])
+            if all(
+                abs(np.median((frags[k]["pts"] - mu) @ nv)) <= MERGE_LINK_PERP_PX
+                for k in grown
+            ):
+                parent[rj] = ri
+
+    groups: dict[int, list[int]] = {}
+    for k in range(n):
+        groups.setdefault(root(k), []).append(k)
+    out: list[DartCandidate] = []
+    for g in groups.values():
+        if len(g) < 2:
+            continue
+        pts = np.vstack([frags[k]["pts"] for k in g])
+        vals = np.concatenate([frags[k]["vals"] for k in g])
+        cand, _ = _fit_centerline(pts, vals, sum(frags[k]["area"] for k in g))
+        if cand is None or cand.shaft_len_px < MERGE_MIN_SHAFT_LEN_PX:
+            continue
+        ax = np.asarray(cand.axis_unit)
+        nv = np.array([-ax[1], ax[0]])
+        t0 = np.asarray(cand.tip_px)
+        spans = sorted(
+            (float(((frags[k]["pts"] - t0) @ ax).min()), float(((frags[k]["pts"] - t0) @ ax).max()))
+            for k in g
+        )
+        max_gap = max(max(0.0, b[0] - a[1]) for a, b in zip(spans, spans[1:]))
+        max_off = max(abs(float(np.median((frags[k]["pts"] - t0) @ nv))) for k in g)
+        if max_off > MERGE_MAX_PIECE_OFFSET_PX:
+            continue
+        cand.merged_fragments = len(g)
+        cand.diagnostics["merge"] = {
+            "n_fragments": len(g),
+            "max_gap_px": round(max_gap, 1),
+            "max_piece_offset_px": round(max_off, 2),
+        }
+        out.append(cand)
+    return out
+
+
 def detect_candidates(
     bg_bgr: np.ndarray,
     frame_bgr: np.ndarray,
@@ -570,23 +699,34 @@ def detect_candidates(
     if n <= 1:
         return []
     comps = []
+    frag_labels = [] # every in-bounds component big enough to be a merge piece
     bboxes: dict[int, tuple[int, int, int, int]] = {}
     for i in range(1, n):
         x, y, w, h, area = (int(v) for v in stats[i])
         bboxes[i] = (x, y, w, h)
         if w > MAX_COMPONENT_FRAME_FRACTION * img_w or h > MAX_COMPONENT_FRAME_FRACTION * img_h:
             continue
+        if area >= MERGE_MIN_AREA_PX:
+            frag_labels.append((area, i))
         if area < MIN_COMPONENT_AREA_PX:
             continue
         comps.append((area, i))
     comps.sort(reverse=True)
 
+    # Per-label pixels from the label's own bbox, not a full-frame
+    # ==/&/nonzero (~25% of the engine's time) -- same pixels, same
+    # order, see `opendarts.imageops.component_pixels`. Memoized: the
+    # fragment merge below reads most of the same labels again.
+    pixels: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+
+    def _pixels(i: int) -> tuple[np.ndarray, np.ndarray]:
+        if i not in pixels:
+            pixels[i] = component_pixels(labels, i, bboxes[i], mask, origin)
+        return pixels[i]
+
     out: list[DartCandidate] = []
     for area, i in comps[:TOP_K_CANDIDATES]:
-        # Per-label pixels from the label's own bbox, not a full-frame
-        # ==/&/nonzero (~25% of the engine's time) -- same pixels, same
-        # order, see `opendarts.imageops.component_pixels`.
-        xs, ys = component_pixels(labels, i, bboxes[i], mask, origin)
+        xs, ys = _pixels(i)
         if len(xs) < MIN_COMPONENT_AREA_PX:
             continue
         pts = np.column_stack([xs, ys]).astype(np.float64)
@@ -601,4 +741,21 @@ def detect_candidates(
                 cand.diagnostics["centerline_failure"] = fit_failure
         if cand is not None:
             out.append(cand)
+
+    # Collinear-fragment merge candidates, AFTER the originals (see
+    # MERGE_* above): the largest pieces, ties in label order.
+    frag_labels.sort(key=lambda t: -t[0])
+    frags = []
+    for area, i in frag_labels:
+        if len(frags) == MERGE_MAX_COMPONENTS:
+            break
+        xs, ys = _pixels(i)
+        if len(xs) < 8:
+            continue
+        frags.append({
+            "area": area,
+            "pts": np.column_stack([xs, ys]).astype(np.float64),
+            "vals": diff[ys - oy, xs - ox].astype(np.float64),
+        })
+    out.extend(_merged_candidates(frags))
     return out

@@ -21,8 +21,8 @@ on.
 | `GET /api/state` | current rig state. Its `capture_loop` section carries `status_epoch` / `status_seq` (see [Ordering stamps](#ordering-stamps)) |
 | `GET /api/cameras/status` | per-camera backend, resolution, frame counts and errors, plus where the slot's JPEG comes from: `jpeg_passthrough` (the camera's own) or `jpeg_synthetic` / `jpeg_synthetic_quality` (encoded by the rig — see `docs/STREAMING.md`) |
 | `GET /api/frame-health` | whether frames are keeping up on **both** sides: `capture` (is the pump reading every frame the camera produces — a 30fps camera delivering 21 is degrading silently) and `publish` (is the virtual-camera consumer collecting every frame we hand it) |
-| `POST /api/start` / `POST /api/stop` | start or stop the capture loop. Replies carry `status_epoch` / `status_seq` |
-| `POST /api/reset` | reset session state |
+| `POST /api/start` / `POST /api/stop` | start or stop the capture loop. Replies carry `status_epoch` / `status_seq`. While the oracle is on, connected and stopped, Start also starts it; its answer is in `oracle_start` (absent otherwise) |
+| `POST /api/reset` | reset session state: the board as it is now becomes the starting point, dart or no dart. While the oracle is on it also resets Autodarts; its answer is in `oracle_reset` (absent while the oracle is off). Pull every dart first |
 | `POST /api/restart` | exit cleanly so the launcher (`run.sh` / `run.ps1`) starts the process again; replies with `restarting` and the old `pid`. Without a launcher loop it only stops the process. Optional body `{"update": true}` asks the launcher to `git pull` first: it records `update_on_next_restart` in `data/config.json`, and refuses to restart if it cannot. **No body restarts without pulling** |
 | `GET /api/restart` | reports, without restarting anything, the two launcher update flags (`always_update`, `update_on_next_restart`) — what a restart *would* do. Both are also keys of the config document |
 | `GET /api/logs/{name}` | tail a log file as plain text; `?n=` lines, default 200. `name` is `run_product` (the product's log), or `server` / `capture_daemon` when those modules are run standalone |
@@ -60,7 +60,7 @@ store. See `config.example.json` for every default.
 | `publish_virtual_cameras`, `v4l2_format` | whether the virtual cameras are fed (`null` follows `ad_enabled`), and the Linux loopback pixel format | next restart |
 | `cv2_num_threads` | how many worker threads OpenCV may use | next restart |
 | `detect_from_small_decode` | detection reads each frame's JPEG decoded straight to 1/4 grey, and only scored frames are decoded in full (`true`, the default); `false` decodes every frame in full, as before | next restart |
-| `idle_timeout_sec` | seconds of no darts before the capture loop auto-stops; `0` disables it | **live**. Clamped to `max(0, n)` |
+| `idle_timeout_sec` | seconds of no darts before the capture loop auto-stops; `0` disables it | **live**. Clamped to `max(0, n)`. While the oracle is on, Autodarts' camera standby (`motion.standby_minutes`) follows it: set on connect and on every change to the smallest of 5/10/15/30/60 minutes at least as long (60 if longer; untouched when `0`) |
 | `lifecycle_settings.dart_stable_frames` | still frames a landed dart must hold before it is scored (1–5; fewer is faster but more error-prone) | **live**, on the next frame |
 | `engine_config` | which engine is primary, which also run, the per-engine timeout | next restart |
 | `always_update`, `update_on_next_restart` | whether a restart pulls the latest code first | read by the launcher at the next restart |
@@ -227,8 +227,8 @@ an ISO `ts`:
 | `VISIT_CLEARED` | a turn ended (board cleared, or Reset) | `previous_visit_id`, `visit_id` (the new one), `n_darts`, `reason` |
 | `PACKAGES_UPDATED` | packages were added, changed or deleted | `count` (true total), `new_count`, `packages` (the changed records) |
 | `CALIBRATION_STATUS` | calibration ran (at Start or on request) | `cameras` (per-camera status), `source`, `ring_geometry_relearned` |
-| `AD_BOARD_STATUS` | Autodarts' own board status changed | — |
-| `AD_CONNECTION` | the Autodarts listener connected or disconnected | same shape as `runtime.ad` in the config document |
+| `AD_BOARD_STATUS` | Autodarts' board status changed, including `cameras_down` (see [Oracle hold](#oracle-hold)) | `oracle_hold` (see [Oracle hold](#oracle-hold)) |
+| `AD_CONNECTION` | the Autodarts listener connected or disconnected | same shape as `runtime.ad` in the config document, plus `oracle_hold` |
 | `IDLE_TIMEOUT` | the capture loop auto-stopped after `idle_timeout_sec` without darts | `idle_timeout_sec` |
 
 `DART_CALL` is its own message so it can leave first (sound is the
@@ -283,3 +283,43 @@ On Windows and Linux the same toggle also decides, unless
 `publish_virtual_cameras` is set explicitly, whether the virtual cameras
 that other software reads are registered and fed (see
 `docs/STREAMING.md`).
+
+Autodarts' board can be driven from here, with the same local calls its
+own dashboard makes on the board machine:
+
+| Route | What it does |
+| --- | --- |
+| `POST /api/oracle/{action}` | `action` is `start`, `stop`, `reset` or `calibrate` (Autodarts' own auto-calibration; answered when it has finished, so allow up to ~90 s). Replies `{ok, action, status}` with Autodarts' HTTP status; `502` with an `error` when Autodarts refused or could not be reached, `404` for any other action, `409` when this process has no Autodarts listener. Refused while `ad_enabled` is off. The board's new state arrives as usual: `ad_board_status` on `GET /api/state`, pushed as `AD_BOARD_STATUS` |
+
+### Oracle hold
+
+While the oracle is on (`ad_enabled`, with a listener in this process),
+OD is not ready unless Autodarts is: it holds, and a dart that lands while
+it holds is **not scored**. Pull it, press Reset (which resets Autodarts
+too) and throw again. With the oracle off nothing changes.
+
+`GET /api/state` carries `oracle_hold`: `null`, or `{code, reason}` with
+`code` one of `takeout` (Autodarts is in takeout), `stopped`, `offline`
+(the listener is not connected), `cameras` (its cameras deliver no frames,
+below) or `unknown` (connected, no status yet), and `reason` a short
+phrase for a person ("oracle in takeout", "oracle cameras down"). The same
+object rides on `AD_BOARD_STATUS` and `AD_CONNECTION`. The retail feed
+reports a hold as `status: "takeout"` with the reason in `hold`
+(`docs/RETAIL_API.md`).
+
+**Cameras down.** Autodarts' own status can say ready on a board that
+cannot see: when the frames it reads stop for long enough its camera
+grabber gives up for good, and `/api/state` still says running. So while
+the oracle is on and connected, OD also reads Autodarts' per-camera frame
+rate (`GET <autodarts>/api/cams/stats`) every 2 s. Any camera at 0 fps for
+3 s makes `ad_board_status` (and `AD_BOARD_STATUS`'s `status`) read
+`cameras_down` in place of `ready`/`takeout`, and the hold `cameras`; it
+clears the moment every camera has frames again. `stopped` stands as it
+is. A failed read of the frame rate is not `cameras_down`. OD only reports
+it: nothing restarts Autodarts.
+
+The light shows every takeout; the scoring gate does not hold a dart for
+a takeout that began within 3 s of it landing -- Autodarts goes into
+takeout on the third throw it sees, often a moment before OD sees the
+same dart. The gate judges the oracle as the dart lands, not when it
+scores.

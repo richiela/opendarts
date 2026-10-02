@@ -105,6 +105,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
@@ -118,6 +119,7 @@ from opendarts.live.ad_ground_truth import (
     segment_to_sector_ring,
 )
 from opendarts.live.board_status import (
+    BOARD_STATUS_CAMERAS_DOWN,
     BOARD_STATUS_READY,
     BOARD_STATUS_STOPPED,
     BOARD_STATUS_TAKEOUT,
@@ -177,6 +179,45 @@ AD_LEAD_EPSILON_SEC = 0.5
 #: order of magnitude tighter than the legacy 12s nearest-in-time window
 #: that let this through.
 AD_ORDINAL_MAX_SKEW_SEC = 2.0
+
+#: How often the camera check asks Autodarts for its per-camera frame rate
+#: (``GET {ad_base}/api/cams/stats`` -> ``{"fps": [30, 29, 30], ...}``, the
+#: call its own dashboard makes).
+#:
+#: Why it exists, measured on the reference rig 2026-10-01: Autodarts there reads
+#: OpenDarts' virtual cameras. When OD's process went away for over a
+#: minute its camera grabber logged "reconnect: giving up" and never
+#: recovered -- yet /api/state kept saying running/"Throw" and
+#: /api/cams/state kept saying isOpened/isRunning, so the oracle light sat
+#: green on a board that could not see. The frame rate is the one honest
+#: signal: it read [0, 0, 0] within 5 s of the frames stopping.
+AD_CAMS_POLL_INTERVAL_SEC = 2.0
+
+#: How long a camera must read 0 fps before the board counts as blind. Long
+#: enough that one late sample is not an outage, short enough that the
+#: light turns red while someone is still looking at it.
+AD_CAMS_DOWN_AFTER_SEC = 3.0
+
+#: Autodarts' "Camera standby time" choices, in minutes (``motion.
+#: standby_minutes`` in its /api/config; its dashboard offers exactly
+#: these). OpenDarts' idle timeout is the one setting: Autodarts' standby
+#: follows it, so the oracle neither stands itself down while OD is still
+#: playing nor stays up long after OD has stopped (rla, 2026-10-01).
+AD_STANDBY_CHOICES_MIN = (5, 10, 15, 30, 60)
+
+
+def standby_minutes_for(idle_timeout_sec: "int | None") -> "int | None":
+    """Autodarts' standby for OD's idle timeout: the smallest choice that is
+    at least as long, so Autodarts never stands down before OD does; 60 when
+    OD's is longer still. None when OD has no idle timeout (0 = never idles
+    out) -- nothing to match, so Autodarts is left as it is."""
+    if idle_timeout_sec is None or idle_timeout_sec <= 0:
+        return None
+    minutes = -(-int(idle_timeout_sec) // 60)
+    for choice in AD_STANDBY_CHOICES_MIN:
+        if choice >= minutes:
+            return choice
+    return AD_STANDBY_CHOICES_MIN[-1]
 
 
 def _http_to_ws(url: str) -> str:
@@ -309,6 +350,18 @@ class AdWsListener:
         #: real transition). Drives the stuck-in-takeout warning.
         self._board_status_since: "datetime | None" = None
         self._board_state_raw: dict[str, Any] | None = None
+        # The camera check (see AD_CAMS_POLL_INTERVAL_SEC): last frame rates
+        # read, since when a camera has read 0 (monotonic), and whether that
+        # has lasted long enough to call the board blind. Kept apart from
+        # _board_status, which stays what Autodarts itself says.
+        self._cams_fps: "list[float] | None" = None
+        self._cams_zero_since: "float | None" = None
+        self._cams_down = False
+        self._cams_thread: threading.Thread | None = None
+        # Where OD's idle timeout (seconds) is read from, for the camera
+        # standby sync (sync_camera_standby). Set by whoever owns the
+        # capture loop; None means do not sync.
+        self._standby_source: "Callable[[], int | None] | None" = None
         # Diagnostics-only bookkeeping (2026-08-16, "persist real
         # diagnostics" task -- see docs/DESIGN.md): survives a buffer clear so
         # a caller reading diagnostics_snapshot() AFTER a clear can still
@@ -337,6 +390,10 @@ class AdWsListener:
             target=self._run, name="opendarts-ad-ws-listener", daemon=True
         )
         self._thread.start()
+        self._cams_thread = threading.Thread(
+            target=self._run_cams_check, name="opendarts-ad-cams-check", daemon=True
+        )
+        self._cams_thread.start()
 
     def stop(self, timeout: float = 3.0) -> None:
         """Signals the background thread to stop and joins it (bounded --
@@ -354,6 +411,9 @@ class AdWsListener:
                     timeout,
                 )
             self._thread = None
+        if self._cams_thread is not None:
+            self._cams_thread.join(timeout=timeout)
+            self._cams_thread = None
         self._set_connected(False)
 
     # -- runtime configuration -------------------------------------------
@@ -433,6 +493,113 @@ class AdWsListener:
         if callback is not None:
             callback(BOARD_STATUS_STOPPED)
 
+    # -- controlling the board ---------------------------------------------
+
+    #: Autodarts' own board controls, exactly as its dashboard calls them on
+    #: a local board (``localAxios``, base ``<board>/api``): start and stop
+    #: are PUTs, reset is a POST, and calibrate is its "Calibrate" button's
+    #: POST /config/calibration/auto. Read from the board manager's own
+    #: bundle on :3180, 2026-09-27.
+    CONTROLS = {"start": ("PUT", "/api/start"), "stop": ("PUT", "/api/stop"),
+                "reset": ("POST", "/api/reset"),
+                "calibrate": ("POST", "/api/config/calibration/auto")}
+    #: Autodarts answers a calibration only when it has finished one, which
+    #: takes it far longer than a start or a stop.
+    CONTROL_TIMEOUTS = {"calibrate": 90.0}
+
+    def control(self, action: str, timeout: float | None = None) -> dict[str, Any]:
+        """Start, stop, reset or calibrate Autodarts' board. Never raises:
+        the answer says whether AD accepted it. Refused when AD is switched
+        off -- the same "do not contact AD at all" rule as every other
+        caller."""
+        if timeout is None:
+            timeout = self.CONTROL_TIMEOUTS.get(action, 10.0)
+        if action not in self.CONTROLS:
+            return {"ok": False, "action": action, "error": f"unknown action {action!r}"}
+        base = self.oracle_base_url()
+        if base is None:
+            return {"ok": False, "action": action, "error": "Autodarts is switched off"}
+        from urllib.error import HTTPError
+        from urllib.request import Request, urlopen
+
+        method, path = self.CONTROLS[action]
+        url = base.rstrip("/") + path
+        try:
+            with urlopen(Request(url, data=b"" if method != "GET" else None, method=method),
+                         timeout=timeout) as resp:
+                code = resp.status
+        except HTTPError as exc:
+            return {"ok": False, "action": action, "status": exc.code,
+                    "error": f"Autodarts answered HTTP {exc.code}"}
+        except Exception as exc:  # noqa: BLE001 -- a control must never raise into the server
+            return {"ok": False, "action": action, "error": f"could not reach Autodarts: {exc}"}
+        log.info("AD control: %s -> HTTP %s (%s %s)", action, code, method, url)
+        return {"ok": 200 <= code < 300, "action": action, "status": code}
+
+    # -- camera standby ----------------------------------------------------
+
+    def set_standby_source(self, source: "Callable[[], int | None] | None") -> None:
+        """Where to read OD's idle timeout (seconds) for the camera standby
+        sync. Syncs at once when already connected, since the connect-time
+        sync may have run before this was set."""
+        with self._lock:
+            self._standby_source = source
+        if source is not None and self.is_connected():
+            self.sync_camera_standby_async()
+
+    def sync_camera_standby_async(self, idle_timeout_sec: "int | None" = None) -> None:
+        """sync_camera_standby() on its own short-lived thread, so neither
+        the event socket nor an HTTP request waits on Autodarts."""
+        threading.Thread(
+            target=self.sync_camera_standby, args=(idle_timeout_sec,),
+            name="ad-standby-sync", daemon=True,
+        ).start()
+
+    def sync_camera_standby(self, idle_timeout_sec: "int | None" = None) -> dict[str, Any]:
+        """Set Autodarts' camera standby to match OD's idle timeout (see
+        AD_STANDBY_CHOICES_MIN), only when it differs. Never raises; a
+        failure is logged and dropped -- the next connect tries again."""
+        base = self.oracle_base_url()
+        if base is None:
+            return {"ok": False, "reason": "Autodarts is switched off"}
+        if idle_timeout_sec is None:
+            with self._lock:
+                source = self._standby_source
+            if source is None:
+                return {"ok": False, "reason": "no idle timeout to match"}
+            idle_timeout_sec = source()
+        target = standby_minutes_for(idle_timeout_sec)
+        if target is None:
+            log.info("AD camera standby left as it is: OD has no idle timeout")
+            return {"ok": True, "changed": False, "reason": "OD never idles out"}
+        if idle_timeout_sec > AD_STANDBY_CHOICES_MIN[-1] * 60:
+            log.warning("AD camera standby: OD's idle timeout (%d min) is longer than Autodarts "
+                        "allows; using %d min", -(-int(idle_timeout_sec) // 60), target)
+        from urllib.request import Request, urlopen
+
+        url = base.rstrip("/") + "/api/config"
+        try:
+            with urlopen(Request(url), timeout=5) as resp:
+                current = (json.loads(resp.read()).get("motion") or {}).get("standby_minutes")
+        except Exception as exc:  # noqa: BLE001 -- never break the listener
+            log.info("AD camera standby not checked (could not read its config: %s)", exc)
+            return {"ok": False, "reason": f"could not read Autodarts' config: {exc}"}
+        if current == target:
+            return {"ok": True, "changed": False, "standby_minutes": target}
+        body = json.dumps({"motion": {"standby_minutes": target}}).encode()
+        try:
+            with urlopen(Request(url, data=body, method="PATCH",
+                                 headers={"Content-Type": "application/json"}), timeout=5) as resp:
+                code = resp.status
+        except Exception as exc:  # noqa: BLE001 -- never break the listener
+            log.info("AD camera standby not changed (%s -> %s min failed: %s)", current, target, exc)
+            return {"ok": False, "reason": f"Autodarts refused: {exc}"}
+        if not 200 <= code < 300:
+            log.info("AD camera standby not changed (%s -> %s min: HTTP %s)", current, target, code)
+            return {"ok": False, "reason": f"Autodarts answered HTTP {code}"}
+        log.info("AD camera standby: %s -> %s min, to match OD's idle timeout", current, target)
+        return {"ok": True, "changed": True, "standby_minutes": target, "was": current}
+
     # -- status ----------------------------------------------------------
 
     def is_connected(self) -> bool:
@@ -451,6 +618,8 @@ class AdWsListener:
                 "last_error": self._last_error,
                 "buffered_events": len(self._buffer),
                 "connect_count": self._connect_count,
+                "cams_fps": self._cams_fps,
+                "cams_down": self._cams_down,
             }
 
     def latest_events(self) -> list[AdWsThrow]:
@@ -540,6 +709,11 @@ class AdWsListener:
             if error is not None:
                 self._last_error = error
             callback = self._on_connection_change if changed else None
+            if not value:
+                # A blind board is a fact about a live connection; offline
+                # is its own state, and a reconnect starts the check fresh.
+                self._cams_zero_since = None
+                self._cams_down = False
         # Outside the lock, like _update_board_status(): the sink may block
         # and nothing reading is_connected() should wait on it. Only on a
         # real transition -- the reconnect loop re-reports "not connected"
@@ -552,7 +726,16 @@ class AdWsListener:
         None) -- the Scoring tab's AD indicator light, 2026-08-14. Pure
         in-memory read, no network call."""
         with self._lock:
-            return self._board_status, self._board_state_raw
+            return self._effective_status_locked(), self._board_state_raw
+
+    def _effective_status_locked(self) -> str:
+        """What the board can actually do: Autodarts' own status, except
+        that a board it calls ready or in takeout whose cameras deliver
+        nothing is ``cameras_down``. Stopped and unknown stand as they are.
+        Caller holds self._lock."""
+        if self._cams_down and self._board_status in (BOARD_STATUS_READY, BOARD_STATUS_TAKEOUT):
+            return BOARD_STATUS_CAMERAS_DOWN
+        return self._board_status
 
     def board_status_age_sec(self) -> "float | None":
         """Seconds since the board last CHANGED status, or None if it has
@@ -684,6 +867,7 @@ class AdWsListener:
         with self._lock:
             changed = new_status != self._board_status
             previous = self._board_status
+            previous_effective = self._effective_status_locked()
             self._board_status = new_status
             # WHEN it entered this status, so "how long has it been here"
             # is answerable. Takeout is normal for a few seconds and a
@@ -694,7 +878,10 @@ class AdWsListener:
             if changed:
                 self._board_status_since = datetime.now(timezone.utc)
             self._board_state_raw = data
-            if changed and self._on_status_change is not None:
+            effective = self._effective_status_locked()
+            # Pushed is what a light should show: while the cameras are
+            # down a ready<->takeout flip changes nothing visible.
+            if effective != previous_effective and self._on_status_change is not None:
                 callback = self._on_status_change
         # Logged, not just pushed. Until 2026-09-10 `changed` existed
         # solely to repaint the dashboard's AD indicator, so AD's state
@@ -711,7 +898,69 @@ class AdWsListener:
                 previous, new_status, event, data.get("status"), running, n,
             )
         if callback is not None:
-            callback(new_status)
+            callback(effective)
+
+    # -- the camera check ---------------------------------------------------
+
+    def _read_cams_fps(self) -> "list[float] | None":
+        """Autodarts' per-camera frame rate, or None when it could not be
+        read. A failed read is not a blind board: an unreachable Autodarts
+        is the connection's business (offline), not this check's."""
+        with self._lock:
+            base = self.base_url
+        try:
+            from urllib.request import urlopen
+
+            with urlopen(base.rstrip("/") + "/api/cams/stats", timeout=AD_CAMS_POLL_INTERVAL_SEC) as resp:
+                fps = json.loads(resp.read()).get("fps")
+        except Exception as exc:  # noqa: BLE001 -- the check must never break the listener
+            log.debug("AD camera check: stats not read: %s", exc)
+            return None
+        if not isinstance(fps, list) or not fps:
+            return None
+        try:
+            return [float(f) for f in fps]
+        except (TypeError, ValueError):
+            return None
+
+    def note_cams_fps(self, fps: "list[float]", now: float) -> None:
+        """Fold one frame-rate reading in (``now``: monotonic seconds).
+        Any camera at 0 for AD_CAMS_DOWN_AFTER_SEC makes the board blind;
+        every camera above 0 clears it at once."""
+        callback = None
+        with self._lock:
+            before = self._effective_status_locked()
+            was_down = self._cams_down
+            self._cams_fps = list(fps)
+            if any(f <= 0 for f in fps):
+                if self._cams_zero_since is None:
+                    self._cams_zero_since = now
+                self._cams_down = now - self._cams_zero_since >= AD_CAMS_DOWN_AFTER_SEC
+            else:
+                self._cams_zero_since = None
+                self._cams_down = False
+            now_down = self._cams_down
+            after = self._effective_status_locked()
+            if after != before and self._on_status_change is not None:
+                callback = self._on_status_change
+        if now_down and not was_down:
+            log.info("AD cameras down: fps %s for %.0f s -- the board cannot see",
+                     [round(f) for f in fps], AD_CAMS_DOWN_AFTER_SEC)
+        elif was_down and not now_down:
+            log.info("AD cameras back: fps %s", [round(f) for f in fps])
+        if callback is not None:
+            callback(after)
+
+    def _run_cams_check(self) -> None:
+        """Ask for the frame rate every AD_CAMS_POLL_INTERVAL_SEC while the
+        oracle is on and connected. Its own thread, so a slow stats call
+        never delays the event socket (throws are timestamped on receipt)."""
+        while not self._stop_event.wait(AD_CAMS_POLL_INTERVAL_SEC):
+            if not (self.is_enabled() and self.is_connected()):
+                continue
+            fps = self._read_cams_fps()
+            if fps is not None:
+                self.note_cams_fps(fps, time.monotonic())
 
     # -- connect / receive loop ------------------------------------------
 
@@ -745,6 +994,10 @@ class AdWsListener:
                     log.info("AD WS listener connected (%s)", self.ws_url)
                     backoff = 1.0
                     self._hydrate_board_status()
+                    with self._lock:
+                        sync = self._standby_source is not None
+                    if sync:
+                        self.sync_camera_standby_async()
                     while not self._stop_event.is_set():
                         try:
                             raw = ws.recv(timeout=self._recv_timeout_s)
