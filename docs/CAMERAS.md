@@ -151,3 +151,50 @@ detail the camera never sent; it would just cost 7.4× the disk. The only reason
 a macOS rig encodes its own JPEG instead of keeping the camera's is that the
 originals cannot be reached, which is a capture-path limitation and not a
 property of the hardware.
+
+## Frame-set sync
+
+The three pictures a tick judges must show the same moment. Until
+2026-10-11 one thread read every camera in lockstep, one blocking read per
+camera per cycle; a camera's own driver queue of frames then backed up on
+another camera's account, and once a queue had filled (one late read is
+enough) it stayed full, because the pump then took one frame a cycle as
+the camera added one. That camera's frames were then several frames old
+for the rest of the session, while OD's own frame counts stayed equal. On
+one rig this put a camera 4 frames (128 ms) behind, and darts were
+committed before that camera had seen them. A drain-and-refuse patch
+followed (read again until fresh, then refuse to judge a set whose
+capture times spread too far) — and that blinded a *different* rig for
+about 6 minutes, because its drain threshold and its refusal threshold
+disagreed about what "behind" meant.
+
+**The redesign splits reading from choosing.** Each camera now has its
+own reader thread (`local-cam-reader-<slot>`), reading as fast as that
+camera delivers and never waiting on another camera — so no camera's
+driver queue can ever back up on another's account in the first place.
+Every frame is stamped with its arrival time and, when the platform gives
+a usable one, the driver's own capture time (`CAP_PROP_POS_MSEC`). Which
+frame of each camera makes a set is then a pure function of those
+stamps — `opendarts.live.set_assembly.Assembler` — run the same way on
+the rig, in the unit tests and in the trace simulator: sets follow the
+slowest camera; each camera contributes whichever of its recent frames
+is closest to that instant; a camera whose frames are stamped late is
+matched by the others **reaching back into their own short history** to
+the same instant, never refused; a camera that stops delivering is left
+out while the others keep going. There is no spread threshold to tune and
+nothing left to drain — see that module's own docstring for the full
+rule.
+
+**The clock.** Driver capture times are used only when every camera in a
+set has one and the platform's own value is trustworthy — V4L2 on Linux
+(`CAP_PROP_POS_MSEC` is `CLOCK_MONOTONIC`, the same clock
+`time.perf_counter()` reads there). Windows' own Media Foundation reader
+returns 0 here, and macOS's AVFoundation synthesises a value that is not
+on our clock at all, so both fall back to **arrival time** for every
+camera in the set — never driver time for some cameras and arrival for
+others in the same set. `GET /api/cameras/status` and
+`CameraHub.frame_set_sync()` report which clock the last set was judged
+on.
+
+To check a rig by hand: blink the board lights and see which camera's
+picture changes last.

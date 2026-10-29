@@ -460,11 +460,12 @@ def test_handle_ready_to_capture_zeus_primary_no_winner_leaves_rollup_null(tmp_p
     """Negative-path E2E confirmation: the existing no-real-sub-engine-
     winner scenario (trivial frames, no stubbing) already used by
     test_package_schema_v2_result_fields.py -- primary_engine_diagnostics
-    IS threaded through (Zeus's own real 0/4 diagnostics), but since
-    there's no winning_engine at all, the rollup correctly stays at its
-    honest "not populated" defaults, exactly as before this task --
-    `cameras_used` as `[]` (2026-08-27 null-vs-[] fix, list-typed field),
-    `triangulation`/`n_cameras_used` unchanged (neither is list-typed)."""
+    IS threaded through (Zeus's own real "0/5" diagnostics, 5 sub-engines
+    since Argus, 2026-10-08), but since there's no winning_engine at all,
+    the rollup correctly stays at its honest "not populated" defaults,
+    exactly as before this task -- `cameras_used` as `[]` (2026-08-27
+    null-vs-[] fix, list-typed field), `triangulation`/`n_cameras_used`
+    unchanged (neither is list-typed)."""
     bg = {0: np.full((4, 4, 3), 50, dtype=np.uint8)}
     frame = {0: np.full((4, 4, 3), 200, dtype=np.uint8)}
     calibrations = {0: _fake_calibration_attempt().calibration}
@@ -477,7 +478,7 @@ def test_handle_ready_to_capture_zeus_primary_no_winner_leaves_rollup_null(tmp_p
     )
 
     data = json.loads((dest_dir / "result.json").read_text())
-    assert data["agreement"] == "0/4"
+    assert data["agreement"] == "0/5"
     assert data["cameras_used"] == []
     assert data["n_cameras_used"] == 0
     assert data["triangulation"] is None

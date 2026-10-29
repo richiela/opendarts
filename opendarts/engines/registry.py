@@ -10,6 +10,7 @@ from __future__ import annotations
 from opendarts.engines.athena import AthenaEngine
 from opendarts.engines.apollo import ApolloEngine
 from opendarts.engines.ares import AresEngine
+from opendarts.engines.argus import ArgusEngine
 from opendarts.engines.talos import TalosEngine
 from opendarts.engines.zeus import ZeusEngine
 from opendarts.engines.zeus.engine import ZEUS_SUB_ENGINE_NAMES
@@ -26,12 +27,17 @@ ENGINES: dict[str, object] = {
     # module docstring for the full quote, reasoning, and real corpus
     # measurement, and docs/DESIGN.md's matching dated guardrail update.
     "Ares": AresEngine(),
-    # A majority-vote COMBINER over Apollo/Talos/Athena/Ares's own
+    # The visual hybrid scorer (opendarts.engines.argus): each camera's
+    # view of the needle tip (paint, map, visibility), refereed by the
+    # cameras' fused board position. 2026-10-08: Zeus's 5th voter, last
+    # in priority -- see opendarts/engines/zeus/engine.py's docstring.
+    "Argus": ArgusEngine(),
+    # A majority-vote COMBINER over Apollo/Talos/Athena/Ares/Argus's own
     # real outputs (opendarts.engines.zeus) -- not its own detector or
     # calibration consumer. Read opendarts/engines/zeus/engine.py's own top
     # docstring for the tie-break convention (Apollo always wins
     # a tie it's part of), the quorum gate (MIN_SUB_ENGINES_TO_VOTE=3 of
-    # 4, as of 2026-08-25), and the real corpus numbers -- the original
+    # 5, as of 2026-10-08), and the real corpus numbers -- the original
     # 3-engine 419/420 (data/archive/clean/, now-superseded corpus
     # location) is preserved there as historical record; the current
     # 4-engine config measures 612/614 on today's session corpus,
@@ -41,7 +47,7 @@ ENGINES: dict[str, object] = {
 
 # The engine used when nothing else has been configured. Zeus is the
 # consensus combiner -- it is the engine that gives the answer, with the
-# four detection engines feeding it.
+# five detection engines feeding it.
 DEFAULT_PRIMARY_ENGINE = "Zeus"
 
 # Also-run engines for a fresh config: Zeus's own sub-engines, so each

@@ -63,23 +63,40 @@ class _FakeResponse:
 
     def __init__(self, body: bytes, boundary: str = BOUNDARY) -> None:
         self._buf = io.BytesIO(body)
+        self._endless = isinstance(body, _Endless)
         self.headers = {"Content-Type": f"multipart/x-mixed-replace; boundary={boundary}"}
 
     def read(self, n: int = -1) -> bytes:
-        return self._buf.read(n)
+        data = self._buf.read(n)
+        if not data and self._endless:
+            # A camera does not run out of frames. Paced lightly so three
+            # readers do not spin a core between them.
+            time.sleep(0.002)
+            self._buf.seek(0)
+            data = self._buf.read(n)
+        return data
 
     def __enter__(self): return self
     def __exit__(self, *a): return False
 
 
 def _serve(monkeypatch, body: bytes) -> None:
-    """Every stream URL gets the same finite body, re-served on reconnect."""
+    """Every stream URL gets the same body, re-served on reconnect."""
     monkeypatch.setattr(remote_capture.urllib.request, "urlopen",
                         lambda *a, **k: _FakeResponse(body))
 
 
+class _Endless(bytes):
+    """A body _FakeResponse repeats for as long as it is read."""
+
+
 def _a_few_frames(n: int = 8) -> bytes:
-    return b"".join(_part(_jpeg()) for _ in range(n))
+    """A live stream: n frames, over and over, never ending.
+
+    A finite body made tests race their own reader thread: it could drain
+    every frame before the test acted, and a test that needed one more
+    delivery then waited on a stream that had ended."""
+    return _Endless(b"".join(_part(_jpeg()) for _ in range(n)))
 
 
 class _FakeVideoCapture:
@@ -267,7 +284,9 @@ def test_a_quiet_stream_gives_up_once_and_then_answers_immediately(monkeypatch):
     src = _source(monkeypatch, _part(_jpeg())) # exactly one frame, then quiet
     try:
         assert src.read() is not None, "the one real frame"
-        t0 = time.monotonic()
+        # From the frame's arrival, not from this read: the reader may have
+        # delivered it well before the first read() got to it.
+        t0 = src._last_frame_mono
         assert src.read() is None, "nothing more is coming"
         waited = time.monotonic() - t0
         assert waited >= remote_capture.STREAM_FRAME_WAIT_S * 0.5, (

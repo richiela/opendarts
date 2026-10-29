@@ -111,6 +111,7 @@ def dispatch_engines(
     registry: dict[str, object] | None = None,
     prior_board_xy_mm: tuple[tuple[float, float], ...] | list[tuple[float, float]] | None = None,
     prior_dart_line_px: "dict[int, tuple[tuple[float, float], tuple[float, float]]] | None" = None,
+    visit_bg_images: "dict[int, np.ndarray] | None" = None,
 ) -> dict[str, EngineResult]:
     """Runs every engine in `names` concurrently against the SAME inputs,
     each wrapped in the shared `timeout_s` deadline (see module
@@ -143,6 +144,12 @@ def dispatch_engines(
     `_call_engine_score()`'s existing signature-filtering, unchanged),
     every other engine in the batch unaffected. Default None -- zero
     behavior change for every existing caller.
+
+    `visit_bg_images` (added 2026-10-08, Argus): the visit's empty board
+    per camera -- the first dart's background (see
+    `opendarts.engines.argus.visit_context`). Forwarded the same way, only
+    to engines whose `score()` declares it (Argus directly, or Zeus
+    wrapping it). Default None.
     """
     registry = ENGINES if registry is None else registry
     results: dict[str, EngineResult] = {}
@@ -176,6 +183,8 @@ def dispatch_engines(
             extra_kwargs["prior_board_xy_mm"] = prior_board_xy_mm
         if prior_dart_line_px:
             extra_kwargs["prior_dart_line_px"] = prior_dart_line_px
+        if visit_bg_images:
+            extra_kwargs["visit_bg_images"] = visit_bg_images
         extra_kwargs = extra_kwargs or None
         future_to_name = {
             pool.submit(

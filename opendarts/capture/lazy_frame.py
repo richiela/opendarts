@@ -161,11 +161,25 @@ class LazyFrames(Mapping):
     with no JPEG (a pixels-only source) holds a plain array.
     """
 
-    __slots__ = ("_handles", "_jpegs", "_generations")
+    __slots__ = ("_handles", "_jpegs", "_generations", "in_sync", "sync_spread_ms",
+                "capture_ms", "stamp_clock")
 
     def __init__(self, handles: "Mapping[int, Any]",
                  jpegs: "Mapping[int, bytes] | None" = None,
-                 generations: "Mapping[int, int] | None" = None) -> None:
+                 generations: "Mapping[int, int] | None" = None,
+                 in_sync: bool = True, sync_spread_ms: "float | None" = None,
+                 capture_ms: "Mapping[int, float] | None" = None,
+                 stamp_clock: "str | None" = None) -> None:
+        #: whether these frames show the same moment -- the hub's frame-set
+        #: sync check (opendarts.live.set_assembly.Assembler, via
+        #: opendarts/live/local_capture.py)
+        self.in_sync = in_sync
+        self.sync_spread_ms = sync_spread_ms
+        #: slot -> capture time, on whichever clock `stamp_clock` names
+        #: ("driver" or "arrival" -- see set_assembly's "THE CLOCK"
+        #: section); diagnostics only, same shape as FrameSet.capture_ms.
+        self.capture_ms = dict(capture_ms or {})
+        self.stamp_clock = stamp_clock
         self._handles = dict(handles)
         self._jpegs = dict(jpegs or {})
         for cam, h in self._handles.items():

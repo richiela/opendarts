@@ -7,7 +7,6 @@ const VIEWS = ['play', 'throws', 'rig'];
 
 const Shell = (() => {
   let view = 'play';
-  const kiosk = new URLSearchParams(window.location.search).has('kiosk');
 
   // 'split' exists only on a display: Play and Throws side by side.
   function showing(name) {
@@ -18,7 +17,6 @@ const Shell = (() => {
   function go(name, opts) {
     const allowed = ROLE === 'display' ? ['play', 'throws', 'split'] : VIEWS;
     if (allowed.indexOf(name) < 0) name = 'play';
-    if (kiosk && ROLE !== 'display') name = 'play';
     view = name;
     document.body.dataset.view = name;
     const shown = name === 'split' ? ['play', 'throws'] : [name];
@@ -230,6 +228,7 @@ const Shell = (() => {
   $$('.views a').forEach((a) => a.addEventListener('click', (ev) => { ev.preventDefault(); go(a.dataset.view); }));
   window.addEventListener('hashchange', () => { if (ROLE !== 'display') fromHash(); });
   $('#status').addEventListener('click', () => { renderSession(); renderActivity(); sheet.open('sheet-session'); });
+  Lightbox.guard($('#link-logs'), 'Log');
   $$('.oracle-ind').forEach((el) => el.addEventListener('click', openOracle));
   $('#orc-toggle').addEventListener('click', () => {
     const o = oracleState();
@@ -289,7 +288,6 @@ const Shell = (() => {
     if (ROLE === 'display') {
       Display.start();
     } else {
-      if (kiosk) document.body.classList.add('kiosk');
       fromHash();
     }
     renderStatus();
@@ -419,6 +417,9 @@ function applyState(st) {
   if (st.calibration) S.calibration = st.calibration;
   if (st.engine_config) S.engineConfig = st.engine_config;
   if ('oracle_hold' in st) S.oracleHold = st.oracle_hold;
+  if (Array.isArray(st.oracle_mismatches) && st.oracle_mismatches.length) {
+    Play.oracleMismatch(st.oracle_mismatches[st.oracle_mismatches.length - 1], true);
+  }
   S.adBoard = {status: st.ad_board_status,
     since: typeof st.ad_board_status_age_sec === 'number' ? Date.now() - st.ad_board_status_age_sec * 1000 : null};
   emit('state'); emit('phase'); emit('visit'); emit('calibration'); emit('engines'); emit('adboard');
@@ -458,6 +459,7 @@ function connect() {
   ws.onmessage = (event) => {
     let m;
     try { m = JSON.parse(event.data); } catch (err) { return; }
+    liveGen++;   // anything the rig pushed is newer than a snapshot still on its way
     switch (m.type) {
       case 'HELLO':
         if (reloadIfStale(m.page_version)) return;
@@ -537,6 +539,9 @@ function connect() {
         if (ROLE === 'display') Display.onMessage(m);
         else emit('displays', m);
         break;
+      case 'ORACLE_MISMATCH':
+        Play.oracleMismatch(m, false);
+        break;
       case 'IDLE_TIMEOUT':
         S.idleStopped = {sec: m.idle_timeout_sec};
         activity('Auto-stop', 'ok', 'no darts for ' + duration(m.idle_timeout_sec));
@@ -548,16 +553,38 @@ function connect() {
   };
 }
 
+// Bumped by every message the rig pushes. A /api/state snapshot fetched
+// before a push is older than it, and applying it afterwards would undo
+// it: the page that reloaded for a deploy, then heard Start (pressed
+// elsewhere) while its long packages fetch was still running, applied the
+// pre-Start snapshot last and sat on "Warming up" with the rig ready.
+let liveGen = 0;
 async function loadInitial() {
+  const gen = liveGen;
   try {
-    const [st, pk] = await Promise.all([api.get('/api/state'), api.get('/api/packages')]);
-    applyState(st);
+    const stP = api.get('/api/state').then((st) => { if (liveGen === gen) applyState(st); });
+    const pk = await api.get('/api/packages');
     if (Array.isArray(pk)) Throws.ingest(pk);
+    await stP;
   } catch (err) { console.error('initial load failed', err); }
   Rig.refreshConfig();
   Rig.refreshHealth();
   Play.loadRecent();
 }
+
+// A safety net under every push: the rig says nothing more until the next
+// change, so a lost or overwritten one would leave the page on a phase the
+// rig left long ago. "Warming up" is only ever a moment; if the page is
+// still on it after a few seconds, it asks the rig.
+let warmingSince = 0;
+setInterval(() => {
+  if (!S.connected || rigPhase().key !== 'warming') { warmingSince = 0; return; }
+  if (!warmingSince) { warmingSince = Date.now(); return; }
+  if (Date.now() - warmingSince < 4000) return;
+  warmingSince = Date.now();
+  const gen = liveGen;
+  api.get('/api/state').then((st) => { if (st && st.capture_loop && liveGen === gen) applyState(st); }).catch(() => {});
+}, 1000);
 
 Shell.start();
 Sound.start();

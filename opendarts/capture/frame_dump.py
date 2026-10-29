@@ -227,6 +227,12 @@ def _manifest_for(
                 # re-served the previous frame" from "the camera produced
                 # a new frame that happens to look the same".
                 "repeat_of_earlier_set": seen is not None,
+                # Additive, optional (opendarts.live.set_assembly): this
+                # camera's own capture time for this frame, on the set's
+                # `clock`. None for a slot the set carries no capture_ms
+                # for (an older recording, a stream, or a platform with no
+                # usable driver timestamp).
+                "capture_ms": fs.capture_ms.get(slot),
             }
             frames_out.append(entry)
             n_frames += 1
@@ -246,6 +252,11 @@ def _manifest_for(
                 # the 2026-09-15 incident that rule comes from.
                 "wall_s": fs.wall_s,
                 "monotonic_s": fs.monotonic_s,
+                # Additive, optional: "driver" or "arrival" -- which clock
+                # this set's per-frame capture_ms values are on (see
+                # opendarts.live.set_assembly's "THE CLOCK" section); None
+                # when none of this set's frames carry one.
+                "clock": fs.clock,
                 "frames": frames_out,
             }
         )

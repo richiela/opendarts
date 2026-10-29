@@ -77,7 +77,7 @@ everything runs on one machine.
 
 ## How the scoring works
 
-Four engines score every throw independently. They are not variations on
+Five engines score every throw independently. They are not variations on
 one idea — each starts from a different piece of evidence, so they tend to
 fail in different situations rather than all at once.
 
@@ -107,10 +107,18 @@ for the spot where those lines agree. It deliberately ignores the flight,
 which is wide, brightly coloured, and drags the fitted line off by
 millimetres if you let it into the measurement.
 
-**Zeus** is not a fifth engine — it is the combiner that runs the other
-four against the same frames and takes the `(sector, ring)` most of them
+**Argus — what each camera sees at the tip.**
+Each camera reports the bed under its view of the needle tip, by the board
+paint there as well as by the calibration map, with a confidence built from
+how clearly it saw the needle (and whether the needle enters over a dart
+thrown earlier in the visit). The cameras' tip positions, fused on the
+board, then referee that vote: a call the geometry cannot reach is
+overruled.
+
+**Zeus** is not a sixth engine — it is the combiner that runs the other
+five against the same frames and takes the `(sector, ring)` most of them
 returned, with Apollo holding the tie-break. It needs answers from at least
-three of the four. Zeus is what scores a throw by default.
+three of the five. Zeus is what scores a throw by default.
 
 See `docs/ENGINES.md` for the interface and how to add one.
 

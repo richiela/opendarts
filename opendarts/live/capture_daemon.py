@@ -294,6 +294,7 @@ from opendarts.capture.calibration_package import (
 from opendarts.capture import clip
 from opendarts.capture.lazy_frame import LazyFrame, LazyFrames, handles_of
 from opendarts.capture.board_disc import (
+    get_calibrated_board_calibrations,
     get_calibrated_board_disc_masks,
     set_calibrated_board_disc_masks,
 )
@@ -316,6 +317,12 @@ from opendarts.engines.apollo.prior_dart_context import (
     PriorDartLinePx,
     engine_accepts_prior_dart_line_px,
     find_prior_dart_line_px,
+)
+from opendarts.engines.argus.visit_context import (
+    CachedVisitStart,
+    VisitBgImages,
+    engine_accepts_visit_bg_images,
+    find_visit_bg_images,
 )
 from opendarts.engines.dispatch import DEFAULT_ENGINE_TIMEOUT_S, dispatch_engines
 from opendarts.engines.talos.prior_dart import (
@@ -4414,7 +4421,7 @@ def _bootstrap_calibrations_unlocked(
                 )
                 continue
             board_disc_masks[cam] = mask
-        set_calibrated_board_disc_masks(board_disc_masks or None)
+        set_calibrated_board_disc_masks(board_disc_masks or None, best_calibration)
     except Exception: # noqa: BLE001 -- never break calibration over this
         log.exception(
             "live per-camera board-disc mask derivation failed -- no throw "
@@ -5423,6 +5430,7 @@ class CalibrationStore:
                         self._snapshot_path)
             return None
         package_id = raw.get("package_id")
+        self._attach_saved_fit(calibrations, package_id)
 
         from opendarts.geometry.board import set_ring_boundary_offsets
         from opendarts.geometry.board_color import set_board_color_thresholds
@@ -5452,7 +5460,7 @@ class CalibrationStore:
                 mask = board_disc_mask(calib, IMAGE_WIDTH, IMAGE_HEIGHT)
                 if mask is not None:
                     board_disc_masks[cam] = mask
-            set_calibrated_board_disc_masks(board_disc_masks or None)
+            set_calibrated_board_disc_masks(board_disc_masks or None, calibrations)
         except Exception: # noqa: BLE001 -- a bad snapshot must not break startup
             log.exception(
                 "%s: board-disc mask re-derivation from the persisted calibration "
@@ -5469,6 +5477,36 @@ class CalibrationStore:
             self._snapshot_path, len(calibrations), checked_at_utc, package_id,
         )
         return calibrations, "persisted", checked_at_utc, package_id
+
+    def _attach_saved_fit(self, calibrations: "dict[int, CameraCalibration]",
+                          package_id: "str | None") -> None:
+        """Give a loaded calibration back the fit quality it was solved
+        with, so the dashboard shows each camera's reprojection error
+        instead of a bare "Calibrated". The snapshot holds only the pose;
+        the calibration package it names (beside the snapshot) recorded
+        the error per camera when it was made. Display only: nothing that
+        scores reads `pnp_result`. Best-effort -- a missing or unreadable
+        package leaves the error unknown, as before."""
+        if not package_id or self._snapshot_path is None:
+            return
+        try:
+            derived = json.loads(
+                (self._snapshot_path.parent / package_id / "derived_calibration.json").read_text())
+            cams = derived.get("cameras") or {}
+        except (OSError, ValueError, AttributeError):
+            return
+        from opendarts.calibration.pnp import PnpResult
+
+        for cam, calib in calibrations.items():
+            fit = cams.get(str(cam))
+            err = fit.get("reprojection_error_px") if isinstance(fit, dict) else None
+            if not isinstance(err, (int, float)):
+                continue
+            calib.pnp_result = PnpResult(
+                ok=True, rvec=calib.rvec, tvec=calib.tvec,
+                reprojection_error_px=float(err),
+                landmark_spread_ok=calib.landmark_spread_ok,
+            )
 
     def _save_snapshot(self) -> None:
         """Write the CURRENT calibrations (already held under `self._lock`
@@ -6469,6 +6507,7 @@ def _dispatch_also_run_engines_in_background(
     on_event: "Callable[[dict[str, Any]], None] | None" = None,
     prior_dart_line_px: "dict[int, tuple[tuple[float, float], tuple[float, float]]] | None" = None,
     reused_sub_results: "dict[str, EngineResult] | None" = None,
+    visit_bg_images: "VisitBgImages | None" = None,
 ) -> None:
     """Runs every "also-run" engine CONCURRENTLY (opendarts.engines.dispatch.
     dispatch_engines(), each own thread, each held to `timeout_s`) on a
@@ -6551,6 +6590,7 @@ def _dispatch_also_run_engines_in_background(
                     timeout_s=timeout_s,
                     prior_dart_line_px=prior_dart_line_px,
                     prior_board_xy_mm=priors or None,
+                    visit_bg_images=visit_bg_images,
                 )
                 if names_to_dispatch
                 else {}
@@ -6766,6 +6806,11 @@ def handle_ready_to_capture(
     own_tip_line_px_out: "dict[str, PriorDartLinePx] | None" = None,
     background_save: bool = True,
     store_packages: bool = True,
+    # The current visit's first throw's background frames, kept in memory
+    # by the capture loop (2026-10-08, Argus's occlusion check -- see
+    # opendarts.engines.argus.visit_context). None falls back to loading
+    # the visit's first package from disk, exactly as replay does.
+    cached_visit_start: "CachedVisitStart | None" = None,
     # The free-space floor, in GB, below which a throw package is
     # SKIPPED rather than written -- None means the code default (see
     # opendarts.disk_space.DEFAULT_MIN_FREE_DISK_GB, 5 GB), 0 means the
@@ -7038,9 +7083,18 @@ def handle_ready_to_capture(
             package_root / session_id, visit_id, visit_index,
             cached_frames=cached_prior_frames,
         )
+        # 2026-10-08 -- the visit's empty board for Argus (Zeus forwards
+        # it to its Argus sub-call). Same shared lookup as replay; the
+        # loop's in-memory copy of the first throw's background means no
+        # disk read, and no race with that throw's background save.
+        primary_kwargs: dict[str, Any] = {"prior_dart_line_px": prior_dart_line_px}
+        if engine_accepts_visit_bg_images(primary_engine):
+            primary_kwargs["visit_bg_images"] = find_visit_bg_images(
+                package_root / session_id, visit_id, visit_index,
+                cached=cached_visit_start,
+            )
         engine_result = primary_engine.score(
-            bg_images, dict(current_frames), calibrations,
-            prior_dart_line_px=prior_dart_line_px,
+            bg_images, dict(current_frames), calibrations, **primary_kwargs,
         )
     else:
         engine_result = primary_engine.score(bg_images, dict(current_frames), calibrations)
@@ -7588,11 +7642,22 @@ def handle_ready_to_capture(
                         package_root / session_id, visit_id, visit_index,
                         cached_frames=cached_prior_frames,
                     )
+                # Same rule for the visit's empty board (Argus).
+                also_run_visit_bg_images = None
+                if any(
+                    engine_accepts_visit_bg_images(get_engine(name))
+                    for name in also_run if name not in reused_sub_results
+                ):
+                    also_run_visit_bg_images = find_visit_bg_images(
+                        package_root / session_id, visit_id, visit_index,
+                        cached=cached_visit_start,
+                    )
                 _dispatch_also_run_engines_in_background(
                     dest_dir, bg_images, dict(current_frames), calibrations,
                     primary_name, also_run, engine_config.timeout_s,
                     session_id=session_id, on_event=on_event,
                     prior_dart_line_px=also_run_prior_dart_line_px,
+                    visit_bg_images=also_run_visit_bg_images,
                     reused_sub_results=reused_sub_results,
                 )
         except Exception: # noqa: BLE001 -- see this function's own docstring:
@@ -8112,13 +8177,21 @@ def _build_lifecycle_driver(
 
     kwargs: dict = {}
     if ad_ws_listener is not None:
+        from opendarts.lifecycle.state import Action, Phase
+
         kwargs["hold"] = hold_reason_provider(ad_ws_listener)
+        # A Start's oracle start (or reset) waits for a still, empty board:
+        # the cabinet's lights come on as capture starts and the cameras
+        # take a moment to settle (AdWsListener.start_when_board_ready).
+        kwargs["on_tick"] = lambda tick: ad_ws_listener.board_tick(
+            tick.phase is Phase.IDLE and tick.action is Action.NONE and tick.dart_count == 0)
     if lifecycle_settings_store is not None:
         kwargs["config"] = lifecycle_settings_store.get()
         kwargs["config_provider"] = lifecycle_settings_store.get
     return LifecycleDriver(
         log_dir=DEFAULT_LOG_DIR,
         masks_provider=get_calibrated_board_disc_masks,
+        calibrations_provider=get_calibrated_board_calibrations,
         save_commit_frames=False,
         **kwargs,
     )
@@ -8812,6 +8885,12 @@ def run_capture_loop_body(
     # and falls through to the disk path exactly like a fresh `None`
     # would, never risking a wrong-throw's frames being used silently.
     cached_prior_frames: "CachedPriorThrowFrames | None" = None
+    # The current visit's first throw's background frames (2026-10-08,
+    # Argus): every later dart of the visit is scored against this
+    # empty-board picture. Replaced on each visit's first dart; a stale
+    # entry from an earlier visit fails find_visit_bg_images()'s visit_id
+    # check and falls through to the disk lookup.
+    cached_visit_start: "CachedVisitStart | None" = None
 
     # FRAME-FRESHNESS GATE state (see MAX_FRAME_FRESHNESS_WAIT_S's own
     # comment for the full incident/mechanism writeup) -- per-camera, and
@@ -9329,6 +9408,14 @@ def run_capture_loop_body(
             )
             continue
 
+        # FRAME-SET SYNC: a set's pictures are matched by capture time
+        # before this loop ever sees them -- opendarts.live.set_assembly.
+        # Assembler, fed by per-camera reader threads in local_capture.py.
+        # A camera that stalls is handled by the freshness gate below
+        # (frame_count), not by refusing the set outright: a refusal here
+        # once blinded a rig for ~6 minutes when its own drain and refusal
+        # thresholds disagreed about what "behind" meant.
+
         prev_state = trigger.state
         prev_dart_count = trigger.dart_count
         _t_lifecycle_start = time.perf_counter() if _diag_on else None
@@ -9554,6 +9641,7 @@ def run_capture_loop_body(
                 calibration_package_id=current_package_id,
                 cached_prior_frames=cached_prior_frames,
                 own_tip_line_px_out=own_tip_line_px_out,
+                cached_visit_start=cached_visit_start,
                 background_save=background_save,
                 store_packages=store_packages,
                 min_free_disk_gb=min_free_disk_gb,
@@ -9649,6 +9737,14 @@ def run_capture_loop_body(
                 precomputed_tip_line=own_tip_line_px_out.get("own_tip_line_px"),
                 precomputed_tip_line_out=own_tip_line_px_out,
             )
+            # The visit's first dart: its background is the empty board
+            # the visit's later darts are checked against (Argus). Same
+            # frames and filter as cached_prior_frames above.
+            if trigger.dart_count - 1 == 0 and visit_id is not None:
+                cached_visit_start = CachedVisitStart(
+                    visit_id=visit_id,
+                    bg_frames={cam: frame for cam, frame in bg_frames.items() if cam in current_frames},
+                )
             # handle_ready_to_capture() ALWAYS saves a package regardless of
             # the live score's ok status (docs/DESIGN.md's "Replay is the source of truth"); nothing
             # below depends on `result.ok`. The lifecycle has already

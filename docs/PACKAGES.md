@@ -24,6 +24,7 @@ holds the frames. There are no image files.
 | `capture_diagnostics.json` | ~2 KB | timings, the settle decision, board-disc state |
 | `meta.json` | ~1 KB | session, capture time, visit and throw numbers, calibration package id, and the `video` block that says which file holds each camera's frames and where the two scored frames sit inside it |
 | `ad_ground_truth.json` | ~0.8 KB | what Autodarts called the same throw, if the oracle was on |
+| `rescore.json` | ~2 KB | added later, off the rig: the score from each code version it has been **rescored** with — see [Rescores](#rescores) |
 
 Clip sizes are from a Linux rig; they scale with the JPEG size of each
 frame, so they vary with the camera and resolution.
@@ -164,3 +165,22 @@ the only way to tell whether a change made scoring better or worse. If you
 want packages but not the clip storage, set
 `video_record_mode` to `mismatch` or `never` rather than turning packages off
 entirely.
+
+## Rescores
+
+`result.json` is what OpenDarts scored live and never changes. To ask
+whether a dart is *still* wrong, or which change fixed it, each package can
+also carry `rescore.json`: one entry per code version it was rescored with,
+in commit order. Each entry holds the truth (the operator's correction,
+else the oracle's matched call), the oracle's call, the final call and every
+engine's call with its tip position, and which of them were right.
+
+    .venv/bin/python3 -m opendarts.capture.rescore_store            # rescore at the current commit
+    .venv/bin/python3 opendarts/capture/rescore_store.py --code-root <checkout of an older commit>
+
+A run skips packages already rescored at that commit, uses every core but
+one (about 45 s for 4,000 darts), and appends one line to
+`data/rescore_reports/rescore_history.jsonl`: accuracy per engine, how often
+the oracle matched the operator's corrections, and which darts turned right
+or wrong since the previous version. `first_right_version(pkg)` gives the
+commit that fixed a dart.

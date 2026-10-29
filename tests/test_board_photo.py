@@ -88,6 +88,20 @@ def test_the_photo_reproduces_the_board_straight_on(cals):
     assert np.percentile(err, 95) < 12.0
 
 
+def test_low_cameras_do_not_darken_the_centre():
+    # Cameras set low and wide, ~400 mm out at ~210 mm: every one sees the
+    # bull at a cosine near 0.46, and the blend's 40th power of that
+    # (~1e-14) used to underflow the weights, rendering the centre black.
+    low = {0: (348.0, 196.0, 205.0), 1: (-3.0, -413.0, 213.0), 2: (-343.0, 198.0, 206.0)}
+    cals = {cam: _looking_at_bull(c) for cam, c in low.items()}
+    grey = np.full((TEX_N, TEX_N, 3), 200, np.uint8)
+    frames = {cam: _camera_view(grey, cal) for cam, cal in cals.items()}
+    photo = bp.BoardPhotoMaps(cals, {cam: (W, H) for cam in cals}).render(frames).astype(np.float32)
+    ys, xs = np.mgrid[0:bp.SIZE_PX, 0:bp.SIZE_PX]
+    centre = np.hypot(xs - bp.SIZE_PX / 2, ys - bp.SIZE_PX / 2) / bp.PX_PER_MM < 100
+    assert np.abs(photo[centre] - 200).max() < 3.0
+
+
 def test_the_number_ring_takes_each_number_from_one_camera(cals):
     """A soft blend of two cameras doubles raised digits; in the number
     ring every spot must come (almost) entirely from one camera."""

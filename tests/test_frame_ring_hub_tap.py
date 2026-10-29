@@ -148,7 +148,20 @@ def test_ring_stamps_match_the_camera_status_stamps_from_the_same_cycle(three_ca
     """The pump samples wall and monotonic ONCE per cycle and uses that
     pair for both CameraStatus and the ring. Two independent time calls
     would describe two instants and make the ring's ordering disagree with
-    the status fields -- which nothing else in the suite would catch."""
+    the status fields -- which nothing else in the suite would catch.
+
+    REWRITTEN for the Assembler-based design (2026-10-11): `_pump_once()`
+    no longer reads cameras itself -- with no reader thread running (as
+    here, driving it by hand), it falls back to one synchronous read per
+    slot via the pool, then asks the Assembler for the next matched set
+    exactly as the real reader-thread path does. The Assembler paces sets
+    to the slowest camera's own measured period, so calling `_pump_once()`
+    twice with NO real time between them (as the old lockstep test did)
+    finds no NEW target the second time -- correctly: two real frames
+    1-2ms apart could never come from a 30fps camera either, and that
+    is exactly the queued-frame confusion the redesign exists to remove.
+    A short real sleep between cycles, comfortably past half the nominal
+    30fps period, is what makes the second cycle a genuinely new set."""
     from concurrent.futures import ThreadPoolExecutor
 
     ring = FrameRing(10.0)
@@ -159,8 +172,10 @@ def test_ring_stamps_match_the_camera_status_stamps_from_the_same_cycle(three_ca
     hub._pool = ThreadPoolExecutor(max_workers=3)
     try:
         # Twice, not once: the second cycle is where a stamp reused from
-        # the first would show up.
+        # the first would show up. The sleep between them is real elapsed
+        # time past half a nominal frame period (see docstring above).
         hub._pump_once()
+        time.sleep(0.02)
         hub._pump_once()
     finally:
         hub._pool.shutdown(wait=True)
@@ -353,12 +368,20 @@ def test_grab_paired_names_the_ring_set_for_jpeg_slots_too(monkeypatch):
 
 
 class _StallingCapture(_CountingCapture):
-    """Camera 1 fails every other read, so the pump re-serves its previous
-    frame -- the same array -- in the next set."""
+    """Camera 1 stalls in spells -- 15 reads delivering, then 15 failing
+    (each failed read backs off a frame period, so ~0.5 s of nothing) --
+    so the hub re-serves its previous frame, the same array, in the sets
+    made while it is stalled.
+
+    It used to fail every OTHER read. Under per-camera readers that is not
+    a stall at all, just a camera at half rate: it becomes the set
+    reference (sets follow the slowest camera) and is never re-served, so
+    the test would no longer exercise a re-serve. A spell longer than the
+    stall time is what makes the hub re-serve a slot now."""
 
     def read(self):
         ok, arr = super().read()
-        if int(self.device) == 1 and self.reads % 2 == 0:
+        if int(self.device) == 1 and (self.reads // 15) % 2 == 1:
             return False, None
         return ok, arr
 
@@ -375,6 +398,8 @@ def test_a_re_served_frame_keeps_the_generation_that_first_published_it(monkeypa
     hub.open_all()
     assert _wait_until(lambda: ring.stats()["sets"] >= 12)
     assert _paired_frames_are_the_ring_sets_they_name(hub, ring, slots=(1,)) > 5
+    # Long enough to span at least one whole stall spell.
+    assert _wait_until(lambda: ring.stats()["sets"] >= 80, timeout_s=10.0)
     hub.close_all()
     sets = ring.snapshot().sets
     repeats = [(a, b) for a, b in zip(sets, sets[1:])

@@ -30,6 +30,7 @@ from opendarts.engines.base import EngineResult
 from opendarts.engines.athena import AthenaEngine
 from opendarts.engines.apollo import ApolloEngine
 from opendarts.engines.ares import AresEngine
+from opendarts.engines.argus import ArgusEngine
 from opendarts.engines.talos import TalosEngine
 from opendarts.engines.registry import DEFAULT_ALSO_RUN, DEFAULT_PRIMARY_ENGINE
 from opendarts.engines.zeus import ZEUS_SUB_ENGINE_NAMES
@@ -555,8 +556,9 @@ def test_handle_ready_to_capture_zeus_primary_reuses_sub_results_no_duplicate_di
     (the live-configured shape), each real
     sub-engine's own score() must be called EXACTLY ONCE per throw, not
     twice -- confirmed by counting real calls via monkeypatched wrappers
-    around each of the 4 real engine classes."""
-    call_counts = {"Apollo": 0, "Talos": 0, "Athena": 0, "Ares": 0}
+    around each of the 5 real engine classes (Argus added 2026-10-08,
+    Zeus's 5th voter -- see opendarts/engines/zeus/engine.py)."""
+    call_counts = {"Apollo": 0, "Talos": 0, "Athena": 0, "Ares": 0, "Argus": 0}
 
     def _counting(cls, name):
         real_score = cls.score
@@ -571,6 +573,7 @@ def test_handle_ready_to_capture_zeus_primary_reuses_sub_results_no_duplicate_di
     _counting(TalosEngine, "Talos")
     _counting(AthenaEngine, "Athena")
     _counting(AresEngine, "Ares")
+    _counting(ArgusEngine, "Argus")
 
     bg = {0: np.full((4, 4, 3), 50, dtype=np.uint8)}
     frame = {0: np.full((4, 4, 3), 200, dtype=np.uint8)}
@@ -602,10 +605,10 @@ def test_handle_ready_to_capture_zeus_primary_reuses_sub_results_no_duplicate_di
 
     data = _read_result_json(dest_dir / "result.json")
     assert data["primary_engine"] == "Zeus"  # Zeus -> Zeus package codename
-    # All 4 sub-engines present under other_engines, via their own
+    # All 5 sub-engines present under other_engines, via their own
     # package display codenames.
-    assert set(data["other_engines"]) == {"Apollo", "Talos", "Athena", "Ares"}
-    for name in ("Apollo", "Talos", "Athena", "Ares"):
+    assert set(data["other_engines"]) == {"Apollo", "Talos", "Athena", "Ares", "Argus"}
+    for name in ("Apollo", "Talos", "Athena", "Ares", "Argus"):
         assert data["other_engines"][name]["timed_out"] is False
 
 

@@ -1376,7 +1376,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     from opendarts.live.logging_setup import configure_console_and_file_logging
+    from opendarts.live import native_stderr
 
+    # Before any camera opens: libjpeg's per-frame "Corrupt JPEG data"
+    # warning about camera padding would otherwise bury the console log.
+    native_stderr.install()
     log_path = configure_console_and_file_logging("run_product")
     log.info("=" * 60)
     log.info("opendarts run_product -- starting COMBINED capture loop + dashboard")

@@ -178,13 +178,12 @@ def _function_source(js: str, name: str) -> str:
 def test_the_picker_names_the_segment_the_scorer_would(tmp_path):
     """Runs the SHIPPED hitTest in node against geometry.sector_ring_for_point.
 
-    Points within 2 mm of a ring edge are skipped on purpose: the scorer's
-    inner edges are measured scoring radii (regulation minus
-    INNER_RING_SCORING_OFFSET_MM, adjustable at runtime), while the picker
-    draws and hit-tests the wires where they physically are. A person
-    tapping a segment means the segment; the ring chips beside the board
-    settle a tap on a wire. Everything else -- which wedge, which band,
-    every ring name -- must agree exactly."""
+    The picker hit-tests the inner ring edges at the scorer's own default
+    scoring radii (regulation minus INNER_RING_SCORING_OFFSET_MM; the
+    page takes the live values from OD.board_scoring_mm). Points within
+    2 mm of any edge are still skipped: a tap there is a tap on a wire,
+    which the ring chips beside the board settle. Everything else --
+    which wedge, which band, every ring name -- must agree exactly."""
     node = shutil.which("node")
     if not node:
         pytest.skip("node not installed -- picker/scorer parity was NOT checked")
@@ -230,3 +229,67 @@ def test_nothing_on_the_page_reaches_off_the_rig(page):
     assert not re.findall(r'(?:src|href)="https?://', page)
     assert "@import" not in ui.CSS
     assert "fonts.googleapis" not in page
+
+
+def test_the_rig_has_an_icon_and_every_page_links_it(tmp_path):
+    client = TestClient(create_app(package_root=tmp_path, enable_background_poll=False))
+    for path, kind in (("/favicon.ico", "image/x-icon"), ("/favicon.svg", "image/svg+xml"),
+                       ("/apple-touch-icon.png", "image/png")):
+        resp = client.get(path)
+        assert resp.status_code == 200 and resp.headers["content-type"].startswith(kind) and resp.content, path
+    ico = client.get("/favicon.ico").content
+    assert ico[:4] == b"\x00\x00\x01\x00" and ico[4] == 3, "an .ico holding 16, 32 and 48 px"
+    for page in ("/", "/?ui=classic", "/?display=tv"):
+        assert 'href="/favicon.svg"' in client.get(page).text, page
+
+
+def test_there_is_no_kiosk_mode_a_tv_is_a_display(tmp_path):
+    """?kiosk was the first design's wall-TV switch, replaced by /?display."""
+    assert "has('kiosk')" not in ui.JS and "body.kiosk" not in ui.CSS
+
+
+def test_frame_urls_carry_the_throws_version():
+    """A throw id can be reused after delete-all; the dashboard versions its
+    frame URLs by capture time so a kept frame is never another dart's."""
+    src = re.search(r"function frameUrl\(p, cam, which\) \{.*?\n  \}", ui.JS, re.S).group(0)
+    assert "&v=" in src and "captured_at_utc" in src
+
+
+def test_an_oracle_count_mismatch_is_said_on_the_scoreboard():
+    """opendarts/live/oracle_watch.py: a dart the oracle saw and OD did not
+    must be obvious, on every screen, without the oracle scoring anything."""
+    assert 'id="oracle-miss"' in ui.INDEX_HTML
+    assert 'id="oracle-miss-lab"' in ui.INDEX_HTML    # the Engines view, where the TV sits while testing
+    assert "case 'ORACLE_MISMATCH'" in ui.JS and "st.oracle_mismatches" in ui.JS
+    fn = re.search(r"function oracleMismatch\(m, fromState\) \{.*?\n  \}", ui.JS, re.S).group(0)
+    assert "S.visit" not in fn          # a notice, never a change to the visit
+
+
+def test_status_notices_float_and_never_move_the_page():
+    """rla: "I hate when things shift." The status strip and the notices
+    lie over the page; none of them pads, pushes or shrinks it."""
+    assert "padding-top: var(--conn-h" not in ui.CSS
+    assert "has-miss" not in ui.CSS and "has-miss" not in ui.JS
+    assert re.search(r"\.throws-notices \{ position: absolute;", ui.CSS)
+    assert re.search(r"\.omiss \{ position: absolute;", ui.CSS)
+    # the notices live outside the flowing header and scoreboard
+    head = ui.INDEX_HTML.split('<header class="throws-head">', 1)[1].split("</header>", 1)[0]
+    assert 'id="throws-banner"' not in head and 'id="oracle-miss-lab"' not in head
+    turn = ui.INDEX_HTML.split('<div class="turn" id="turn">', 1)[1].split("</aside>", 1)[0]
+    assert 'id="oracle-miss"' not in turn
+
+
+def test_the_board_is_painted_from_the_scoring_edges():
+    """A dart the scorer called D1 must be drawn in the green: the bands are
+    painted and hit-tested from the inner SCORING radii, and the page is
+    told the live ones."""
+    from opendarts.live import server as srv
+    boot = srv._dashboard_bootstrap([0, 1, 2])
+    assert boot["board_scoring_mm"] == {"treble_inner": geometry.TREBLE_INNER_SCORING_RADIUS_MM,
+                                        "double_inner": geometry.DOUBLE_INNER_SCORING_RADIUS_MM}
+    board_mm = re.search(r"const BOARD_MM = \{.*?\};", ui.JS, re.S).group(0)
+    assert f"doubleInnerScore: {geometry.DOUBLE_INNER_SCORING_RADIUS_MM}" in board_mm
+    assert f"trebleInnerScore: {geometry.TREBLE_INNER_SCORING_RADIUS_MM}" in board_mm
+    paint = _function_source(ui.JS, "drawDiagram")
+    assert "mm(BOARD_MM.doubleInnerScore), mm(BOARD_MM.doubleOuter)" in paint
+    assert "mm(BOARD_MM.doubleInner)," not in paint

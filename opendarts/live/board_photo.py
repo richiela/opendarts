@@ -213,7 +213,13 @@ class BoardPhotoMaps:
                        for k in range(20) if best[k] != best[(k + 1) % 20]]
         pick = np.array([best[sector] == i for i in range(len(cams))], dtype=np.float32)
         pick = np.array([cv2.GaussianBlur(m, (0, 0), _JOIN_SOFTEN_PX) for m in pick]) * inside_a
-        board = np.where(inside_a, np.array(cos_here), 0.0) ** _BLEND_POWER
+        # Relative to the squarest camera at each spot, THEN the power: the
+        # blend only uses the ratios, so this is the same blend -- but a
+        # rig whose cameras sit low (cosine ~0.46 at the bull, 0.46**40 ~
+        # 1e-14) no longer underflows past the normalising floor below
+        # and renders the centre almost black.
+        cos_in = np.where(inside_a, np.array(cos_here), 0.0)
+        board = (cos_in / np.maximum(cos_in.max(axis=0), 1e-6)) ** _BLEND_POWER
         weight = np.where(in_ring[None], pick, board).astype(np.float32)
         weight /= np.maximum(weight.sum(axis=0), 1e-6)
         overlap = inside_a.all(axis=0) & (radius < HALF_MM - 10)

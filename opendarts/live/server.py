@@ -298,6 +298,7 @@ from opendarts.live.capture_daemon import (
 )
 from opendarts.capture.calibration_package import DEFAULT_CALIBRATION_PACKAGE_ROOT
 from opendarts.live.ad_ws_listener import AdWsListener
+from opendarts.live.oracle_watch import OracleCountWatch
 from opendarts.live.heap_trim import release_freed_heap
 from opendarts.live.board_status import BOARD_STATUS_STOPPED, BOARD_STATUS_UNKNOWN
 from opendarts.live.oracle_hold import oracle_hold
@@ -309,6 +310,7 @@ from opendarts.capture.trigger_state import MAX_DARTS_PER_TURN, ThrowState
 # OD's own takeout.
 _TAKEOUT_WAITING = ThrowState.TAKEOUT_WAITING.name
 from opendarts.live.logging_setup import DEFAULT_LOG_DIR
+from opendarts.geometry import board as _board_geometry
 from opendarts.geometry.board import (
     BULL_RADIUS_MM,
     DOUBLE_INNER_RADIUS_MM,
@@ -1471,6 +1473,11 @@ class AppState:
         # of truth, no staleness to manage. None in this module's own
         # standalone CLI, same as every other shared object above.
         self.ad_ws_listener = ad_ws_listener
+        # Oracle count watch (opendarts/live/oracle_watch.py): when the oracle
+        # and this rig disagree on how many darts are in the board, keep the
+        # frames and say so. Never scores; recent ones are in state_dict().
+        self.oracle_watch = OracleCountWatch()
+        self.oracle_mismatches: "collections.deque[dict[str, Any]]" = collections.deque(maxlen=20)
         # Windows virtual-camera publishers, when republishing is on.
         # Held only so /api/frame-health can report whether the consumer is
         # collecting what we publish -- the capture path writes to these
@@ -2505,6 +2512,10 @@ class AppState:
         fix. `trigger_last_event_utc` is stamped with the real stop time
         (not left at the old throw event's timestamp) so a caller
         computing "how fresh is this" gets an honest answer either way."""
+        if self.ad_ws_listener is not None:
+            # a Start's oracle start still waiting for warm-up must not
+            # fire after the session it was for has ended
+            self.ad_ws_listener.cancel_pending_start()
         if self.controller is None:
             return {"ok": False, "reason": "no capture loop in this process to stop"}
         if not self.controller.is_running():
@@ -2569,10 +2580,19 @@ class AppState:
         # leaves takeout (it waits for visit_complete), and a Stop during a
         # takeout or an oracle hold would be swallowed.
         await self.publish_retail_state("stopped")
-        return {
+        result = {
             "ok": True, "acknowledged": acked, "reason": reason, "starting": False,
             **self.controller.meta(), **self._capture_status_stamp(),
         }
+        # Stop stops both, as Start starts both and Reset resets both. Left
+        # running, the oracle saw the cabinet's lights come on at the next
+        # Start and went into a takeout that never ended; stopped, it is
+        # started again once OD has warmed up with the lights on.
+        listener = self.ad_ws_listener
+        if (listener is not None and listener.is_enabled() and listener.is_connected()
+                and listener.board_status()[0] != BOARD_STATUS_STOPPED):
+            result["oracle_stop"] = await asyncio.to_thread(listener.control, "stop", 10.0)
+        return result
 
     async def _idle_timeout_loop(self) -> None:
         """Auto-stop after `self.controller.idle_timeout_sec` of no real
@@ -3310,6 +3330,9 @@ class AppState:
     def state_dict(self) -> dict[str, Any]:
         return {
             "server_time_utc": datetime.now(timezone.utc).isoformat(),
+            # Recent disagreements with the oracle on how many darts are in
+            # the board, newest last (opendarts/live/oracle_watch.py).
+            "oracle_mismatches": list(self.oracle_mismatches),
             "package_root": str(self.package_root),
             "frame_source": "local",
             "config": {
@@ -3588,6 +3611,64 @@ class AppState:
         self._tasks.append(
             asyncio.create_task(self._calibration_progress_loop(), name="opendarts-calibration-progress")
         )
+        if self.ad_ws_listener is not None:
+            self._tasks.append(
+                asyncio.create_task(self._oracle_watch_loop(), name="opendarts-oracle-watch")
+            )
+
+    async def _oracle_watch_loop(self) -> None:
+        """Twice a second, compare the oracle's dart count with this rig's
+        (opendarts/live/oracle_watch.py). On a lasting disagreement: log
+        it, keep the frame ring (source "oracle"), and tell every screen
+        (ORACLE_MISMATCH). Judged only while both sides are throwing."""
+        from opendarts.live.board_status import BOARD_STATUS_READY, BOARD_STATUS_TAKEOUT
+
+        while True:
+            await asyncio.sleep(0.5)
+            try:
+                listener = self.ad_ws_listener
+                if listener is None:
+                    continue
+                running = bool(self.controller is not None and self.controller.is_running())
+                oracle_n = listener.throw_count()
+                status = listener.board_status()[0]
+                od_n = len(self.visit_throws)
+                # The oracle's own takeout after its throws still counts (its
+                # count stands until "Takeout finished") -- while this rig's
+                # visit is still open: it often clears a moment before the
+                # oracle's takeout ends, and 3 against a fresh 0 is not a
+                # miss (replayed over two days of games: 204 false alarms
+                # without this, 6 real ones with it). This rig's own takeout
+                # never counts. Its retail status is not used: that reads
+                # "takeout" for an oracle hold, which is the oracle's takeout.
+                judging = (running and listener.is_enabled() and listener.is_connected()
+                           and (status == BOARD_STATUS_READY
+                                or (status == BOARD_STATUS_TAKEOUT and oracle_n > 0 and od_n > 0))
+                           and not self._in_own_takeout())
+                events = listener.latest_events() if judging else []
+                call = ((events[-1].throw.get("segment") or {}).get("name") if events else None)
+                found = self.oracle_watch.observe(
+                    judging=judging, visit_id=str(self.visit_id), oracle_n=oracle_n,
+                    od_n=od_n, oracle_call=call, now=time.monotonic(),
+                )
+                if found is None:
+                    continue
+                record = {**found.as_dict(), "at_utc": datetime.now(timezone.utc).isoformat(),
+                          "captured": False, "capture": None}
+                log.warning("oracle mismatch: %s", found.reason())
+                service = self.throw_capture
+                if service is not None:
+                    result = await asyncio.to_thread(
+                        service.capture_missed_dart, reason=found.reason(), source="oracle",
+                        extra={"oracle_mismatch": found.as_dict()},
+                    )
+                    job = result.get("job") or {}
+                    record["captured"] = bool(result.get("ok"))
+                    record["capture"] = (job.get("dest_dir") if isinstance(job, dict) else None) or result.get("reason")
+                self.oracle_mismatches.append(record)
+                await self._broadcast({"type": "ORACLE_MISMATCH", **record})
+            except Exception:  # noqa: BLE001 -- a watcher must never take the server down
+                log.exception("oracle watch tick failed")
 
     async def _calibration_progress_loop(self) -> None:
         """Push calibration progress (opendarts.live.calibration_progress)
@@ -3712,6 +3793,16 @@ def _dashboard_bootstrap(cam_ids: "list[int]") -> "dict[str, Any]":
         # could never compare equal to any engine's answer.
         "board_sectors": [str(n) for n in SECTOR_NUMBERS_CLOCKWISE],
         "board_rings": board_ring_names(),
+        # Where the treble and double actually begin for the scorer: the
+        # inner-ring SCORING radii, a little inside the regulation ones
+        # (opendarts.geometry.board.INNER_RING_SCORING_OFFSET_MM). Read
+        # from the module at call time, since a per-board measurement
+        # reassigns them. The board drawings paint the bands from here,
+        # so a dart scored D1 is never drawn in the single beside it.
+        "board_scoring_mm": {
+            "treble_inner": _board_geometry.TREBLE_INNER_SCORING_RADIUS_MM,
+            "double_inner": _board_geometry.DOUBLE_INNER_SCORING_RADIUS_MM,
+        },
         # Drives whether the per-throw "Save frames" control is offered
         # at all. On "all" every throw already records a clip, so the
         # button can only ever duplicate what the rig just did -- and it
@@ -4487,6 +4578,19 @@ def create_app(
         await state._broadcast({"type": "DISPLAY_FORGOTTEN", "display_id": display_id})  # noqa: SLF001
         return {"ok": True}
 
+    # The rig's icon (opendarts/live/ui/icons): a dart into the bull. At the
+    # root, where a browser asks for it unprompted; every page links it too.
+    _ICON_DIR = Path(next_ui.__file__).resolve().parent / "icons"
+    _ICONS = {"favicon.ico": "image/x-icon", "favicon.svg": "image/svg+xml", "apple-touch-icon.png": "image/png"}
+
+    @app.get("/favicon.ico")
+    @app.get("/favicon.svg")
+    @app.get("/apple-touch-icon.png")
+    async def favicon(request: Request) -> Response:
+        name = request.url.path.lstrip("/")
+        return Response((_ICON_DIR / name).read_bytes(), media_type=_ICONS[name],
+                        headers={"Cache-Control": "public, max-age=86400"})
+
     @app.get("/api/health")
     async def health() -> dict[str, Any]:
         # Capabilities ride along on health (2026-09-12): "does that rig
@@ -5111,12 +5215,19 @@ def create_app(
         # One press gets the board working, as Reset resets both: with the
         # oracle on and connected but stopped (it stands down by itself after
         # its idle time), Start starts it too -- otherwise OD comes up held,
-        # "waiting on oracle", until someone starts it by hand.
+        # "waiting on oracle", until someone starts it by hand. It starts
+        # once OD has warmed up, not now: starting it now, it took its empty
+        # board before the cabinet's lights came on and sat in a takeout
+        # that never ended (AdWsListener.start_when_board_ready).
+        # A running oracle the lights came on under is reset then, if it went
+        # into a takeout with no darts thrown.
         listener = state.ad_ws_listener
         if (result.get("ok") and listener is not None and listener.is_enabled()
-                and listener.is_connected()
-                and listener.board_status()[0] == BOARD_STATUS_STOPPED):
-            result["oracle_start"] = await asyncio.to_thread(listener.control, "start", 15.0)
+                and listener.is_connected()):
+            listener.start_when_board_ready()
+            if listener.board_status()[0] == BOARD_STATUS_STOPPED:
+                result["oracle_start"] = {"ok": True, "action": "start", "deferred": True,
+                                          "note": "starts once OpenDarts has warmed up"}
         return result
 
     @app.post("/api/stop")
@@ -6036,7 +6147,7 @@ def create_app(
 
     @app.get("/api/packages/{session}/{throw_id}/frame/{cam}/{kind}.png")
     async def api_package_frame(
-        session: str, throw_id: str, cam: int, kind: str, fmt: str = "png"
+        session: str, throw_id: str, cam: int, kind: str, fmt: str = "png", v: "str | None" = None
     ):
         """One still of a throw: kind=`bg` (baseline) or `after` (the scored
         commit frame). `after` comes from the clip for a recorded package
@@ -6088,7 +6199,14 @@ def create_app(
         if data is None:
             return Response("no such frame", status_code=404)
         media = "image/jpeg" if fmt == "jpeg" else "image/png"
-        return Response(content=data, media_type=media)
+        # A browser may keep a frame only when the URL is VERSIONED (`v`, the
+        # throw's capture time, as the dashboard sends it): a throw id can be
+        # reused after "delete recorded data" resets the session's throw
+        # counters, so the same unversioned URL can later mean another dart.
+        # Unversioned requests stay uncached, as before. A 404 -- frames not
+        # written yet -- is never cached either.
+        headers = {"Cache-Control": "private, max-age=86400, immutable"} if v else {"Cache-Control": "no-cache"}
+        return Response(content=data, media_type=media, headers=headers)
 
     @app.get("/api/packages/{session}/{throw_id}/clip/{cam}.mjpg")
     async def api_package_clip(session: str, throw_id: str, cam: int, request: Request):
@@ -6229,8 +6347,9 @@ def create_app(
           on the top row and the scored (after) frame on the bottom;
         - when the throw was recorded, a clip scrubber below it: one frame
           per camera, a slider to drag through the clip, play at
-          0.25x / 0.5x / 1x (plays once, does not loop), and left/right
-          arrow-key stepping. Frames come from /clip.json (fetched once)
+          0.25x / 0.5x / 1x (plays once, does not loop), and frame stepping
+          by the on-screen step buttons (touch: the kiosk has no keyboard)
+          or the left/right arrow keys. Frames come from /clip.json (fetched once)
           and are swapped client-side, so scrubbing is instant.
 
         Opened in a new window from the engine row."""
@@ -6338,12 +6457,19 @@ def create_app(
       <button class="btn speed" data-speed="0.5" type="button">0.5×</button>
       <button class="btn speed is-active" data-speed="1" type="button">1×</button>
     </div>
+    <div class="steps" role="group" aria-label="Step frame">
+      <button class="btn step" data-step="-1" type="button"
+              aria-label="Previous frame" title="Previous frame">◀</button>
+      <button class="btn step" data-step="1" type="button"
+              aria-label="Next frame" title="Next frame">▶</button>
+    </div>
     <span id="frameLabel" class="frame-label">—</span>
   </div>
   <input id="slider" type="range" min="0" max="0" value="0" step="1"
          aria-label="Clip position" disabled>
-  <p class="hint">Drag the slider, press <kbd>Play</kbd>, or use
-     <kbd>←</kbd> <kbd>→</kbd> to step frame by frame. The highlighted cell
+  <p class="hint">Drag the slider, press <kbd>Play</kbd>, or tap
+     <kbd>◀</kbd> <kbd>▶</kbd> (← → on a keyboard) to step frame by frame.
+     The highlighted cell
      marks each camera's scored frame.</p>
 </section>
 <script>
@@ -6404,6 +6530,12 @@ def create_app(
   for (const b of speedBtns) {{
     b.addEventListener('click', () => setSpeed(parseFloat(b.dataset.speed)));
   }}
+  for (const b of document.querySelectorAll('.step')) {{
+    b.addEventListener('click', () => {{
+      if (!nFrames) return;
+      stop(); show(cur + parseInt(b.dataset.step, 10));
+    }});
+  }}
   window.addEventListener('keydown', (ev) => {{
     if (ev.target && /^(INPUT|TEXTAREA|SELECT)$/.test(ev.target.tagName)
         && ev.target !== slider) return;
@@ -6444,6 +6576,7 @@ def create_app(
         page = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Throw {score_label}</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="icon" href="/favicon.ico">
 <style>
   :root{{
     --bg:#0f1115; --panel:#161922; --panel-2:#1c2029; --line:#272c38;
@@ -6567,6 +6700,9 @@ def create_app(
     border-radius:6px; font-variant-numeric:tabular-nums}}
   .speeds .btn:hover{{background:#222735}}
   .speeds .btn.is-active{{background:var(--accent); color:#0c1420}}
+  /* Frame step: big enough for a fingertip on the kiosk tablet. */
+  .steps{{display:inline-flex; gap:6px}}
+  .steps .btn{{min-width:56px; min-height:44px; font-size:16px; padding:6px 14px}}
   .frame-label{{margin-left:auto; color:var(--muted);
     font-variant-numeric:tabular-nums; font-size:13px}}
   #slider{{width:100%; accent-color:var(--accent); margin:4px 0 0; cursor:pointer}}

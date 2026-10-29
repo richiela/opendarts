@@ -98,7 +98,12 @@ const Conn = (() => {
   const el = $('#conn-strip');
   function render() {
     const p = rigPhase();
-    const hide = p.key === 'ready' || p.key === 'takeout' || p.key === 'warming' || p.key === 'calibrating' || !Shell.showing('throws') && !Shell.showing('rig');
+    // Stopped is a resting state, not an alarm: a controller's bar already
+    // says it in red, and a strip parked over the page for as long as the
+    // rig sits idle only hid what was under it (rla). A display has no
+    // bar, so it still says so.
+    const quiet = p.key === 'stopped' && ROLE !== 'display';
+    const hide = quiet || p.key === 'ready' || p.key === 'takeout' || p.key === 'warming' || p.key === 'calibrating' || !Shell.showing('throws') && !Shell.showing('rig');
     el.hidden = hide;
     document.body.classList.toggle('conn-on', !hide);
     if (hide) return;
@@ -108,8 +113,9 @@ const Conn = (() => {
     el.dataset.hold = p.key === 'held' ? (p.hold.code || '') : '';
     measure();
   }
-  // The page below moves down by the strip's real height -- one line on a
-  // wide screen, two on a phone -- so nothing is ever hidden under it.
+  // The strip floats over the page (it never pushes it down: rla hates a
+  // shifting page). Its real height -- one line on a wide screen, two on a
+  // phone -- only moves the other overlays clear of it.
   function measure() {
     if (el.hidden) return;
     document.body.style.setProperty('--conn-h', Math.ceil(el.getBoundingClientRect().height) + 'px');

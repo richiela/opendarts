@@ -304,7 +304,56 @@ const Play = (() => {
       : '';
   }
 
-  function render() { renderTurn(); renderVeil(); renderMissed(); LiveBoard.draw(); }
+  // ---- the oracle counted differently ----------------------------------------
+  // opendarts/live/oracle_watch.py: Autodarts and OD disagreed on the visit's
+  // dart count for a few seconds, and the frames were kept. Said loudly, in a
+  // banner floating along the foot of Play and of Throws -- a missed dart is
+  // the thing rla most needs to see -- that never moves the page under it. The oracle never scores: nothing here changes the visit.
+  // Shown for the visit it is about: the takeout that ends that visit
+  // clears it (rla: by then it has been seen and acted on), as does a
+  // dismiss.
+  const MISS_FRESH_MS = 10 * 60 * 1000;   // on reload, older ones are history
+  let missDismissed = null;
+  function oracleMismatch(m, fromState) {
+    if (!m || !m.kind) return;
+    if (fromState && !(Date.now() - Date.parse(m.at_utc) < MISS_FRESH_MS)) return;
+    if (S.oracleMiss && missKey(S.oracleMiss) === missKey(m)) return;   // a resync's copy
+    S.oracleMiss = m;
+    if (!fromState) {
+      activity(m.kind === 'oracle_saw_dart_od_missed' ? 'Missed dart' : 'Extra dart?', 'warn',
+        missText(m) + (m.captured ? ' — frames saved' : ''));
+    }
+    renderOracleMiss();
+  }
+  const missKey = (m) => m.at_utc + '|' + m.visit_id + '|' + m.kind;
+  function missText(m) {
+    if (m.kind === 'oracle_saw_dart_od_missed') {
+      return 'The oracle saw dart ' + m.oracle_n + (m.oracle_call ? ' (' + m.oracle_call + ')' : '')
+        + ' — OpenDarts has ' + m.od_n;
+    }
+    return 'OpenDarts counted dart ' + m.od_n + ' — the oracle has ' + m.oracle_n + '. Possibly a phantom.';
+  }
+  // Drawn into every .omiss: the scoreboard's, and the Engines view's.
+  function renderOracleMiss() {
+    const m = S.oracleMiss;
+    const show = !!m && missKey(m) !== missDismissed
+      && m.visit_id === S.visit.id;
+    const missed = !!m && m.kind === 'oracle_saw_dart_od_missed';
+    for (const box of $$('.omiss')) {
+      box.hidden = !show;
+      if (!show) continue;
+      box.dataset.kind = missed ? 'missed' : 'extra';
+      $('.omiss-k', box).textContent = missed ? 'MISSED DART' : 'EXTRA DART?';
+      $('.omiss-t', box).textContent = missText(m);
+      $('.omiss-f', box).textContent = m.captured ? 'Frames saved for review'
+        : 'Frames not saved' + (m.capture ? ' — ' + m.capture : '');
+    }
+  }
+  for (const x of $$('.omiss-x')) {
+    x.addEventListener('click', () => { missDismissed = S.oracleMiss && missKey(S.oracleMiss); renderOracleMiss(); });
+  }
+
+  function render() { renderTurn(); renderVeil(); renderMissed(); renderOracleMiss(); LiveBoard.draw(); }
 
   on('visit', render);
   on('engines', renderCredits);
@@ -329,5 +378,5 @@ const Play = (() => {
   if (window.ResizeObserver) new ResizeObserver(shape).observe(stage);
   window.addEventListener('resize', shape);
 
-  return {render, loadRecent, openMissed, shape};
+  return {render, loadRecent, openMissed, shape, oracleMismatch};
 })();

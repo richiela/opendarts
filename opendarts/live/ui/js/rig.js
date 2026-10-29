@@ -186,6 +186,15 @@ const Cameras = (() => {
   }
 
   // ---- calibration ----
+  // The calibration the capture loop scores against when the per-camera
+  // rows have not been filled in yet (a restart, before Start): {n} cameras.
+  function savedCalibration(cal) {
+    const src = (cal && cal.live_source) || {};
+    const rows = (cal && cal.cameras) || {};
+    if (Object.keys(rows).length || !src.checked_at_utc || !(src.n_cameras > 0)) return null;
+    return {n: src.n_cameras, at: src.checked_at_utc, source: src.source};
+  }
+
   function renderCalibration() {
     const cal = S.calibration || {};
     const src = cal.live_source || {};
@@ -193,6 +202,10 @@ const Cameras = (() => {
     if (next !== token) for (const c of CAM_IDS) retries[c] = 0;
     token = next;
     const cams = cal.cameras || {};
+    // After a restart the rig scores against the calibration it saved
+    // (live_source: "persisted"), but the per-camera rows only fill in
+    // on Start, which reuses it as-is. That is calibrated, not "not calibrated".
+    const saved = savedCalibration(cal);
     let ok = 0;
     for (const c of CAM_IDS) {
       const row = cams[String(c)];
@@ -201,6 +214,14 @@ const Cameras = (() => {
       if (S.calibrating) {
         badge.className = 'cam-cal busy'; badge.textContent = 'Calibrating';
         overlayOk[c] = false;
+        continue;
+      }
+      if (!row && saved && c < saved.n) {
+        ok++;
+        overlayOk[c] = false;
+        badge.className = 'cam-cal ok';
+        badge.textContent = 'Saved';
+        badge.title = 'The saved calibration is in use. Calibrate again if this camera has moved.';
         continue;
       }
       const good = !!row && row.ok === true;
@@ -326,8 +347,9 @@ const Cameras = (() => {
     const cell = (text, cls, title) => h('td', {class: cls || '', title: title || null}, text);
     const head = h('thead', {}, h('tr', {}, ['Cam', 'Sits at', 'Away', 'Angle', 'Focal length', 'Reproj. error', 'Live'].map((t, i) => h('th', {class: i > 1 && i < 6 ? 'r' : ''}, t))));
     let flagged = [];
+    const saved = savedCalibration(cal);
     const body = h('tbody', {}, rows.map(({c, g, at, cal: cc, live}) => {
-      const ok = cc && cc.ok === true;
+      const ok = (cc && cc.ok === true) || (!cc && !!saved && c < saved.n);
       const err = cc && typeof cc.reprojection_error_px === 'number' ? cc.reprojection_error_px
         : g && typeof g.reprojection_error_px === 'number' ? g.reprojection_error_px : null;
       const far = median && g && typeof g.distance_mm === 'number' && Math.abs(g.distance_mm - median) / median > DISTANCE_WARN;
@@ -336,7 +358,7 @@ const Cameras = (() => {
       if (loose) flagged.push('Cam ' + (c + 1) + ' fits its calibration loosely (' + err.toFixed(2) + ' px) — worth a recalibrate');
       const fps = live && (live.effective_fps || live.actual_fps);
       return h('tr', {class: ok ? '' : 'uncal'},
-        h('td', {}, h('span', {class: 'cn'}, h('span', {class: 'dot', dataset: {tone: !cc ? 'idle' : ok ? (loose ? 'warn' : 'live') : 'bad'}}), 'Cam ' + (c + 1))),
+        h('td', {}, h('span', {class: 'cn'}, h('span', {class: 'dot', dataset: {tone: ok ? (loose ? 'warn' : 'live') : !cc ? 'idle' : 'bad'}}), 'Cam ' + (c + 1))),
         cell(at ? at.hour + ' o’clock' : '—'),
         cell(g && g.distance_mm ? Math.round(g.distance_mm) + ' mm' : '—', 'r' + (far ? ' flag' : ''), far ? 'Noticeably further from the board than the others' : 'Distance from the bull'),
         cell(at && typeof at.elevation === 'number' ? Math.round(at.elevation) + '°' : '—', 'r', 'How far off the board’s face it looks'),
@@ -347,8 +369,10 @@ const Cameras = (() => {
         cell(live && live.opened ? (fps ? fps.toFixed(0) + ' fps' : '—') + ' · ' + (live.actual_width || '?') + '×' + (live.actual_height || '?') : 'off', 'dim'));
     }));
     table.replaceChildren(head, body);
-    const from = {startup: 'at start-up', manual: 'by hand', persisted: 'loaded from disk'}[cal.source] || cal.source || '';
-    $('#sched-when').textContent = cal.checked_at_utc ? 'calibrated ' + ago(cal.checked_at_utc) + (from ? ' · ' + from : '') : 'not calibrated yet';
+    // a saved calibration: just when (the summary above says where from)
+    const whenSrc = cal.checked_at_utc ? cal : (saved ? {checked_at_utc: saved.at} : cal);
+    const from = {startup: 'at start-up', manual: 'by hand', persisted: 'loaded from disk'}[whenSrc.source] || whenSrc.source || '';
+    $('#sched-when').textContent = whenSrc.checked_at_utc ? 'calibrated ' + ago(whenSrc.checked_at_utc) + (from ? ' · ' + from : '') : 'not calibrated yet';
     const note = $('#sched-note');
     note.textContent = flagged.length ? flagged.join('. ') + '.' : (dists.length === CAM_IDS.length ? 'All cameras even and well fitted.' : '');
     note.classList.toggle('warn', flagged.length > 0);

@@ -971,6 +971,29 @@ def test_calibration_store_set_persists_a_snapshot_that_a_new_store_loads(tmp_pa
     assert get_board_color_thresholds() == (120.0, 30.0)
 
 
+def test_a_loaded_calibration_shows_the_fit_its_package_recorded(tmp_path):
+    """A calibration loaded from disk used to show "Calibrated" with no
+    reprojection error, though its package recorded one per camera. The
+    loader reads it back from the package the snapshot names; a camera the
+    package has no number for, or a missing package, stays unknown."""
+    root = tmp_path / "calibration_packages"
+    pkg_id = "calib_20261002-170338-4e26b65b"
+    writer = capture_daemon.CalibrationStore(snapshot_path=root / "current_calibration.json")
+    writer.set({0: _fake_calibration(42.0), 1: _fake_calibration(43.0)}, source="startup",
+               checked_at_utc="2026-10-02T17:03:38+00:00", package_id=pkg_id)
+    (root / pkg_id).mkdir(parents=True)
+    (root / pkg_id / "derived_calibration.json").write_text(json.dumps(
+        {"cameras": {"0": {"reprojection_error_px": 0.958, "target_met": True}}}))
+
+    loaded = capture_daemon.CalibrationStore(snapshot_path=root / "current_calibration.json").get()
+    assert loaded[0].pnp_result.reprojection_error_px == pytest.approx(0.958)
+    assert loaded[1].pnp_result is None
+
+    (root / pkg_id / "derived_calibration.json").unlink()
+    loaded = capture_daemon.CalibrationStore(snapshot_path=root / "current_calibration.json").get()
+    assert sorted(loaded) == [0, 1] and loaded[0].pnp_result is None
+
+
 def test_calibration_store_snapshot_path_corrupt_json_falls_through_to_defaults(tmp_path, caplog):
     snapshot_path = tmp_path / "current_calibration.json"
     snapshot_path.write_text("{not valid json")

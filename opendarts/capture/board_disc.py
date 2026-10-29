@@ -118,15 +118,29 @@ def board_disc_mask(
 # ----------------------------------------------------------------------
 # live registry
 _PER_CAMERA_BOARD_DISC_MASK: dict[int, np.ndarray] = {}
+_PER_CAMERA_CALIBRATION: dict[int, CameraCalibration] = {}
 
 
-def set_calibrated_board_disc_masks(masks: dict[int, np.ndarray] | None) -> None:
-    """(Re-)set the per-camera masks from a fresh calibration. ``None`` or
-    ``{}`` clears them."""
-    global _PER_CAMERA_BOARD_DISC_MASK
+def set_calibrated_board_disc_masks(
+    masks: dict[int, np.ndarray] | None,
+    calibrations: dict[int, CameraCalibration] | None = None,
+) -> None:
+    """(Re-)set the per-camera masks from a fresh calibration, with the
+    calibrations they were built from (the lifecycle's same-dart check
+    needs the geometry itself). ``None`` or ``{}`` clears both."""
+    global _PER_CAMERA_BOARD_DISC_MASK, _PER_CAMERA_CALIBRATION
     _PER_CAMERA_BOARD_DISC_MASK = dict(masks) if masks else {}
+    _PER_CAMERA_CALIBRATION = (
+        {cam: cal for cam, cal in calibrations.items() if cam in _PER_CAMERA_BOARD_DISC_MASK}
+        if masks and calibrations else {}
+    )
 
 
 def get_calibrated_board_disc_masks() -> dict[int, np.ndarray]:
     """A copy of whatever was last set, never the live dict."""
     return dict(_PER_CAMERA_BOARD_DISC_MASK)
+
+
+def get_calibrated_board_calibrations() -> dict[int, CameraCalibration]:
+    """The calibrations the current masks were built from (a copy)."""
+    return dict(_PER_CAMERA_CALIBRATION)

@@ -293,6 +293,32 @@ logic (this hub's counter deliberately says nothing about WHETHER a
 caller kept up -- that accounting lives entirely on the consumer side,
 where the "was I too slow" question actually belongs).
 
+READING AND CHOOSING SPLIT APART, 2026-10-11 -- read before touching
+`_pump_once()`/`_reader_loop()`/`close_all()` again. Everything above this
+paragraph still describes the real shape ("one dedicated thread reads
+every camera", "consumers only ever read a cache") EXCEPT that the single
+pump thread calling `cap.read()` itself (via its own `ThreadPoolExecutor`,
+one worker per camera, `pool.map(read_one, range(n))`) is gone. Reading
+cameras in lockstep -- one blocking read per camera per cycle -- let a
+camera's own driver queue of frames back up on another camera's account
+(2026-10-07: one camera served frames 4 behind for a whole session; the
+drain-and-refuse patch that followed then blinded a rig for ~6 minutes
+when its own two thresholds disagreed about what "behind" meant). Reading
+is now ONE daemon thread PER OPENED SLOT (`_reader_loop()`, named
+`local-cam-reader-<i>`, started by `open_all()` after every camera has
+opened and stopped by `close_all()` before any capture is released --
+same "retire the readers before the captures they hold" ordering the pump
+thread always had, just extended to these). Each reads only its own
+camera, as fast as that camera delivers, and pushes every frame into
+`opendarts.live.set_assembly.Assembler` with its arrival time and (on
+Linux only) the driver's own capture time. `_pump_once()` no longer calls
+`cap.read()` at all: it asks the Assembler for the next frame set whose
+capture times line up, publishes it to the SAME cache/generation counter/
+sink/ring described above, and republishes the existing cache on a cycle
+that finds nothing new -- so FRAME-DRIVEN WAKE's "a completed pump cycle
+always bumps" contract is unchanged. See set_assembly's own module
+docstring for the full design and the incident that drove it.
+
 REAL INCIDENT, STATUS-HONESTY GAP FOUND AND FIXED, 2026-08-12 -- read
 before touching `close_all()`/`CameraStatus` again. hit a real,
 live `/api/stop` call that reported `already_stopped: true` -- the
@@ -346,6 +372,7 @@ import numpy as np
 
 from opendarts.capture.lazy_frame import LazyFrame, LazyFrames, pixels_of, reduced_gray
 from opendarts.live import camera_resolution, jpeg_info
+from opendarts.live.set_assembly import Assembler
 
 log = logging.getLogger("opendarts.local_capture")
 
@@ -576,6 +603,21 @@ DEFAULT_CAMERA_DEVICES: list[int] = [0, 1, 2]
 DEFAULT_WIDTH = 1280
 DEFAULT_HEIGHT = 720
 DEFAULT_FPS = 30
+
+# FRAME-SET SYNC, 2026-10-07, SUPERSEDED 2026-10-11. The three pictures a
+# tick judges must show the same moment. The drain-and-refuse design that
+# used to live here (read again until fresh, then refuse to judge a set
+# whose capture times spread too far) is gone: it blinded a rig for ~6
+# minutes when its own drain threshold and its own refusal threshold
+# disagreed about what "behind" means. Reading is now per-camera (each
+# slot has its own reader thread -- `_reader_loop()` below -- so no
+# camera's driver queue can ever back up on another's account) and
+# choosing which frame of each camera makes a set is
+# `opendarts.live.set_assembly.Assembler`, a pure function of capture
+# times. See that module's own docstring for the full design and the
+# incident that drove it.
+#: a capture time this far from now is not on our clock -- treated as absent
+CAPTURE_TS_MAX_AGE_MS = 10_000.0
 
 
 def camera_configs_from_resolution_preferences(
@@ -984,6 +1026,10 @@ class CameraStatus:
     # is worth knowing about.
     jpeg_passthrough: bool = False
     jpeg_rejected: int = 0
+    #: FRAME-SET SYNC (see that module-level section): the age of the last
+    #: frame read, from the driver's capture time (None when the source
+    #: reports none).
+    frame_age_ms: float | None = None
     #: SYNTHETIC JPEG (see that module-level section): this slot had no
     #: camera JPEG, so we encoded one ourselves and published the decode of
     #: it. Distinct from `jpeg_passthrough`, which means the bytes came from
@@ -1248,6 +1294,40 @@ class CameraHub:
         # Absent for a frame the pump never published (a camera's warm
         # frame at open), which no ring set holds.
         self._slot_generation: dict[int, int] = {}
+        # FRAME-SET SYNC: the capture time of the frame in `_last_frames`,
+        # on the clock `_last_clock` names ("driver" or "arrival" -- see
+        # set_assembly's "THE CLOCK" section), written in the same locked
+        # step as the frame. `_read_capture_ms` is per-reader-thread
+        # handoff only: `_read_one_raw()` notes a local read's driver
+        # capture time there for that SAME slot's reader thread to pick up
+        # a moment later and hand to the Assembler -- never read cross-slot,
+        # so no lock is needed around it (each key is written and read by
+        # exactly one thread).
+        self._last_capture_ms: dict[int, float] = {}
+        self._last_clock: "str | None" = None
+        self._read_capture_ms: dict[int, "float | None"] = {}
+        # THE CHOOSING HALF of FRAME-SET SYNC (opendarts.live.set_assembly):
+        # picks one frame per camera, from each camera's own recent
+        # stamped history, so a set shows one instant. Reset whenever the
+        # hub (re)opens -- a stale history from a previous session must
+        # never be compared against a fresh one's capture times.
+        self._assembler: Assembler = Assembler()
+        #: The last SetChoice _pump_once() actually committed, or None
+        #: before the first one -- what grab_frames()/frame_set_sync()
+        #: report sync from.
+        self._last_choice: "Any" = None
+        #: Cumulative count of SetChoice.repeats across every committed
+        #: set this session -- diagnostic only (frame_set_sync()).
+        self._repeats_total: int = 0
+        # One daemon reader thread per opened slot (local, stream or
+        # preset source), started by open_all() and stopped by
+        # close_all() -- see `_reader_loop()`'s own docstring. Empty for a
+        # hub nothing has opened, or built by hand for a test that drives
+        # `_pump_once()` directly without starting readers (that call
+        # falls back to a single synchronous read per slot -- see
+        # `_read_all_once_and_push()`).
+        self._reader_threads: "dict[int, threading.Thread]" = {}
+        self._reader_stop: threading.Event = threading.Event()
         # A Condition wrapping a plain Lock -- see module docstring's
         # "FRAME-DRIVEN WAKE PRIMITIVE" section for why this replaced a
         # bare Lock (2026-09-05): every pre-existing `with
@@ -1412,6 +1492,11 @@ class CameraHub:
                 "cannot reconfigure while the pump thread is still running -- "
                 "close_all() joins it, call that first"
             )
+        if any(t.is_alive() for t in self._reader_threads.values()):
+            raise RuntimeError(
+                "cannot reconfigure while per-camera reader threads are still "
+                "running -- close_all() joins them, call that first"
+            )
         previous = list(self._slot_urls)
         # `sources=None` means "keep them", the same convention `urls=None`
         # already uses and for the same reason: the dashboard sends only
@@ -1575,6 +1660,12 @@ class CameraHub:
         self._last_frames = {i: None for i in range(len(self.configs))}
         self._last_jpegs = {}
         self._slot_generation = {}
+        self._last_capture_ms = {}
+        self._last_clock = None
+        self._read_capture_ms = {}
+        self._assembler = Assembler()
+        self._last_choice = None
+        self._repeats_total = 0
         self._raw_slots = set()
         ok_flags = [False] * len(self.configs)
         for i in preset_slots:
@@ -1604,20 +1695,42 @@ class CameraHub:
         else:
             log.info("opened %d/%d cameras ok", n_ok, len(local_slots))
 
-        # Start the pump AFTER every camera has been opened (concurrently,
-        # above) -- the proven open_all() ordering (the
-        # pump still only ever starts once ALL cameras have finished their
-        # own open attempt, success or failure; only the opening itself is
-        # now parallel across cameras, not the pump-start ordering).
-        # Only start it if at least one camera actually opened; a hub
-        # with zero working cameras has nothing to pump and no caller
-        # should be relying on a pump thread existing in that case.
+        # Start one reader thread per opened slot, THEN the pump, AFTER
+        # every camera has been opened (concurrently, above) -- the
+        # proven open_all() ordering (the pump still only ever starts
+        # once ALL cameras have finished their own open attempt, success
+        # or failure; only the opening itself is now parallel across
+        # cameras, not the pump-start ordering). Only start either if at
+        # least one camera actually opened; a hub with zero working
+        # cameras has nothing to read or pump and no caller should be
+        # relying on either existing in that case.
         self._pump_stop.clear()
+        self._reader_stop.clear()
         if any(ok_flags):
             self._pool = ThreadPoolExecutor(
                 max_workers=max(1, len(self.configs)),
                 thread_name_prefix="local-cam-pump-worker",
             )
+            # PER-SLOT READER THREADS (opendarts.live.set_assembly's "THE
+            # DESIGN", READING half): one per opened slot, reading as fast
+            # as that slot's own source delivers -- never waiting on any
+            # other slot, which is what let a driver queue back up under
+            # the old lockstep pump. `_pump_once()` below only CHOOSES
+            # among what these have already stamped and pushed.
+            self._reader_threads = {
+                i: threading.Thread(
+                    target=self._reader_loop, args=(i,),
+                    name=f"local-cam-reader-{i}", daemon=True,
+                )
+                for i, ok in enumerate(ok_flags) if ok
+            }
+            # Every opened slot is registered BEFORE its first frame, so the
+            # Assembler knows to wait for a camera that is still starting
+            # rather than open the session on sets with it missing.
+            with self._cache_lock:
+                self._assembler = Assembler(self._reader_threads)
+            for t in self._reader_threads.values():
+                t.start()
             self._pump_thread = threading.Thread(
                 target=self._pump_loop, name="local-cam-pump", daemon=True
             )
@@ -2170,7 +2283,13 @@ class CameraHub:
         array for a pixels-only slot), plus each slot's JPEG and ring
         generation, all read under one lock hold so they describe the same
         frames. Reading a VALUE of the returned mapping decodes that frame;
-        see opendarts/capture/lazy_frame.py."""
+        see opendarts/capture/lazy_frame.py.
+
+        `in_sync`/`sync_spread_ms`/`capture_ms`/`stamp_clock` describe the
+        last SetChoice `_pump_once()` actually published (opendarts.live.
+        set_assembly.Assembler) -- in_sync means no camera was left out of
+        it (see SetChoice.stalled); there is no spread threshold to tune
+        or refuse against any more."""
         handles: "dict[int, Any]" = {}
         with self._cache_lock:
             for i in range(len(self.configs)):
@@ -2180,7 +2299,15 @@ class CameraHub:
             jpegs = {i: self._last_jpegs[i] for i in handles if i in self._last_jpegs}
             generations = {i: self._slot_generation[i] for i in handles
                            if i in self._slot_generation}
-        return LazyFrames(handles, jpegs=jpegs, generations=generations)
+            capture_ms = {i: self._last_capture_ms[i] for i in handles
+                         if i in self._last_capture_ms}
+            stamp_clock = self._last_clock
+            choice = self._last_choice
+            in_sync = True if choice is None else not choice.stalled
+            spread = None if choice is None else choice.spread_ms
+        return LazyFrames(handles, jpegs=jpegs, generations=generations,
+                          in_sync=in_sync, sync_spread_ms=spread,
+                          capture_ms=capture_ms, stamp_clock=stamp_clock)
 
     def _read_one(self, i: int) -> "tuple[np.ndarray | None, bytes | None]":
         """`_read_one_raw()`, plus the SYNTHETIC JPEG round trip for a slot
@@ -2233,14 +2360,23 @@ class CameraHub:
         stream = self._sources.get(i)
         if stream is not None:
             read_pair = getattr(stream, "read_pair", None)
-            if read_pair is not None:
-                return read_pair()
-            return stream.read(), None
+            pair = read_pair() if read_pair is not None else (stream.read(), None)
+            # A source that KNOWS when its frame was captured says so (a
+            # capability, not a type check): a replay knows the recorded
+            # moment, so a replayed set is reassembled exactly as recorded.
+            # Its times are on the recording's clock, which only ever meets
+            # other times from the same recording -- one slot without them
+            # puts the whole set on arrival times (set_assembly, THE CLOCK).
+            # A live stream has none and is stamped on arrival.
+            self._read_capture_ms[i] = getattr(stream, "capture_time_ms", None)
+            return pair
         cap = self._caps.get(i)
         if cap is None or not cap.isOpened():
             return None, None
         try:
             ok, frame = cap.read()
+            if ok:
+                self._note_capture_time(i, cap)
         except Exception: # noqa: BLE001 -- one bad camera must never kill the pump
             return None, None
         if not ok:
@@ -2267,6 +2403,69 @@ class CameraHub:
         if scale is not None:
             decoded, jpeg = self._eager((decoded, jpeg))
         return decoded, jpeg
+
+    def _capture_age_ms(self, cap: Any) -> "tuple[float | None, float | None]":
+        """(capture time, age) for the frame `cap` last returned, both in
+        ms on the SAME clock as time.perf_counter() -- or (None, None)
+        when its backend reports none we can use. See set_assembly's "THE
+        CLOCK" section for why perf_counter(), not monotonic(): the
+        Assembler's arrival times are stamped on it, and age has to agree
+        with whichever clock a reader thread hands the Assembler."""
+        try:
+            ts = float(cap.get(cv2.CAP_PROP_POS_MSEC))
+        except Exception: # noqa: BLE001
+            return None, None
+        if not ts or ts <= 0:
+            return None, None
+        age = time.perf_counter() * 1000.0 - ts
+        if age < 0 or age > CAPTURE_TS_MAX_AGE_MS:
+            return None, None
+        return ts, age
+
+    def _note_capture_time(self, i: int, cap: Any) -> None:
+        """FRAME-SET SYNC's successor (opendarts.live.set_assembly): stash
+        this read's driver capture time in `_read_capture_ms[i]` for slot
+        `i`'s OWN reader thread to pop a moment later and hand to the
+        Assembler as `driver_ms` -- and update the frame_age_ms
+        diagnostic. Driver times reach the Assembler ONLY on Linux
+        (CLOCK_MONOTONIC, the same clock as time.perf_counter() there);
+        Windows' own MF reader returns 0 here and macOS's AVFoundation
+        synthesises a value that is not on our clock at all, so both stay
+        None and that camera's sets fall back to arrival time for every
+        camera -- never driver time for some and arrival for others."""
+        ts, age = self._capture_age_ms(cap)
+        status = self.status.get(i)
+        if status is not None:
+            status.frame_age_ms = round(age, 1) if age is not None else None
+        self._read_capture_ms[i] = (
+            ts if (ts is not None and sys.platform.startswith("linux")) else None
+        )
+
+    def frame_set_sync(self) -> "dict[str, Any]":
+        """The last published set's sync, replacing the old drain/refusal
+        design -- see opendarts.live.set_assembly's module docstring.
+        `in_sync` means simply "no camera was left out of the set"; there
+        is no spread threshold to tune or refuse against any more.
+        `dropped` is per-slot: frames a camera delivered that were pushed
+        out by the Assembler's own history cap before any set ever used
+        them (only possible while another camera stalls or lags badly)."""
+        with self._cache_lock:
+            choice = self._last_choice
+            repeats_total = self._repeats_total
+            dropped = {s: b.dropped for s, b in self._assembler.buffers.items() if b.dropped}
+        if choice is None:
+            return {
+                "in_sync": True, "spread_ms": None, "clock": None,
+                "stalled": [], "repeats_total": repeats_total, "dropped": dropped,
+            }
+        return {
+            "in_sync": not choice.stalled,
+            "spread_ms": round(choice.spread_ms, 1),
+            "clock": "driver" if choice.use_driver else "arrival",
+            "stalled": list(choice.stalled),
+            "repeats_total": repeats_total,
+            "dropped": dropped,
+        }
 
     def _eager(self, pair: "tuple[Any, bytes] | None") -> "tuple[Any, bytes] | None":
         """Decode a small-decode slot's full pixels HERE, on its worker
@@ -2298,10 +2497,107 @@ class CameraHub:
             rates = []
         return 1.0 / float(max(rates)) if rates else 1.0 / float(DEFAULT_FPS)
 
+    def _nominal_period_s(self, i: int) -> float:
+        """Slot `i`'s own configured frame period, for its reader's
+        failure-sleep (never a busy spin) -- falls back to DEFAULT_FPS
+        when unconfigured or nonsensical, same posture as
+        `_stall_backoff_s()`."""
+        try:
+            fps = self.configs[i].fps
+        except IndexError:
+            fps = 0
+        return 1.0 / float(fps) if fps and fps > 0 else 1.0 / float(DEFAULT_FPS)
+
+    def _reader_loop(self, i: int) -> None:
+        """Slot `i`'s OWN dedicated reader -- opendarts.live.set_assembly's
+        "THE DESIGN", READING half. Reads as fast as this slot's source
+        delivers, never waiting on any other slot (that waiting is what
+        let a driver queue back up under the old lockstep pump), stamps
+        every frame with its arrival time plus the driver's capture time
+        when the platform gives a usable one (`_note_capture_time()`,
+        via `_read_one()`), and pushes it straight into the Assembler.
+        `_pump_once()` below only CHOOSES among what reader threads have
+        already stamped and pushed; it never calls cap.read() itself.
+
+        Decode/synthetic-JPEG work stays on THIS thread (inside
+        `_read_one()`), exactly as it did on the old pump's own per-camera
+        worker threads -- that is what keeps three cameras' decodes
+        running in parallel rather than serialised behind one lock.
+
+        Runs until close_all() (`_reader_stop`) stops it."""
+        while not self._reader_stop.is_set():
+            frame, jpeg = self._read_one(i)
+            if frame is not None:
+                arrival_ms = time.perf_counter() * 1000.0
+                driver_ms = self._read_capture_ms.pop(i, None)
+                status = self.status.get(i)
+                with self._cache_lock:
+                    self._assembler.push(i, arrival_ms, driver_ms, payload=(frame, jpeg))
+                    if status is not None:
+                        _update_effective_fps(status, time.monotonic())
+                    self._cache_lock.notify_all()
+                continue
+            status = self.status.get(i)
+            if status is not None:
+                stream = self._sources.get(i)
+                status.last_read_at = time.time()
+                status.last_read_ok = False
+                # A stream knows something specific about why it came back
+                # empty ("HTTP 503", "stream ended", "connection refused");
+                # replacing that with this layer's generic answer would
+                # turn a precise explanation into a shrug.
+                status.last_error = (
+                    stream.read_failure_reason() if stream is not None
+                    else "no decodable JPEG from the camera"
+                    if i in self._raw_slots
+                    else "cap.read() returned no frame"
+                )
+            # Interruptible: close_all() must not have to wait out a whole
+            # failed camera's frame period before this thread notices
+            # _reader_stop.
+            if self._reader_stop.wait(self._nominal_period_s(i)):
+                break
+
+    def _read_all_once_and_push(self) -> None:
+        """FALLBACK for `_pump_once()` when no per-camera reader thread is
+        running -- a caller driving the hub by hand, bypassing
+        open_all()'s readers (see tests/test_frame_ring_hub_tap.py's
+        test_ring_stamps_match_the_camera_status_stamps_from_the_same_cycle,
+        which does exactly this for an exact 1:1 cycle<->set
+        correspondence). Reads every configured slot once via the pool --
+        the lockstep read this hub used before per-camera readers existed
+        -- and pushes whatever succeeded into the Assembler, so the wait
+        in `_pump_once()` has something fresh to choose from this cycle."""
+        n = len(self.configs)
+        results = list(self._pool.map(self._read_one, range(n)))
+        now = time.time()
+        with self._cache_lock:
+            for i, (frame, jpeg) in enumerate(results):
+                stream = self._sources.get(i)
+                cap = self._caps.get(i)
+                status = self.status.get(i)
+                if cap is None and stream is None:
+                    continue
+                if frame is None:
+                    if status is not None:
+                        status.last_read_at = now
+                        status.last_read_ok = False
+                        status.last_error = (
+                            stream.read_failure_reason() if stream is not None
+                            else "no decodable JPEG from the camera"
+                            if i in self._raw_slots
+                            else "cap.read() returned no frame"
+                        )
+                    continue
+                arrival_ms = time.perf_counter() * 1000.0
+                driver_ms = self._read_capture_ms.pop(i, None)
+                self._assembler.push(i, arrival_ms, driver_ms, payload=(frame, jpeg))
+                if status is not None:
+                    _update_effective_fps(status, time.monotonic())
+
     def _pump_loop(self) -> None:
-        """The hub's single dedicated cap.read() thread for its whole
-        lifetime -- see module docstring's "ARCHITECTURE CHANGE"
-        section. Runs _pump_once() back-to-back until close_all() sets
+        """The hub's single dedicated set-publishing thread for its whole
+        lifetime. Runs _pump_once() back-to-back until close_all() sets
         _pump_stop. An unexpected exception inside _pump_once() is
         logged and backed off from, never allowed to kill this thread
         silently."""
@@ -2313,106 +2609,107 @@ class CameraHub:
                 time.sleep(0.05)
 
     def _pump_once(self) -> None:
-        """One pump cycle: read every configured camera IN PARALLEL via
-        this hub's own ThreadPoolExecutor (one worker per camera,
-        the `pool.map(read_one, range(n))` pattern), then
-        update the cache and per-camera CameraStatus fields for whichever
-        cameras produced a frame. Cameras that were never opened (failed
-        backend probe, or disabled in config) are left alone -- their
-        status already reflects why, set once by _open_one_locked(), and
-        is not touched here."""
+        """One pump cycle: ask the Assembler (opendarts.live.set_assembly)
+        for the next matched frame set and publish it -- this method no
+        longer calls cap.read() itself at all; per-camera reader threads
+        (`_reader_loop()`) already did that and pushed what they read.
+
+        Waits, under the cache lock (so a reader's notify_all() can never
+        land invisibly between a check and a wait -- same FRAME-DRIVEN
+        WAKE discipline as `wait_for_new_frame()`), for `next_set()` to
+        return a SetChoice, for at most ~2 stall periods. If one never
+        arrives this cycle (every camera stalled, or the hub is closing),
+        the generation still bumps and notifies -- "a completed pump
+        cycle always bumps" (see FRAME-DRIVEN WAKE) -- but nothing is
+        handed to the sink or ring: only a new set is published.
+        """
         n = len(self.configs)
         if n == 0 or self._pool is None:
             time.sleep(0.05)
             return
-        now = time.time()
-        now_monotonic = time.monotonic()
-        # Sampled in the SAME instant as `now` above (not a second,
-        # independently-timed call a few lines later) so the two clocks
-        # describe the identical real moment -- see `last_read_at_
-        # monotonic`'s own field comment on CameraStatus for why a
-        # consumer needs this monotonic twin, not `now` itself. Used
-        # ONLY on the successful-read branch below, deliberately NOT
-        # mirrored onto the failure branch the way `now`/`last_read_at`
-        # already are -- a genuine, intentional semantic difference from
-        # `last_read_at`, not an oversight: `last_read_at` already means
-        # "the pump's last ATTEMPT" (see grab()'s own docstring), which
-        # is right for that field's own purpose (surfacing whether the
-        # pump is currently healthy) but wrong for a FRAME-AGE
-        # computation -- on a failing pump cycle, `_last_frames[i]`
-        # keeps serving the last frame that WAS successfully read
-        # (grab()'s own docstring: "a momentary hiccup does not null out
-        # an otherwise-good previous frame"), so stamping this field on
-        # a failed attempt would make a served frame look FRESHER than
-        # it actually is, exactly backwards for a diagnostic whose whole
-        # point is catching a frame that's staler than it looks.
-        results = list(self._pool.map(self._read_one, range(n)))
+        if not self._reader_threads:
+            self._read_all_once_and_push()
 
-        any_live = False
+        # Two of the slowest camera's MEASURED periods, not the configured
+        # rate: a camera running at 15 fps under dynamic framerate must not
+        # time every other cycle out (a timed-out cycle wakes the capture
+        # loop with nothing new to judge).
         with self._cache_lock:
-            for i, (frame, jpeg) in enumerate(results):
-                stream = self._sources.get(i)
-                cap = self._caps.get(i)
-                status = self.status.get(i)
-                if cap is None and stream is None:
-                    # Never opened -- nothing this pump cycle can say
-                    # about it that _open_one_locked() didn't already.
-                    continue
-                if frame is None:
+            slowest_ms = max((b.period_ms for b in self._assembler.buffers.values()), default=0.0)
+        deadline_ms = time.perf_counter() * 1000.0 + max(
+            2000.0 * self._stall_backoff_s(), 2.0 * slowest_ms, 1.0)
+        choice = None
+        with self._cache_lock:
+            while True:
+                choice = self._assembler.next_set(time.perf_counter() * 1000.0)
+                if choice is not None or self._pump_stop.is_set():
+                    break
+                remaining_s = (deadline_ms - time.perf_counter() * 1000.0) / 1000.0
+                if remaining_s <= 0:
+                    break
+                self._cache_lock.wait(min(remaining_s, 0.01))
+
+            # Sampled once, inside the lock, whether or not a choice was
+            # found this cycle -- see `last_read_at_monotonic`'s own field
+            # comment on CameraStatus for why a consumer needs this
+            # monotonic twin, and tests/test_frame_ring_hub_tap.py's
+            # test_ring_stamps_match_the_camera_status_stamps_from_the_same_cycle
+            # for why it must be exactly one pair per cycle, not one per
+            # published slot.
+            now = time.time()
+            now_monotonic = time.monotonic()
+            if choice is not None:
+                self._assembler.commit(choice)
+                self._last_choice = choice
+                self._last_clock = "driver" if choice.use_driver else "arrival"
+                self._repeats_total += len(choice.repeats)
+                for i, stamped in choice.picks.items():
+                    frame, jpeg = stamped.payload
+                    is_repeat = i in choice.repeats
+                    # Every frame here is already detached from anything
+                    # its source will write into again (see _read_one()'s
+                    # own docstring), so a caller holding a grab()'d
+                    # reference across the next pump cycle still sees the
+                    # frame it was given.
+                    self._last_frames[i] = frame
+                    self._last_capture_ms[i] = choice.stamp(i)
+                    if jpeg is not None:
+                        self._last_jpegs[i] = jpeg
+                    else:
+                        self._last_jpegs.pop(i, None)
+                    status = self.status.get(i)
+                    if not is_repeat:
+                        # The generation this cycle is about to publish
+                        # (the bump below, under this same lock hold) --
+                        # repeats keep their EARLIER generation (see
+                        # `_slot_generation`'s own field comment: "the
+                        # generation that FIRST published the frame").
+                        self._slot_generation[i] = self._frame_generation + 1
                     if status is not None:
                         status.last_read_at = now
-                        status.last_read_ok = False
-                        # A stream knows something specific about why it
-                        # came back empty ("HTTP 503", "stream ended",
-                        # "connection refused"); replacing that with this
-                        # layer's generic answer would turn a precise
-                        # explanation into a shrug.
-                        status.last_error = (
-                            stream.read_failure_reason() if stream is not None
-                            else "no decodable JPEG from the camera"
-                            if i in self._raw_slots
-                            else "cap.read() returned no frame"
-                        )
-                    continue
-                any_live = True
-                # Every frame here is already detached from anything its
-                # source will write into again, so a caller holding a
-                # grab()'d reference across the NEXT pump cycle still sees
-                # the frame it was given, so consumers can hold refs.
-                # A local decoded-in-driver frame was copied
-                # by _read_one() on its worker thread; a stream, replay or
-                # passthrough frame is a fresh array from cv2.imdecode.
-                # A slot with no camera JPEG already had its SYNTHETIC JPEG
-                # made in _read_one(), on its own worker thread -- never here,
-                # inside the cache lock, where it serialised the cameras.
-                copied = frame
-                self._last_frames[i] = copied
-                # The generation this cycle is about to publish (the bump
-                # below, under this same lock hold).
-                self._slot_generation[i] = self._frame_generation + 1
-                if jpeg is not None:
-                    self._last_jpegs[i] = jpeg
-                else:
-                    self._last_jpegs.pop(i, None)
-                if status is not None:
-                    status.last_read_at = now
-                    status.last_read_at_monotonic = now_monotonic
-                    status.last_read_ok = True
-                    status.frame_count += 1
-                    _update_effective_fps(status, now_monotonic)
-                    h, w = copied.shape[:2]
-                    status.actual_width = int(w)
-                    status.actual_height = int(h)
+                        status.last_read_at_monotonic = now_monotonic
+                        status.last_read_ok = True
+                        # A repeat is this camera's own read not having
+                        # produced anything new for this set -- the same
+                        # thing a failed read meant before per-camera
+                        # readers existed, and frame_count must not
+                        # advance for it either: that is the capture
+                        # loop's own per-camera freshness gate.
+                        if not is_repeat:
+                            status.frame_count += 1
+                        h, w = frame.shape[:2]
+                        status.actual_width = int(w)
+                        status.actual_height = int(h)
+                # Slots in choice.stalled keep their previous frame,
+                # untouched -- exactly as a failed read did before
+                # per-camera readers existed.
 
             # FRAME-DRIVEN WAKE, 2026-09-05 -- bump once per COMPLETED
-            # pump cycle, regardless of `any_live` (see module docstring's
-            # "FRAME-DRIVEN WAKE PRIMITIVE" section): a waiter cares about
-            # "did the pump do another cycle of work" so it can re-check
-            # its own per-camera frame_count-based staleness logic sooner
-            # rather than sitting on a fixed timer -- whether that cycle
-            # happened to succeed on every camera is a SEPARATE, unchanged
-            # question (still answered by CameraStatus.frame_count per
-            # camera, untouched by this counter). Still inside `with
+            # pump cycle, whether or not this cycle found a new SetChoice
+            # (see this method's own docstring): a waiter cares about "did
+            # the pump do another cycle of work" so it can re-check its
+            # own per-camera frame_count-based staleness logic sooner
+            # rather than sitting on a fixed timer. Still inside `with
             # self._cache_lock:` -- the mutation and the notify must be
             # atomic with respect to a waiter's own check-then-wait, or
             # the classic lost-wakeup race this design exists to avoid
@@ -2420,18 +2717,11 @@ class CameraHub:
             self._frame_generation += 1
             self._cache_lock.notify_all()
             # SLOTS WITH A FRAME ONLY -- the same "absent, not None"
-            # contract grab_all() has always had. This used to be a plain
-            # dict() copy, which on a local rig meant a camera that failed
-            # to open was published as None on every cycle; the publishers
-            # each grew their own `if frame is None: return False` to cope.
-            # Harmless there because a failed camera is rare and permanent.
-            # Not harmless once a slot can be a STREAM: a stream is None
-            # for its whole connect time and for every second it is down,
-            # so an all-stream rig with nothing connected called the sink
-            # ~30 times a second with a dict of three Nones, and a test
-            # asserting "every slot present" passed on a set that carried
-            # no pixels at all. Found by running the real publisher over a
-            # real socket, not by the suite.
+            # contract grab_all() has always had, built from whatever
+            # `_last_frames` holds NOW (this cycle's picks plus every
+            # earlier cycle's still-cached slots) -- exactly as before
+            # per-camera readers existed, where a cycle with no live
+            # camera still republished the existing cache.
             #
             # BUILT ONCE FOR BOTH CONSUMERS. The ring taps the same point
             # the sink does -- one cycle, one complete frame set, the
@@ -2439,10 +2729,19 @@ class CameraHub:
             # would be two dict comprehensions over the same data and,
             # worse, two chances for the two to disagree about what "this
             # cycle's set" means.
+            #
+            # ONLY A NEW SET IS PUBLISHED. A cycle that timed out with no
+            # new SetChoice bumps the generation (above) but hands the sink
+            # and ring nothing: re-sending the cached set would put a
+            # duplicate set in the ring (a dump would show every camera
+            # "repeating" at once, and a replay would play it as new
+            # frames), and with a camera slower than the wait -- 15 fps
+            # under dynamic framerate -- that would happen every few sets.
             ring = self._frame_ring
             published = (
                 {i: f for i, f in self._last_frames.items() if f is not None}
-                if (self._frame_sink is not None or ring is not None) else None
+                if choice is not None and (self._frame_sink is not None or ring is not None)
+                else None
             )
             # The camera JPEGs for exactly those frames. Only slots in
             # `published` can appear, so a consumer never gets bytes for a
@@ -2451,6 +2750,14 @@ class CameraHub:
                 {i: self._last_jpegs[i] for i in published if i in self._last_jpegs}
                 if published else {}
             )
+            # Per-camera capture times for exactly those frames, plus
+            # which clock they are on -- see frame_ring.FrameSet /
+            # frame_dump's manifest for what a dump does with these.
+            capture_ms = (
+                {i: self._last_capture_ms[i] for i in published if i in self._last_capture_ms}
+                if published else {}
+            )
+            clock = self._last_clock if published else None
             generation = self._frame_generation
 
         # Outside the lock on purpose: publishing copies several megabytes
@@ -2460,7 +2767,8 @@ class CameraHub:
         if sink is not None and published:
             try:
                 # A sink that does not take LazyFrames gets pixels; _eager()
-                # already decoded them on the workers, so this costs nothing.
+                # already decoded them on the reader threads, so this costs
+                # nothing.
                 to_sink = (published if _takes_lazy(sink)
                            else {i: pixels_of(f) for i, f in published.items()})
                 if sink_takes_jpegs:
@@ -2475,19 +2783,19 @@ class CameraHub:
         # THE RING TAP. Also outside the lock, for the same reason -- and
         # by REFERENCE, which is the whole reason this feature is
         # affordable: every array in `published` was already allocated by
-        # this cycle (a local camera's was `.copy()`d off OpenCV's
-        # reusable buffer a few lines above, a source's is a fresh array
-        # it will never touch again) and would be freed on the next cycle
-        # when `_last_frames[i]` is reassigned. Retaining it defers that
-        # free; it does not add an allocation, a copy or a memcpy. See
+        # its own reader thread (a local camera's was `.copy()`d off
+        # OpenCV's reusable buffer there, a source's is a fresh array it
+        # will never touch again) and would be freed once no `_last_frames`
+        # entry still points to it. Retaining it defers that free; it does
+        # not add an allocation, a copy or a memcpy. See
         # opendarts/capture/frame_ring.py's own docstring for the measured
         # numbers behind that claim and what it costs in memory.
         #
         # Both clock samples are the pump's OWN `now`/`now_monotonic`,
-        # taken in the same instant at the top of this method -- not two
-        # fresh calls here, which would describe a third instant and make
-        # the ring's ordering disagree with the CameraStatus fields
-        # written from the same pair.
+        # taken in the same instant inside the lock above -- not two fresh
+        # calls here, which would describe a third instant and make the
+        # ring's ordering disagree with the CameraStatus fields written
+        # from the same pair.
         if ring is not None and published:
             try:
                 ring.append(
@@ -2496,33 +2804,13 @@ class CameraHub:
                     monotonic_s=now_monotonic,
                     generation=generation,
                     jpegs=published_jpegs,
+                    capture_ms=capture_ms,
+                    clock=clock,
                 )
             except Exception: # noqa: BLE001 -- a diagnostic must never break capture
                 self.frame_ring_errors += 1
                 if self.frame_ring_errors == 1:
                     log.exception("frame ring raised -- continuing without it")
-
-        if not any_live:
-            # Avoid busy-spinning the pump when every camera is
-            # mid-reopen/failing -- a real camera's cap.read() otherwise
-            # blocks naturally until the next frame is ready, so this
-            # sleep only matters in the all-failing case.
-            #
-            # BACKOFF IS THE CAMERA'S OWN FRAME PERIOD, not a flat 20ms,
-            # 2026-09-13 (CPU task). The flat 0.02 cycled a fully-stalled
-            # hub at ~50Hz while a HEALTHY hub cycles at the camera's
-            # ~30fps -- so a stall made this thread cycle FASTER than
-            # success, and because `_frame_generation` bumps once per
-            # COMPLETED cycle regardless of `any_live` (see the bump's own
-            # comment above), every one of those cycles also woke the
-            # frame-driven consumer in capture_daemon. Measured live on
-            # the Windows rig with all three cameras stalled: the capture
-            # loop ran 499 full iterations in 10.66s (46.8/s) against its
-            # configured 20Hz, each doing real lifecycle work and writing
-            # a WARNING line. Degradation cost more CPU than health, which
-            # is backwards. Sleeping the nominal frame period instead
-            # makes a stalled cycle no faster than a delivering one.
-            time.sleep(self._stall_backoff_s())
 
     def close_all(self) -> None:
         """Stop the pump thread FIRST (signal + join with a bounded
@@ -2568,14 +2856,15 @@ class CameraHub:
         lifetime) rather than reset to zero/None, which would destroy
         real information for no honesty benefit."""
         self._pump_stop.set()
+        self._reader_stop.set()
         # SIGNAL EVERY STREAM BEFORE JOINING ANY OF THEM, and before the
-        # pump is joined: a pump worker may be parked inside
-        # StreamSource.read() waiting out its frame budget, and the pump
-        # thread cannot finish its cycle until that worker returns. Same
-        # ordering principle as "retire the readers before the captures
-        # they hold", one layer up -- and signalling all of them first
-        # means three dying streams cost one connect timeout between them
-        # rather than three in series.
+        # pump or any per-camera reader thread is joined: a reader thread
+        # may be parked inside StreamSource.read() waiting out its frame
+        # budget, and it cannot notice `_reader_stop` until that call
+        # returns. Same ordering principle as "retire the readers before
+        # the captures they hold", one layer up -- and signalling all of
+        # them first means three dying streams cost one connect timeout
+        # between them rather than three in series.
         sources = list(self._sources.values())
         for source in sources:
             source.stop()
@@ -2583,6 +2872,20 @@ class CameraHub:
         self._pump_thread = None
         if thread is not None and thread.is_alive():
             thread.join(timeout=2.0)
+        # RETIRE THE READERS BEFORE THE CAPTURES THEY HOLD. Every
+        # per-camera reader thread started by open_all() is joined here,
+        # BEFORE the pool shuts down and BEFORE any cv2.VideoCapture is
+        # released below -- the same guarantee this ordering has always
+        # given the pump thread, now extended to the threads that actually
+        # call cap.read(). A reader blocked inside a local camera's own
+        # cap.read() cannot be interrupted (no real camera read ever could
+        # be); it finishes that one read, notices `_reader_stop` on its
+        # next loop check, and exits.
+        reader_threads = list(self._reader_threads.values())
+        self._reader_threads = {}
+        for t in reader_threads:
+            if t.is_alive():
+                t.join(timeout=2.0)
         if self._pool is not None:
             self._pool.shutdown(wait=True)
             self._pool = None
@@ -2611,6 +2914,11 @@ class CameraHub:
             self._last_frames.clear()
             self._last_jpegs.clear()
             self._slot_generation.clear()
+            self._last_capture_ms.clear()
+            self._last_clock = None
+            self._last_choice = None
+            self._repeats_total = 0
+            self._assembler = Assembler()
             # FRAME-DRIVEN WAKE, 2026-09-05 -- bump+notify here too, not
             # just in _pump_once(): this is the ONLY notify that can ever
             # fire for a hub whose pump thread never started at all (zero

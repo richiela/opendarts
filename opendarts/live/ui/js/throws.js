@@ -198,6 +198,19 @@ const Throws = (() => {
       h('span', {class: 'r dim'}, clock(p.captured_at_utc)));
   }
 
+  // The primary's column IS the call (rla: "we know Zeus makes the call"):
+  // the scoreboard's call, which is the primary's unless a person
+  // corrected it -- then the correction, with what the primary said
+  // struck through beside it, as a wrong engine reads in the other columns.
+  function primaryCell(p) {
+    const fixed = p.ad_operator_confirmed_ring ? shownCall(p) : null;
+    const said = ours(p);
+    if (!fixed || sameCall(fixed, said)) return callCell(p);
+    return h('span', {class: 'call'}, callLabel(fixed.sector, fixed.ring),
+      h('s', {class: 'was', title: (p.primary_engine || 'The primary') + ' said ' + callLabel(said.sector, said.ring) + ' — a person recorded ' + callLabel(fixed.sector, fixed.ring)},
+        noRead(p) ? 'NO READ' : callLabel(said.sector, said.ring)));
+  }
+
   // Every engine's call, side by side -- the view for studying the engines.
   // Each cell is marked against the known answer: right, wrong (struck
   // through), or unknown when nothing has been graded.
@@ -205,7 +218,7 @@ const Throws = (() => {
     const v = verdict(p);
     const truth = truthOf(p);
     const secs = new Map(sections(p).map((s) => [s.name, s]));
-    const cells = cols.map((name) => {
+    const cells = cols.slice(1).map((name) => {
       const s = secs.get(name);
       if (!s) return p._pending ? h('span', {class: 'mcell none pending', title: name + ': on its way'}, '…') : h('span', {class: 'mcell none'}, '—');
       if (s.timed_out) return h('span', {class: 'mcell none', title: name + ': timed out'}, 'TIME');
@@ -222,13 +235,13 @@ const Throws = (() => {
       ad = h('span', {class: 'mcell ' + cls, title: 'Autodarts' + (p.ad_latency_ms ? ' · ' + Math.round(p.ad_latency_ms) + ' ms' : '')}, callLabel(adCall.sector, adCall.ring));
     }
     return h('button', {type: 'button', class: 'trow v-' + v.key + (passes(p, 'split') ? ' split' : '') + (p.path === selected ? ' sel' : ''), dataset: {path: p.path}, onclick: () => select(p.path, true)},
-      h('span', {class: 'ix'}, String(number)), dartNum(p), callCell(p), cells, ad, h('span', {class: 'r dim'}, clock(p.captured_at_utc, false)));
+      h('span', {class: 'ix'}, String(number)), dartNum(p), primaryCell(p), cells, ad, h('span', {class: 'r dim'}, clock(p.captured_at_utc, false)));
   }
 
   function listHead(mode, cols) {
     const c = (t, cls) => h('span', {class: cls || ''}, t);
     return mode === 'matrix'
-      ? h('div', {class: 'thead'}, c('#'), c(''), c('Call'), cols.map((n) => c(n.slice(0, 6), 'ctr')), c('AD', 'ctr'), c('Time', 'r'))
+      ? h('div', {class: 'thead'}, c('#'), c(''), c(cols[0] || 'Call'), cols.slice(1).map((n) => c(n.slice(0, 6), 'ctr')), c('AD', 'ctr'), c('Time', 'r'))
       : h('div', {class: 'thead'}, c('#'), c(''), c('Call'), c('Pts', 'r'), c('Vote'), c('Oracle', 'ctr'), c('Δ tip', 'r'), c('Time', 'r'));
   }
 
@@ -266,7 +279,7 @@ const Throws = (() => {
     const box = $('#throw-list');
     box.className = 'throw-list ' + (mode === 'matrix' ? 'tl-matrix' : 'tl-list');
     const cols = engineColumns(list);
-    box.style.setProperty('--eng', String(Math.max(1, cols.length)));
+    box.style.setProperty('--eng', String(Math.max(1, cols.length - 1)));   // the primary is the call column
     if (!filtered.length) {
       box.replaceChildren(h('div', {class: 'empty'},
         h('strong', {}, list.length ? 'Nothing here' : 'No throws yet'),
@@ -364,9 +377,29 @@ const Throws = (() => {
     return img;
   }
 
+  // Frames already fetched, kept loaded so the browser need not ask again;
+  // the last few throws' worth (6 each), oldest dropped first.
+  const frameCache = new Map();
+  function preloadFrames(p) {
+    for (const c of CAM_IDS) {
+      for (const k of ['bg', 'after']) {
+        const url = frameUrl(p, c, k);
+        if (frameCache.has(url)) { const im = frameCache.get(url); frameCache.delete(url); frameCache.set(url, im); continue; }
+        const im = new Image();
+        im.onerror = () => frameCache.delete(url);   // not written yet: the still's own retry covers it
+        im.src = url;
+        frameCache.set(url, im);
+      }
+    }
+    while (frameCache.size > 48) frameCache.delete(frameCache.keys().next().value);
+  }
+
   function frameUrl(p, cam, which) {
     return '/api/packages/' + encodeURIComponent(p.session) + '/' + encodeURIComponent(p.throw_id)
-      + '/frame/' + cam + '/' + which + '.png?fmt=jpeg';
+      + '/frame/' + cam + '/' + which + '.png?fmt=jpeg'
+      // Versioned by when the throw was captured: a throw id can be reused
+      // after "delete recorded data", and the browser keeps frames by URL.
+      + (p.captured_at_utc ? '&v=' + encodeURIComponent(p.captured_at_utc) : '');
   }
   function viewerUrl(p) {
     return '/packages/' + encodeURIComponent(p.session) + '/' + encodeURIComponent(p.throw_id) + '/viewer';
@@ -413,9 +446,35 @@ const Throws = (() => {
     else if (v.key === 'right' && p.ad_operator_confirmed_ring) tail = ' You confirmed it.';
     else if (!p.ad_matched && v.key !== 'noread') tail = ' Autodarts was not asked.';
     const canvas = h('canvas', {class: 'agree-canvas', 'aria-label': 'Where each engine placed the dart'});
-    const stills = h('div', {class: 'stills'}, CAM_IDS.map((c) => h('a', {href: viewerUrl(p), target: '_blank', rel: 'noopener', class: 'still', title: 'Open the full viewer'},
+    // A still opens large, over the page (Lightbox, core.js) -- never in a
+    // new window -- and steps through the cameras from there.
+    // A still opens large, over the page (Lightbox, core.js) -- never in a
+    // new window -- stepping through the cameras, Before and After a switch.
+    const tid = (p.throw_id || '').split('-').slice(-2, -1)[0];
+    const set = (k, word) => ({label: word, list: CAM_IDS.map((c) => ({src: frameUrl(p, c, k), caption: 'Cam ' + (c + 1) + ' · ' + word + ' · throw ' + tid}))});
+    const openStill = (c) => {
+      // the full viewer opens in the same overlay (Lightbox.guard), never a new window
+      const viewer = Lightbox.guard(h('a', {class: 'btn ghost lb-link', href: viewerUrl(p)}, 'Full viewer'), 'Throw viewer');
+      Lightbox.images(null, CAM_IDS.indexOf(c), viewer, [set('bg', 'Before'), set('after', 'After')], kind === 'bg' ? 0 : 1);
+    };
+    // All six frames are fetched as soon as a throw is shown, so flipping
+    // Before / After (here or in the lightbox) is instant.
+    preloadFrames(p);
+    const stills = h('div', {class: 'stills'}, CAM_IDS.map((c) => h('button', {type: 'button', class: 'still', title: 'Look closer', onclick: () => openStill(c), dataset: {cam: String(c)}},
       stillImage(p, c),
-      h('p', {class: 'figcap'}, h('span', {}, 'Cam ' + (c + 1)), h('span', {}, kind === 'bg' ? 'Before' : 'After')))));
+      h('p', {class: 'figcap'}, h('span', {}, 'Cam ' + (c + 1)), h('span', {class: 'kindw'}, kind === 'bg' ? 'Before' : 'After')))));
+    // Before / After swaps the loaded pictures in place: no rebuild, no blank.
+    const setKind = (k) => {
+      kind = k;
+      $$('.still', stills).forEach((b) => {
+        const c = Number(b.dataset.cam);
+        const img = $('img', b);
+        img.src = frameUrl(p, c, kind);
+        img.alt = 'camera ' + (c + 1) + ' ' + (kind === 'bg' ? 'before' : 'after');
+        $('.kindw', b).textContent = kind === 'bg' ? 'Before' : 'After';
+      });
+      $$('.kind-seg button', pane).forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.k === kind)));
+    };
     const xy = (a) => (a ? a[0].toFixed(1) + ', ' + a[1].toFixed(1) : '');
     const engineRows = secs.map((s) => h('tr', {class: s.primary ? 'primary' : ''},
       h('td', {}, s.name),
@@ -440,7 +499,7 @@ const Throws = (() => {
         following
           ? h('span', {class: 'follow on', title: 'The newest dart shows here as it lands'}, '● Newest')
           : h('button', {type: 'button', class: 'follow', onclick: () => { following = true; render(); }}, 'Follow newest'),
-        h('a', {href: viewerUrl(p), target: '_blank', rel: 'noopener'}, h('b', {}, 'Viewer ↗'))),
+        Lightbox.guard(h('a', {href: viewerUrl(p)}, h('b', {}, 'Viewer')), 'Throw viewer')),
       h('div', {class: 'detail-call'},
         h('span', {class: 'big'}, noRead(p) ? '—' : callLabel(call.sector, call.ring)),
         h('span', {class: 'pts'}, noRead(p) ? 'NO READ' : points(call.sector, call.ring) + ' PTS'),
@@ -453,9 +512,9 @@ const Throws = (() => {
       h('figure', {}, h('div', {class: 'cropbox agree-box'}, canvas),
         h('figcaption', {class: 'figcap'}, h('span', {}, 'Fig. — where each engine put it'), h('span', {}, p.primary_engine ? p.primary_engine + ' scored it' : ''))),
       h('div', {class: 'h'}, h('b', {}, 'Cameras'),
-        h('div', {class: 'seg'},
-          h('button', {type: 'button', 'aria-pressed': String(kind === 'bg'), onclick: () => { kind = 'bg'; renderDetail(); }}, 'Before'),
-          h('button', {type: 'button', 'aria-pressed': String(kind === 'after'), onclick: () => { kind = 'after'; renderDetail(); }}, 'After'))),
+        h('div', {class: 'seg kind-seg'},
+          h('button', {type: 'button', 'aria-pressed': String(kind === 'bg'), dataset: {k: 'bg'}, onclick: () => setKind('bg')}, 'Before'),
+          h('button', {type: 'button', 'aria-pressed': String(kind === 'after'), dataset: {k: 'after'}, onclick: () => setKind('after')}, 'After'))),
       stills,
       h('div', {class: 'h'}, h('b', {}, 'Engines'), h('span', {}, 'call · vs known · ring · Δ tip · board xy mm')),
       h('div', {class: 'table-wrap'}, h('table', {class: 'engines'}, h('tbody', {}, engineRows))),
@@ -577,7 +636,7 @@ const Throws = (() => {
 
   // j/k and the arrows walk the list; Enter says what landed.
   document.addEventListener('keydown', (ev) => {
-    if (!Shell.showing('throws') || ev.metaKey || ev.ctrlKey || ev.altKey) return;
+    if (!Shell.showing('throws') || ev.metaKey || ev.ctrlKey || ev.altKey || Lightbox.open) return;
     if (typingIn(ev.target)) return;
     const rows = $$('#throw-list .trow');
     if (!rows.length) return;

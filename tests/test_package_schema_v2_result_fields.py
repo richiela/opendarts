@@ -328,9 +328,10 @@ def test_handle_ready_to_capture_agreement_absent_for_non_vote_based_primary(tmp
 
 def test_handle_ready_to_capture_agreement_from_zeus_primary(tmp_path):
     """Zeus as PRIMARY: fake 4x4 frames give every sub-engine ok=False, so
-    Zeus itself never reaches MIN_SUB_ENGINES_TO_VOTE -- the real "0/4"
-    branch, sourced from Zeus's own diagnostics synchronously, before the
-    ScoreResult conversion would have discarded them."""
+    Zeus itself never reaches MIN_SUB_ENGINES_TO_VOTE -- the real "0/5"
+    branch (5 sub-engines since Argus, 2026-10-08), sourced from Zeus's
+    own diagnostics synchronously, before the ScoreResult conversion
+    would have discarded them."""
     bg = {0: np.full((4, 4, 3), 50, dtype=np.uint8)}
     frame = {0: np.full((4, 4, 3), 200, dtype=np.uint8)}
     calibrations = {0: _fake_calibration_attempt().calibration}
@@ -342,7 +343,7 @@ def test_handle_ready_to_capture_agreement_from_zeus_primary(tmp_path):
     background_save=False,
     )
     data = json.loads((dest_dir / "result.json").read_text())
-    assert data["agreement"] == "0/4"
+    assert data["agreement"] == "0/5"
     assert data["label"] == "NR"
 
 
@@ -370,4 +371,4 @@ def test_handle_ready_to_capture_agreement_backfilled_from_also_run_zeus(tmp_pat
     assert _wait_until(_has_other_engines), "other_engines never appeared in result.json"
     data = json.loads((dest_dir / "result.json").read_text())
     assert "Zeus" in data["other_engines"]
-    assert data["agreement"] == "0/4"
+    assert data["agreement"] == "0/5"

@@ -340,6 +340,11 @@ class AdWsListener:
         self._on_connection_change = on_connection_change
 
         self._lock = threading.Lock()
+        #: a Start that is waiting for OD's warm-up before starting AD
+        #: (start_when_board_ready / board_tick)
+        self._start_pending = False
+        #: since when the board has been quiet while a start is pending
+        self._quiet_since: "float | None" = None
         self._buffer: list[AdWsThrow] = []
         self._ad_num = 0
         self._connected = False
@@ -536,6 +541,79 @@ class AdWsListener:
         log.info("AD control: %s -> HTTP %s (%s %s)", action, code, method, url)
         return {"ok": 200 <= code < 300, "action": action, "status": code}
 
+    # -- start after warm-up -----------------------------------------------
+
+    #: How long OD must see a still, empty board after a Start before the
+    #: oracle is started or reset. OD's warm-up alone was not enough: it
+    #: ended in a lull 1.3 s after the lights came on, the cameras were
+    #: still adjusting, and the oracle started then went into a takeout
+    #: half a second later (20:23 on 2026-10-07).
+    SETTLE_S = 2.0
+
+    def start_when_board_ready(self) -> None:
+        """Get Autodarts going once the board has settled after a Start, not now.
+
+        Starting it at the moment Start is pressed raced the cabinet: OD's
+        capture starting switches the board lights on a fraction of a second
+        later, so Autodarts took its empty board in the dark, then saw the
+        whole board change and went into a takeout that never ended
+        ("Takeout started" with 0 darts). The same happens to one already
+        running when the lights come on under it. ``board_tick`` acts once
+        OD has seen a still, empty board for SETTLE_S."""
+        with self._lock:
+            self._start_pending = True
+            self._quiet_since = None
+
+    def cancel_pending_start(self) -> None:
+        """Forget a start that is waiting for the board (capture stopped first)."""
+        with self._lock:
+            self._start_pending = False
+            self._quiet_since = None
+
+    def board_tick(self, quiet: bool, now: "float | None" = None) -> None:
+        """One lifecycle tick: ``quiet`` when OD is past warm-up, idle, with
+        no darts and nothing changing. Any other tick restarts the wait.
+        After SETTLE_S of quiet ticks, start Autodarts if it is stopped, or
+        reset it if it is in a takeout with no darts thrown -- the takeout
+        the lights coming on put it in (the same reset OD's Reset sends). A
+        takeout with darts in it is a real one and is left alone. Once per
+        Start; the request runs on its own thread -- this is called from the
+        capture loop, which must not wait on the network."""
+        if not self._start_pending:   # every tick: no lock taken while nothing waits
+            return
+        now = time.monotonic() if now is None else now
+        status = self.board_status()[0]
+        with self._lock:
+            if not self._start_pending:
+                return
+            if not quiet:
+                self._quiet_since = None
+                return
+            if self._quiet_since is None:
+                self._quiet_since = now
+            if now - self._quiet_since < self.SETTLE_S:
+                return
+            # Not judged yet while the oracle reads cameras-down or unknown:
+            # it sees through OD's cameras, which were dark while OD was
+            # stopped, and its frames are only counted back a few seconds
+            # after Start. Giving up then left it stuck in its takeout.
+            if status in (BOARD_STATUS_CAMERAS_DOWN, BOARD_STATUS_UNKNOWN):
+                return
+            self._start_pending = False
+            self._quiet_since = None
+            n_thrown = self._ad_num
+        if not (self.is_enabled() and self.is_connected()):
+            return
+        if status == BOARD_STATUS_STOPPED:
+            action, why = "start", "starting Autodarts now that the board has settled"
+        elif status == BOARD_STATUS_TAKEOUT and n_thrown == 0:
+            action, why = "reset", "Autodarts is in a takeout with no darts thrown -- resetting it"
+        else:
+            return
+        log.info("AD control: %s", why)
+        threading.Thread(target=self.control, args=(action, 15.0 if action == "start" else 5.0),
+                         name=f"ad-{action}-after-settle", daemon=True).start()
+
     # -- camera standby ----------------------------------------------------
 
     def set_standby_source(self, source: "Callable[[], int | None] | None") -> None:
@@ -621,6 +699,12 @@ class AdWsListener:
                 "cams_fps": self._cams_fps,
                 "cams_down": self._cams_down,
             }
+
+    def throw_count(self) -> int:
+        """The oracle's dart count for the current visit (its ``numThrows``;
+        0 after a takeout) -- what oracle_watch compares with this rig's."""
+        with self._lock:
+            return self._ad_num
 
     def latest_events(self) -> list[AdWsThrow]:
         """A snapshot copy of the current buffer, oldest-first -- never

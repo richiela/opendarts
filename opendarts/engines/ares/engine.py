@@ -228,6 +228,7 @@ from opendarts.engines.ares.detection import (
     detect_candidates,
 )
 from opendarts.engines.ares.fusion import (
+    FusionResult,
     LineObservation,
     PointObservation,
     fuse,
@@ -728,8 +729,15 @@ def _consensus_select(
                     )
                     if x is None:
                         continue
-                    if float(np.hypot(x[0], x[1])) > TIP_GATE_RADIUS_MM:
-                        continue
+                    # No board-radius cap here: two cameras' shafts
+                    # crossing off the board ARE an off-board dart (a real
+                    # OUT). Capping them at the tip gate threw the real
+                    # dart away, and then an on-board flight blob or speck
+                    # was the only hypothesis left -- an OUT scored as a
+                    # hit. Junk crossings are still outranked: they lack
+                    # the multi-camera support the real dart's has.
+                    # Measured over 3,473 truth darts: 8 OUTs fixed, 0
+                    # broken, no hit turned OUT.
                     hyps.append(x)
 
     def _tip_hyps(include_contaminated: bool) -> list[np.ndarray]:
@@ -785,6 +793,35 @@ def _consensus_select(
         if best.support(best_hyp) >= CONSENSUS_MIN_CONTRIB:
             selected.append(best)
     return selected, best_hyp, len(hyps)
+
+
+def _off_board_hypothesis(
+    hypothesis: np.ndarray | None,
+    lines: list[LineObservation],
+    points: list[PointObservation],
+) -> FusionResult | None:
+    """The winning hypothesis itself, when it is off the board and the
+    solve could not place the dart.
+
+    Consensus can settle on an off-board shaft crossing and keep only the
+    one camera that agrees with it. A single line with no tip point cannot
+    fix a position, so the solve returns nothing -- yet consensus has
+    already said where the dart is: off the board, an OUT. Scoring the
+    hypothesis says so instead of returning no score. An on-board
+    hypothesis is never scored this way: there the exact position matters.
+    Seen on two long-distance misses (each 1 shaft line, 0 tip points,
+    hypothesis 236 / 311 mm out); over 4,087 truth darts this never fires."""
+    if hypothesis is None or math.hypot(float(hypothesis[0]), float(hypothesis[1])) <= DOUBLE_OUTER_RADIUS_MM:
+        return None
+    return FusionResult(
+        xy_mm=(float(hypothesis[0]), float(hypothesis[1])),
+        method="off_board_hypothesis",
+        n_lines_used=len(lines),
+        n_points_used=len(points),
+        per_line_residual_mm={},
+        condition_ratio=None,
+        spread_mm=None,
+    )
 
 
 class AresEngine:
@@ -962,6 +999,8 @@ class AresEngine:
             ))
 
         fused = fuse(lines, points, init_xy=hypothesis)
+        if fused is None:
+            fused = _off_board_hypothesis(hypothesis, lines, points)
         if fused is None:
             return EngineResult(
                 ok=False,

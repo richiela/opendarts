@@ -6,6 +6,17 @@ sub-engines named in `ZEUS_SUB_ENGINE_NAMES` against the SAME
 with, and picks whichever `(sector, ring)` answer at least
 `MIN_SUB_ENGINES_TO_VOTE` of them agree on.
 
+**2026-10-08 -- Argus added as a 5th voter.** `ZEUS_SUB_ENGINE_NAMES` is
+now `("Apollo", "Talos", "Athena", "Ares", "Argus")`. Argus (the visual
+hybrid scorer, `opendarts.engines.argus`) goes LAST: Apollo keeps the
+tie-break and the tie rule below is unchanged -- with five voters a 2-2
+split among the first four is now settled by Argus's vote whenever it
+sides with one pair, and only falls to Apollo when it does not.
+Measured by replaying the 4,087-dart truth corpus: Zeus's misses go
+5 -> 1, 4 fixed and 0 broken, every fix one of those 2-2 ties; the other
+four engines' calls are unchanged. The quorum stays at 3 -- now a
+majority of five rather than three of four (see "The quorum gate").
+
 **2026-08-25 -- Ares added as a 4th voter.** Majority still wins, and
 Apollo holds the tie-breaking vote. This is a deliberate, narrow override
 of the standing docs/DESIGN.md guardrail that previously said Zeus's
@@ -48,17 +59,17 @@ returned `ok=True`. Find the max vote count; if more than one
 `(sector, ring)` key is tied for that max, the winner is whichever key
 was inserted into the vote-counting dict FIRST. Because votes are
 collected by iterating `ZEUS_SUB_ENGINE_NAMES` in a fixed order
-(`Apollo`, `Talos`, `Athena`, `Ares`) and a `Counter` built from
+(`Apollo`, `Talos`, `Athena`, `Ares`, `Argus`) and a `Counter` built from
 a dict's `.values()` preserves that same insertion order, this means:
 whenever Apollo is part of the tied group (any tie Apollo
-participates in -- a 2-way, 3-way, or 4-way tie), `Apollo`'s own
+participates in -- a 2-way, 3-way, 4-way or 5-way tie), `Apollo`'s own
 answer wins. This is the literal mechanism that implements "Apollo has
 the tie breaking vote" -- not because it is judged "best" in any
 per-throw sense, purely because that is the existing, already-measured,
 deterministic tie-break the original 3-engine prototype used, now
-extended to a 4th voter without changing its shape.
+extended to a 4th and then a 5th voter without changing its shape.
 
-**Residual ordering (Talos before Athena before Ares) -- a real,
+**Residual ordering (Talos before Athena before Ares before Argus) -- a real,
 separate decision, secondary to Apollo's tie-break.** Apollo being
 first is what guarantees Apollo wins any tie it's part of; where the
 OTHER three sit relative to each other only matters for the rarer case
@@ -67,9 +78,9 @@ of a tie that does NOT include Apollo at all (Apollo returned
 answers with Apollo's own answer among the tied group at count 1, in
 which case Apollo still wins per the paragraph above; the genuinely
 distinct case is Apollo simply not voting). Chosen order: `Talos`,
-then `Athena`, then `Ares` -- this matches `opendarts/engines/
+then `Athena`, then `Ares`, then `Argus` -- this matches `opendarts/engines/
 registry.py`'s own `ENGINES` dict registration order exactly (Apollo,
-Talos, Athena, Ares, then Zeus, which doesn't vote).
+Talos, Athena, Ares, Argus, then Zeus, which doesn't vote).
 Rationale: registration order is a real, already-existing, legible
 ordering with no per-engine favoritism baked in beyond "the order they
 were built and added to this project" -- using it here means the
@@ -100,6 +111,9 @@ skeptical of, and there's no measured cost to being more conservative
 here. If a future corpus measurement finds real throws where floor=3
 newly returns `ok=False` and floor=2 would have scored them correctly,
 that's the moment to revisit this, with real numbers, not before.
+With Argus as a 5th voter (2026-10-08) the floor stays at 3: three of
+five is still a real majority of the registered voters, and a throw
+where only two engines produce anything is still one to be skeptical of.
 
 **Diagnostics** are deliberately rich, matching this project's
 established "enough to investigate a specific throw" bar:
@@ -162,6 +176,10 @@ from opendarts.engines.apollo.prior_dart_context import (
     PriorDartLinePx,
     engine_accepts_prior_dart_line_px,
 )
+from opendarts.engines.argus.visit_context import (
+    VisitBgImages,
+    engine_accepts_visit_bg_images,
+)
 from opendarts.imageops import (
     DiffCrop,
     engine_accepts_precomputed,
@@ -174,13 +192,15 @@ from opendarts.pipeline import CameraCalibration
 # below) is defined in terms of -- see this module's own docstring,
 # "Tie-break convention" and "Residual ordering" sections, for the full
 # reasoning. Apollo FIRST is load-bearing (Apollo's tie-break); the
-# rest (Talos, Athena, Ares) matches opendarts/engines/registry.py's
+# rest (Talos, Athena, Ares, Argus) matches opendarts/engines/registry.py's
 # own ENGINES registration order, chosen 2026-08-25 when Ares was
-# added as the 4th voter -- see this module's docstring for why.
-ZEUS_SUB_ENGINE_NAMES: tuple[str, ...] = ("Apollo", "Talos", "Athena", "Ares")
+# added as the 4th voter and kept 2026-10-08 when Argus was added as the
+# 5th -- see this module's docstring for why.
+ZEUS_SUB_ENGINE_NAMES: tuple[str, ...] = ("Apollo", "Talos", "Athena", "Ares", "Argus")
 
 # Raised from 2 (of 3) to 3 (of 4) 2026-08-25 when Ares was added as
-# a 4th voter -- see this module's own docstring, "The quorum gate"
+# a 4th voter, and kept at 3 (a majority of 5) 2026-10-08 when Argus was
+# added as the 5th -- see this module's own docstring, "The quorum gate"
 # section, for the full reasoning and the real corpus measurement
 # (floor=2 and floor=3 are byte-identical on the full real corpus as
 # measured, so this is a deliberate conservative choice, not one forced
@@ -196,6 +216,7 @@ def _score_sub_engine(
     *,
     prior_dart_line_px: "PriorDartLinePx | None" = None,
     precomputed: "dict[int, DiffCrop] | None" = None,
+    visit_bg_images: "VisitBgImages | None" = None,
 ) -> EngineResult:
     """Runs one sub-engine, never raising -- a sub-engine that throws is
     treated the same as one that returns ok=False (unusable for voting),
@@ -265,6 +286,11 @@ def _score_sub_engine(
         kwargs["prior_dart_line_px"] = prior_dart_line_px
     if precomputed and engine_accepts_precomputed(engine):
         kwargs["precomputed"] = precomputed
+    # The visit's empty board (2026-10-08): only Argus reads it, and only
+    # an engine whose score() declares it is handed it -- same capability
+    # discipline as the two keywords above.
+    if visit_bg_images and engine_accepts_visit_bg_images(engine):
+        kwargs["visit_bg_images"] = visit_bg_images
     try:
         result = engine.score(bg_images, frame_images, calibration, **kwargs)
     except Exception as exc: # noqa: BLE001 -- see docstring above
@@ -284,6 +310,7 @@ def _score_all_sub_engines(
     calibration: dict[int, CameraCalibration],
     *,
     prior_dart_line_px: "PriorDartLinePx | None" = None,
+    visit_bg_images: "VisitBgImages | None" = None,
 ) -> dict[str, EngineResult]:
     """Runs all `ZEUS_SUB_ENGINE_NAMES` CONCURRENTLY -- 2026-08-27
     performance task. **Before this**: `ZeusEngine.score()` called
@@ -353,6 +380,7 @@ def _score_all_sub_engines(
             pool.submit(
                 _score_sub_engine, n, bg_images, frame_images, calibration,
                 prior_dart_line_px=prior_dart_line_px, precomputed=precomputed,
+                visit_bg_images=visit_bg_images,
             ): n
             for n in ZEUS_SUB_ENGINE_NAMES
         }
@@ -430,6 +458,7 @@ class ZeusEngine:
         calibration: dict[int, CameraCalibration],
         *,
         prior_dart_line_px: "PriorDartLinePx | None" = None,
+        visit_bg_images: "VisitBgImages | None" = None,
     ) -> EngineResult:
         # `prior_dart_line_px` (2026-08-24, see this module's own
         # docstring): declaring this parameter on Zeus's OWN score() is
@@ -444,9 +473,14 @@ class ZeusEngine:
         # _score_all_sub_engines()'s own docstring for the real measured
         # before/after numbers and why this is a pure performance change
         # (tie-break determinism unaffected).
+        # `visit_bg_images` (2026-10-08): the visit's empty board per
+        # camera, for Argus's occlusion check -- declared here for the same
+        # reason as `prior_dart_line_px`, so the capability check tells
+        # callers to look it up; forwarded only to sub-engines declaring it.
         sub_results: dict[str, EngineResult] = _score_all_sub_engines(
             bg_images, frame_images, calibration,
             prior_dart_line_px=prior_dart_line_px,
+            visit_bg_images=visit_bg_images,
         )
 
         # Only ok=True sub-results with a real (sector, ring) are usable

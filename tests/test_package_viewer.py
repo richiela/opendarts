@@ -79,6 +79,16 @@ def test_viewer_playback_does_not_loop_and_binds_arrow_keys(tmp_path):
     assert "ArrowLeft" in html and "ArrowRight" in html
 
 
+def test_viewer_steps_frames_by_touch_not_only_keys(tmp_path):
+    """The kiosk tablet has no keyboard: stepping needs on-screen buttons,
+    and the hint must not promise keys alone."""
+    _make_recorded_package(tmp_path)
+    html = _client(tmp_path).get("/packages/sess/t1/viewer").text
+    assert 'data-step="-1"' in html and 'data-step="1"' in html
+    assert "querySelectorAll('.step')" in html
+    assert "tap" in html and "on a keyboard" in html
+
+
 def test_viewer_images_open_full_res_lightbox(tmp_path):
     """Stills and clip frames are click-to-zoom into a full-resolution
     lightbox modal."""
@@ -119,6 +129,19 @@ def test_still_fmt_jpeg_is_smaller_than_png_same_pixels(tmp_path):
     b = cv2.imdecode(np.frombuffer(jpg.content, np.uint8), cv2.IMREAD_COLOR)
     assert a.shape == b.shape                            # same dimensions
     assert client.get("/api/packages/sess/t1/frame/0/bg.png?fmt=bogus").status_code == 400
+
+
+def test_a_frame_is_kept_by_the_browser_only_when_its_url_is_versioned(tmp_path):
+    """A throw id can be reused after delete-all, so an unversioned frame URL
+    can later mean another dart: only a URL carrying the throw's version
+    (`v`, its capture time) may be cached."""
+    _make_recorded_package(tmp_path)
+    client = _client(tmp_path)
+    plain = client.get("/api/packages/sess/t1/frame/0/bg.png?fmt=jpeg")
+    versioned = client.get("/api/packages/sess/t1/frame/0/bg.png?fmt=jpeg&v=2026-10-04T10:00:00Z")
+    assert plain.headers["cache-control"] == "no-cache"
+    assert "max-age" in versioned.headers["cache-control"] and "immutable" in versioned.headers["cache-control"]
+    assert plain.content == versioned.content
 
 
 def test_clip_frame_png_is_lossless_and_matches_clip(tmp_path):

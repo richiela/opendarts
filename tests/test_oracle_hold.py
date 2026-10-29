@@ -53,6 +53,14 @@ class Oracle:
         self.controls.append((action, timeout))
         return {"ok": True, "action": action, "status": 200}
 
+    pending_start = False
+
+    def start_when_board_ready(self):
+        self.pending_start = True
+
+    def cancel_pending_start(self):
+        self.pending_start = False
+
 
 class Switch:
     """A hold provider the test flips by hand."""
@@ -284,8 +292,8 @@ class _FakeHub:
 
 def test_start_starts_a_stopped_oracle_too(tmp_path):
     """One press gets the board working: Start starts a stopped oracle, as
-    Reset resets both. A running, offline or switched-off oracle is left
-    alone."""
+    Reset resets both -- once OD has warmed up, so Start only asks for it.
+    A running, offline or switched-off oracle is left alone."""
     from fastapi.testclient import TestClient
     from opendarts.live.capture_daemon import CaptureLoopController
     from opendarts.live.server import create_app
@@ -298,8 +306,118 @@ def test_start_starts_a_stopped_oracle_too(tmp_path):
 
     stopped = Oracle(BOARD_STATUS_STOPPED)
     body = start(stopped)
-    assert stopped.controls == [("start", 15.0)] and body["oracle_start"]["ok"] is True
-    for oracle in (Oracle(BOARD_STATUS_READY), Oracle(BOARD_STATUS_STOPPED, connected=False),
+    assert stopped.controls == [] and stopped.pending_start
+    assert body["oracle_start"]["ok"] is True and body["oracle_start"]["deferred"] is True
+    running = Oracle(BOARD_STATUS_READY)           # checked after warm-up, not started
+    body = start(running)
+    assert running.controls == [] and running.pending_start and "oracle_start" not in body
+    for oracle in (Oracle(BOARD_STATUS_STOPPED, connected=False),
                    Oracle(BOARD_STATUS_STOPPED, enabled=False)):
         body = start(oracle)
-        assert oracle.controls == [] and "oracle_start" not in body
+        assert oracle.controls == [] and not oracle.pending_start and "oracle_start" not in body
+
+
+def test_the_oracle_starts_once_the_board_has_settled_not_at_start():
+    """Started the moment Start was pressed, Autodarts took its empty board
+    before the cabinet's lights came on and sat in a takeout that never
+    ended; started at the end of OD's warm-up, it still caught the cameras
+    adjusting. It now starts after SETTLE_S of a still, empty board -- any
+    change restarts the wait -- once, and only if a Start asked."""
+    import time
+
+    from opendarts.live.ad_ws_listener import AdWsListener
+
+    lst = AdWsListener("http://fake-ad:3180")
+    calls = []
+    lst.control = lambda action, timeout=None: calls.append(action) or {"ok": True}
+    lst.is_enabled = lambda: True
+    lst.is_connected = lambda: True
+    status = [BOARD_STATUS_STOPPED]
+    lst.board_status = lambda: (status[0], None)
+    S = lst.SETTLE_S
+
+    def run(ticks):
+        """ticks: [(t, quiet)] -> the controls sent."""
+        for t, quiet in ticks:
+            lst.board_tick(quiet, now=t)
+        time.sleep(0.05)
+        out = list(calls)
+        calls.clear()
+        return out
+
+    assert run([(0, True), (S + 1, True)]) == []                 # nobody asked
+    lst.start_when_board_ready()
+    assert run([(0, True), (S - 0.1, True)]) == []               # not settled long enough
+    assert run([(S + 0.1, True)]) == ["start"]
+    assert run([(10, True), (20, True)]) == []                   # once per Start
+
+    # the 20:23 case: quiet, then the cameras adjust (a scene change) -- the wait restarts
+    lst.start_when_board_ready()
+    assert run([(0, True), (1.3, True), (1.8, False), (2.5, True), (3.9, True)]) == []
+    assert run([(2.5 + S, True)]) == ["start"]
+
+    lst.start_when_board_ready()
+    lst.cancel_pending_start()                                   # Stop first
+    assert run([(0, True), (S + 1, True)]) == []
+
+    # cameras still counted down a moment after Start: wait, don't give up
+    status[0] = BOARD_STATUS_TAKEOUT
+    lst._ad_num = 0
+    lst._cams_down = True
+    lst._board_status = BOARD_STATUS_TAKEOUT
+    lst.board_status = lambda: (lst._effective_status_locked(), None)
+    lst.start_when_board_ready()
+    assert run([(0, True), (S + 0.1, True), (S + 1, True)]) == []
+    lst._cams_down = False
+    assert run([(S + 1.5, True)]) == ["reset"]
+    lst.board_status = lambda: (status[0], None)
+
+    # already running: an empty takeout is reset; a real takeout or a ready board is not
+    for st, n, expect in ((BOARD_STATUS_TAKEOUT, 0, ["reset"]), (BOARD_STATUS_TAKEOUT, 3, []),
+                          (BOARD_STATUS_READY, 0, [])):
+        status[0] = st
+        lst._ad_num = n
+        lst.start_when_board_ready()
+        assert run([(0, True), (S + 0.1, True)]) == expect, (st, n)
+
+
+def test_the_lifecycle_tells_the_oracle_whether_the_board_is_quiet():
+    from types import SimpleNamespace
+
+    from opendarts.lifecycle.state import Action, Phase
+    from opendarts.live.capture_daemon import _build_lifecycle_driver
+
+    oracle = Oracle(BOARD_STATUS_STOPPED)
+    seen = []
+    oracle.board_tick = lambda quiet: seen.append(quiet)
+    driver = _build_lifecycle_driver(ad_ws_listener=oracle)
+    for phase, action, n in ((Phase.IDLE, Action.NONE, 0), (Phase.WARMUP, Action.NONE, 0),
+                             (Phase.SCENE_CHANGE, Action.NONE, 0), (Phase.IDLE, Action.READY, 0),
+                             (Phase.IDLE, Action.NONE, 1)):
+        driver._on_tick(SimpleNamespace(phase=phase, action=action, dart_count=n))
+    assert seen == [True, False, False, False, False]
+
+
+def test_stop_stops_a_running_oracle_too(tmp_path):
+    """Stop stops both, as Start starts both. A stopped, offline or
+    switched-off oracle is left alone."""
+    from fastapi.testclient import TestClient
+    from opendarts.live.capture_daemon import CaptureLoopController
+    from opendarts.live.server import create_app
+
+    def start_then_stop(oracle):
+        c = TestClient(create_app(package_root=tmp_path / str(id(oracle)), enable_background_poll=False,
+                                  local_hub=_FakeHub(), controller=CaptureLoopController(),
+                                  ad_ws_listener=oracle))
+        assert c.post("/api/start").json()["ok"] is True
+        oracle.controls.clear()
+        return c.post("/api/stop").json()
+
+    for status in (BOARD_STATUS_READY, BOARD_STATUS_TAKEOUT):
+        running = Oracle(status)
+        body = start_then_stop(running)
+        assert running.controls == [("stop", 10.0)] and body["oracle_stop"]["ok"] is True
+    for oracle in (Oracle(BOARD_STATUS_STOPPED), Oracle(BOARD_STATUS_READY, connected=False),
+                   Oracle(BOARD_STATUS_READY, enabled=False)):
+        body = start_then_stop(oracle)
+        assert oracle.controls == [] and "oracle_stop" not in body

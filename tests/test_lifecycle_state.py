@@ -434,6 +434,35 @@ def test_lighting_step_is_scene_change_not_dart():
     assert sum(t.action is Action.COMMIT for t in ticks) == 1
 
 
+def test_lighting_step_that_shrinks_before_settling_is_adopted_not_committed():
+    """Lights fading in, then the cameras' auto-exposure pulling most of
+    the board back: the change drops below the whole-board fraction while
+    still moving, but part of the board stays brighter. That leftover was
+    left against the dark reference and committed as a dart (a phantom
+    OUT at every Start that switched the cabinet lights on)."""
+    lc, s = new_lifecycle(), Scene()
+    warm(lc, s)
+    ticks = []
+    for level in (150, 180, 200, 190, 200, 185):   # fading in: whole board, moving
+        s.level = level
+        ticks += run(lc, s, 1)
+    s.level = 120                                   # exposure pulls most of it back ...
+    lit = Scene.render
+
+    def render_with_lit_patch(self):                # ... but a quarter stays brighter
+        img = lit(self)
+        img[CY - R : CY, CX - R : CX] = np.clip(img[CY - R : CY, CX - R : CX].astype(int) + 60, 0, 255)
+        return img
+    s.render = render_with_lit_patch.__get__(s)
+    ticks += run(lc, s, 30)
+    assert any(t.action is Action.SCENE_CHANGE for t in ticks)
+    assert not any(t.action is Action.COMMIT for t in ticks), [(t.phase, t.action, t.reason) for t in ticks]
+    assert lc.phase is Phase.IDLE
+    s.darts.append((CX + 20, CY + 10, 16, 80))      # and a real dart still scores after it
+    ticks = run(lc, s, 10)
+    assert sum(t.action is Action.COMMIT for t in ticks) == 1
+
+
 def test_permanent_outside_change_does_not_wedge_hand_and_dart_still_commits():
     """A large static change outside the board (an object placed in view,
     a light) must not keep the machine in HAND forever; after the static
@@ -473,7 +502,7 @@ def test_reference_refreshes_on_stable_non_dart_frame():
     fallback cadence configured absurdly high."""
     lc, s = new_lifecycle(LifecycleConfig(warmup_stable_frames=3, idle_readopt_frames=1000)), Scene()
     warm(lc, s)
-    s.darts.append((CX - 4, CY - 40, 12, 80))  # ~60 small px: artifact-sized
+    s.darts.append((CX - 4, CY - 40, 12, 40))  # ~40 small px: artifact-sized, under dart_min_px
     ticks = run(lc, s, 4)
     assert not any(t.action is Action.COMMIT for t in ticks)
     assert any(t.action is Action.READOPT for t in ticks[:3])
@@ -493,7 +522,7 @@ def test_reference_still_refreshes_under_outside_churn():
     cannot stack underneath the churn."""
     lc, s = new_lifecycle(LifecycleConfig(warmup_stable_frames=3, idle_readopt_frames=5)), Scene()
     warm(lc, s)
-    s.darts.append((CX - 4, CY - 40, 12, 80))  # ~60 px board residue, below dart_min_px
+    s.darts.append((CX - 4, CY - 40, 12, 40))  # ~40 px board residue, below dart_min_px
     ticks = []
     for i in range(15):
         # 32x32 blob hopping around far outside the board: outside_px ~64
@@ -704,3 +733,118 @@ def test_over_darts_hold_resets_on_motion():
     assert commits[0].reason == "forced"
     assert commits[0].commit is not None and commits[0].commit.forced
     assert not any(t.reason == "over darts, stable" for t in ticks)
+
+
+# --- the union-dominance guard (docs/LIFECYCLE.md) ------------------------
+
+def _sig(board, new, in_union, union_px):
+    from opendarts.lifecycle.signals import CamSignals
+    return CamSignals(board_px=board, outside_px=0, board_delta_px=0, outside_delta_px=0,
+                      in_union_px=in_union, board_new_px=new, board_new_blob_px=new,
+                      union_px=union_px, board_area_px=10000, outside_area_px=40000)
+
+
+def _dart_cams(dart_count, signals):
+    lc = new_lifecycle()
+    lc.dart_count = dart_count
+    return lc._aggregate(signals).dart_cams
+
+
+def test_a_dart_landing_in_front_of_the_group_is_a_dart():
+    # The low-camera rig, 2026-10-04 22:14:46: a third dart in front of two
+    # S20s. Camera 2 saw 218 px, more of it on the two darts (92) than off
+    # them (86), while changing only 15% of them; the old guard read that
+    # as the darts leaving and the S20 was never scored.
+    cams = {0: _sig(60, 42, 7, 613), 1: _sig(77, 77, 0, 613), 2: _sig(218, 86, 92, 613)}
+    assert 2 in _dart_cams(2, cams)
+
+
+def test_darts_being_pulled_still_are_not_a_dart():
+    # Same shape, but a quarter of the committed darts has changed: a pull.
+    assert _dart_cams(2, {0: _sig(218, 86, 160, 613)}) == []
+
+
+def test_at_the_dart_limit_the_guard_is_unchanged():
+    assert _dart_cams(3, {0: _sig(218, 86, 92, 613)}) == []
+
+
+def test_a_moving_frame_never_announces_a_takeout():
+    """A dart in flight passing in front of a committed dart looks, for one
+    blurred frame, like that dart being pulled. That frame must not enter
+    TAKEOUT_PENDING (it announced a takeout and flashed the cabinet strip
+    after dart 2); the next, still frame is judged as usual."""
+    lc, s = new_lifecycle(), Scene()
+    warm(lc, s)
+    s.darts.append((CX - 2, CY - 60, 16, 100))
+    run(lc, s, 15)
+    assert lc.dart_count == 1
+    # one moving frame: dart 1's area changes (something passing over it)
+    s.darts = [(CX - 2, CY - 60, 16, 100)]
+    s.blobs = [(CX - 6, CY - 50, 24, 60)]
+    tick = lc.observe({0: s.render()})
+    assert tick.phase is not Phase.TAKEOUT_PENDING
+    s.blobs = []
+    run(lc, s, 15)
+    assert lc.dart_count == 1
+
+
+def test_a_real_takeout_still_clears():
+    lc, s = new_lifecycle(), Scene()
+    warm(lc, s)
+    s.darts.append((CX - 2, CY - 60, 16, 100))
+    run(lc, s, 15)
+    s.darts.clear()
+    ticks = run(lc, s, 20)
+    assert any(t.action is Action.CLEARED for t in ticks)
+
+
+def test_an_empty_board_picture_taken_with_darts_in_is_retaken_at_the_next_takeout():
+    """2026-10-05: a restart mid-visit warmed up with darts in the board, so
+    the "empty" board held them; it never refreshed, and a later dart landing
+    where one had been was refused as "a removal". The empty board is now
+    retaken at the end of every verified clear."""
+    lc, s = new_lifecycle(), Scene()
+    stray = (CX + 40, CY - 60, 16, 100)
+    s.darts = [stray]                     # warmup with a dart already in
+    warm(lc, s)
+    s.darts.append((CX - 50, CY - 60, 16, 100))
+    run(lc, s, 15)
+    assert lc.dart_count == 1
+    s.darts.clear()                       # the takeout pulls both
+    ticks = run(lc, s, 40)
+    assert any(t.action is Action.CLEARED for t in ticks)
+    s.darts = [stray]                     # a new dart exactly where the stray was
+    ticks = run(lc, s, 15)
+    assert sum(t.action is Action.COMMIT for t in ticks) == 1, [(t.phase, t.action, t.reason) for t in ticks]
+
+
+def _three_cams():
+    return Lifecycle({0: board_mask(), 1: board_mask(), 2: board_mask()}, LifecycleConfig(warmup_stable_frames=3))
+
+
+def _faint(scene, rect):
+    s = Scene(); s.darts = list(scene.darts) + ([rect] if rect else []); return s.render()
+
+
+def test_a_faint_grouped_dart_seen_by_two_cameras_commits():
+    # 2026-10-05 15:21:07: a third dart behind the first two read 9/63/72 px
+    # (under the old 80 floor) and was never scored; the oracle said T20.
+    lc = _three_cams()
+    empty = Scene()
+    for _ in range(6):
+        lc.observe({0: empty.render(), 1: empty.render(), 2: empty.render()})
+    faint1 = (CX - 2, CY - 60, 12, 63)     # 63 small px
+    faint2 = (CX + 20, CY - 60, 12, 72)    # 72 small px
+    ticks = []
+    for _ in range(10):
+        ticks.append(lc.observe({0: empty.render(), 1: _faint(empty, faint1), 2: _faint(empty, faint2)}))
+    assert sum(t.action is Action.COMMIT for t in ticks) == 1, [(t.phase, t.reason) for t in ticks]
+
+
+def test_a_faint_change_in_one_camera_still_is_not_a_dart():
+    lc = _three_cams()
+    empty = Scene()
+    for _ in range(6):
+        lc.observe({0: empty.render(), 1: empty.render(), 2: empty.render()})
+    ticks = [lc.observe({0: empty.render(), 1: _faint(empty, (CX - 2, CY - 60, 12, 72)), 2: empty.render()}) for _ in range(15)]
+    assert not any(t.action is Action.COMMIT for t in ticks)

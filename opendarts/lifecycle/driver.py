@@ -137,9 +137,13 @@ class LifecycleDriver:
         summary_interval_s: float = 300.0,
         config_provider: Callable[[], LifecycleConfig] | None = None,
         hold: Callable[[], "str | None"] | None = None,
+        calibrations_provider: Callable[[], dict[int, Any]] | None = None,
     ) -> None:
         self.cfg = config
         self._hold = hold
+        #: the calibrations the masks were built from, for the lifecycle's
+        #: same-dart check; read whenever the lifecycle is (re)built
+        self._calibrations_provider = calibrations_provider
         self._config_provider = config_provider
         self._masks_provider = masks_provider
         self._on_tick = on_tick
@@ -213,7 +217,8 @@ class LifecycleDriver:
         if not masks:
             return None
         if self._lc is None or self._masks_changed(masks):
-            self._lc = Lifecycle(masks, self.cfg, hold=self._hold)
+            cals = self._calibrations_provider() if self._calibrations_provider else None
+            self._lc = Lifecycle(masks, self.cfg, hold=self._hold, calibrations=cals)
             self._masks_sig = self._masks_signature(masks)
             self._masks = dict(masks)
             log.info("lifecycle: (re)built for cameras %s", sorted(masks))

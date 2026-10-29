@@ -48,7 +48,8 @@
       "Apollo",
       "Talos",
       "Athena",
-      "Ares"
+      "Ares",
+      "Argus"
     ],
     "timeout_s": 5.0
   }

@@ -7,11 +7,26 @@
 // ---------------------------------------------------------------------------
 
 // Regulation radii in mm, matching opendarts.geometry.board's own bands.
+// The two inner ring edges SCORE a little further in than the regulation
+// line -- a tip on the wire counts for the ring (geometry.board's
+// INNER_RING_SCORING_OFFSET_MM) -- and the server says exactly where
+// (OD.board_scoring_mm; the defaults here are its defaults). Bands are
+// painted and hit-tested from the scoring edges, so the paint IS the
+// call: a dart scored D1 is always drawn in the green.
 const BOARD_MM = {
   doubleOuter: 170.0, doubleInner: 162.0,
   trebleOuter: 107.0, trebleInner: 99.0,
   outerBull: 15.9, bull: 6.35,
+  doubleInnerScore: 160.5, trebleInnerScore: 97.5,
 };
+if (typeof OD !== 'undefined' && OD.board_scoring_mm) {
+  if (typeof OD.board_scoring_mm.double_inner === 'number') BOARD_MM.doubleInnerScore = OD.board_scoring_mm.double_inner;
+  if (typeof OD.board_scoring_mm.treble_inner === 'number') BOARD_MM.trebleInnerScore = OD.board_scoring_mm.treble_inner;
+}
+// A real wire is about this thick. Drawn at true size once a figure is
+// zoomed in far enough to show it, as see-through metal over the paint:
+// a tip on the wire then shows ON it, as it sits on the board.
+const WIRE_MM = 1.5;
 // Must match board_photo.HALF_MM: the board photo spans +/- this many mm.
 const PHOTO_HALF_MM = 235.0;
 // How much of it the scoreboard shows: just past the number ring's outer
@@ -63,9 +78,9 @@ function hitTest(x, y) {
   let ring;
   if (r <= BOARD_MM.bull) ring = 'bull';
   else if (r <= BOARD_MM.outerBull) ring = 'outer_bull';
-  else if (r <= BOARD_MM.trebleInner) ring = 'single_inner';
+  else if (r < BOARD_MM.trebleInnerScore) ring = 'single_inner';
   else if (r <= BOARD_MM.trebleOuter) ring = 'treble';
-  else if (r <= BOARD_MM.doubleInner) ring = 'single_outer';
+  else if (r < BOARD_MM.doubleInnerScore) ring = 'single_outer';
   else if (r <= BOARD_MM.doubleOuter) ring = 'double';
   else ring = 'outside';
   if (ring === 'bull' || ring === 'outer_bull' || ring === 'outside') return {sector: null, ring};
@@ -81,10 +96,10 @@ function segmentCentre(sector, ring) {
   const i = BOARD_SECTORS.indexOf(String(sector));
   if (i < 0) return null;
   const r = {
-    single_inner: (BOARD_MM.outerBull + BOARD_MM.trebleInner) / 2,
-    treble: (BOARD_MM.trebleInner + BOARD_MM.trebleOuter) / 2,
-    single_outer: (BOARD_MM.trebleOuter + BOARD_MM.doubleInner) / 2,
-    double: (BOARD_MM.doubleInner + BOARD_MM.doubleOuter) / 2,
+    single_inner: (BOARD_MM.outerBull + BOARD_MM.trebleInnerScore) / 2,
+    treble: (BOARD_MM.trebleInnerScore + BOARD_MM.trebleOuter) / 2,
+    single_outer: (BOARD_MM.trebleOuter + BOARD_MM.doubleInnerScore) / 2,
+    double: (BOARD_MM.doubleInnerScore + BOARD_MM.doubleOuter) / 2,
   }[ring];
   if (!r) return null;
   const a = -Math.PI / 2 + i * (Math.PI * 2) / 20;   // canvas angle
@@ -115,11 +130,11 @@ function drawDiagram(c, cx, cy, ppm, opts) {
     const a = sectorAngles(i);
     const dark = i % 2 === 0;
     c.fillStyle = dark ? K.dark : K.light;
-    wedge(c, cx, cy, mm(BOARD_MM.outerBull), mm(BOARD_MM.trebleInner), a[0], a[1]); c.fill();
-    wedge(c, cx, cy, mm(BOARD_MM.trebleOuter), mm(BOARD_MM.doubleInner), a[0], a[1]); c.fill();
+    wedge(c, cx, cy, mm(BOARD_MM.outerBull), mm(BOARD_MM.trebleInnerScore), a[0], a[1]); c.fill();
+    wedge(c, cx, cy, mm(BOARD_MM.trebleOuter), mm(BOARD_MM.doubleInnerScore), a[0], a[1]); c.fill();
     c.fillStyle = dark ? K.red : K.green;
-    wedge(c, cx, cy, mm(BOARD_MM.trebleInner), mm(BOARD_MM.trebleOuter), a[0], a[1]); c.fill();
-    wedge(c, cx, cy, mm(BOARD_MM.doubleInner), mm(BOARD_MM.doubleOuter), a[0], a[1]); c.fill();
+    wedge(c, cx, cy, mm(BOARD_MM.trebleInnerScore), mm(BOARD_MM.trebleOuter), a[0], a[1]); c.fill();
+    wedge(c, cx, cy, mm(BOARD_MM.doubleInnerScore), mm(BOARD_MM.doubleOuter), a[0], a[1]); c.fill();
   }
   if (opts.highlight) {
     const hl = opts.highlight;
@@ -137,14 +152,42 @@ function drawDiagram(c, cx, cy, ppm, opts) {
     } else {
       const i = BOARD_SECTORS.indexOf(String(hl.sector));
       const band = {
-        single_inner: [BOARD_MM.outerBull, BOARD_MM.trebleInner], treble: [BOARD_MM.trebleInner, BOARD_MM.trebleOuter],
-        single_outer: [BOARD_MM.trebleOuter, BOARD_MM.doubleInner], double: [BOARD_MM.doubleInner, BOARD_MM.doubleOuter],
+        single_inner: [BOARD_MM.outerBull, BOARD_MM.trebleInnerScore], treble: [BOARD_MM.trebleInnerScore, BOARD_MM.trebleOuter],
+        single_outer: [BOARD_MM.trebleOuter, BOARD_MM.doubleInnerScore], double: [BOARD_MM.doubleInnerScore, BOARD_MM.doubleOuter],
       }[hl.ring];
       if (i >= 0 && band) {
         const a = sectorAngles(i);
         wedge(c, cx, cy, mm(band[0]), mm(band[1]), a[0], a[1]);
         c.fill();
       }
+    }
+    c.restore();
+  }
+  // Wires. Zoomed in far enough that a wire is wider than its hairline,
+  // it is drawn at its true thickness as see-through metal, with a
+  // hairline down its middle. Every ring wire lies OUTSIDE the band it
+  // bounds, against the scoring edge, so the ring's paint runs solid to
+  // exactly where it scores: green is double, nothing less.
+  const metal = mm(WIRE_MM) > lw * 2.5;
+  const ringWires = [
+    [BOARD_MM.trebleInnerScore - WIRE_MM, BOARD_MM.trebleInnerScore], [BOARD_MM.trebleOuter, BOARD_MM.trebleOuter + WIRE_MM],
+    [BOARD_MM.doubleInnerScore - WIRE_MM, BOARD_MM.doubleInnerScore], [BOARD_MM.doubleOuter, BOARD_MM.doubleOuter + WIRE_MM],
+  ];
+  if (metal) {
+    c.save();
+    c.fillStyle = K.wire;
+    c.globalAlpha = 0.32;
+    ringWires.forEach(([r0, r1]) => {
+      c.beginPath(); c.arc(cx, cy, mm(r1), 0, Math.PI * 2); c.arc(cx, cy, mm(r0), 0, Math.PI * 2, true); c.fill('evenodd');
+    });
+    c.lineWidth = mm(WIRE_MM);
+    c.strokeStyle = K.wire;
+    for (let i = 0; i < 20; i++) {
+      const a0 = sectorAngles(i)[0];
+      c.beginPath();
+      c.moveTo(cx + Math.cos(a0) * mm(BOARD_MM.outerBull), cy + Math.sin(a0) * mm(BOARD_MM.outerBull));
+      c.lineTo(cx + Math.cos(a0) * mm(BOARD_MM.doubleOuter + WIRE_MM), cy + Math.sin(a0) * mm(BOARD_MM.doubleOuter + WIRE_MM));
+      c.stroke();
     }
     c.restore();
   }
@@ -157,8 +200,8 @@ function drawDiagram(c, cx, cy, ppm, opts) {
     c.lineTo(cx + Math.cos(a0) * mm(BOARD_MM.doubleOuter), cy + Math.sin(a0) * mm(BOARD_MM.doubleOuter));
     c.stroke();
   }
-  [BOARD_MM.trebleInner, BOARD_MM.trebleOuter, BOARD_MM.doubleInner, BOARD_MM.doubleOuter].forEach((r) => {
-    c.beginPath(); c.arc(cx, cy, mm(r), 0, Math.PI * 2); c.stroke();
+  ringWires.forEach(([r0, r1]) => {
+    c.beginPath(); c.arc(cx, cy, mm((r0 + r1) / 2), 0, Math.PI * 2); c.stroke();
   });
   c.beginPath(); c.arc(cx, cy, mm(BOARD_MM.outerBull), 0, Math.PI * 2);
   c.fillStyle = opts.highlight && opts.highlight.ring === 'outer_bull' ? (opts.highlight.color || '#3a9a6a') : K.outer;
@@ -475,7 +518,6 @@ const LiveBoard = (() => {
 // the oracle's, and the confirmed truth. A wire dispute is obvious at a
 // glance where a column of millimetres is not.
 
-const ENGINE_MARK = {Apollo: 'Ap', Talos: 'Ta', Athena: 'At', Ares: 'Ar', Zeus: 'Ze'};
 
 function drawAgreement(canvas, pkg, sections) {
   const fit = fitCanvas(canvas, false);
@@ -487,6 +529,23 @@ function drawAgreement(canvas, pkg, sections) {
   const pts = [];
   for (const s of sections) {
     if (s.board_xy_mm && s.ok !== false && !s.timed_out) pts.push({kind: s.primary ? 'primary' : 'engine', name: s.name, xy: s.board_xy_mm, call: s});
+  }
+  // The primary (Zeus) measures nothing: it counts the votes and takes its
+  // point from the first engine that voted for the winning call. Its own
+  // dot would only ever sit on top of that engine's, so it is not drawn;
+  // the engine it followed is drawn as the primary instead, and named so
+  // ("APOLLO · ZEUS"). Should the primary's point ever match no engine,
+  // it is drawn as before.
+  const pi = pts.findIndex((p) => p.kind === 'primary');
+  if (pi >= 0) {
+    const prim = pts[pi];
+    const same = (a, b) => Math.abs(a[0] - b[0]) < 1e-6 && Math.abs(a[1] - b[1]) < 1e-6;
+    const followed = pts.find((p) => p.kind === 'engine' && same(p.xy, prim.xy));
+    if (followed) {
+      followed.kind = 'primary';
+      followed.tag = prim.name;
+      pts.splice(pi, 1);
+    }
   }
   if (pkg.ad_tip_xy_mm && pkg.ad_matched) pts.push({kind: 'oracle', name: 'Autodarts', xy: pkg.ad_tip_xy_mm, call: {sector: pkg.ad_sector, ring: pkg.ad_ring}});
   // Type grows with the figure: this page is often read from across the room.
@@ -537,7 +596,7 @@ function drawAgreement(canvas, pkg, sections) {
     }
     c.fillStyle = col; c.textAlign = 'left';
     c.font = '600 ' + Math.round(13 * k) + 'px "IBM Plex Mono", monospace';
-    c.fillText(p.name.toUpperCase(), lx, ly);
+    c.fillText(p.name.toUpperCase() + (p.tag ? ' · ' + p.tag.toUpperCase() : ''), lx, ly);
     c.fillStyle = INK; c.textAlign = 'right';
     c.font = '700 ' + Math.round(20 * k) + 'px "IBM Plex Sans Condensed", sans-serif';
     c.fillText(callLabel(p.call.sector, p.call.ring), W - 6, ly);

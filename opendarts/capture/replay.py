@@ -57,6 +57,10 @@ from opendarts.engines.apollo.prior_dart_context import (
     engine_accepts_prior_dart_line_px,
     find_prior_dart_line_px,
 )
+from opendarts.engines.argus.visit_context import (
+    engine_accepts_visit_bg_images,
+    find_visit_bg_images,
+)
 from opendarts.engines.talos.prior_dart import (
     engine_accepts_prior_board_xy_mm,
     find_prior_board_xy_mm,
@@ -134,7 +138,9 @@ def replay_throw_with_engine(package: ThrowPackage | Path, engine_name: str) -> 
             prior_board_xy_mm=prior_board_xy_mm or None,
         )
 
-    if engine_accepts_prior_dart_line_px(engine):
+    accepts_prior_line = engine_accepts_prior_dart_line_px(engine)
+    accepts_visit_bg = engine_accepts_visit_bg_images(engine)
+    if accepts_prior_line or accepts_visit_bg:
         # 2026-08-16 -- prior-dart-in-visit contamination guard, replay
         # side. Per docs/DESIGN.md's "Replay is the source of truth": a live capture
         # and an offline replay of the SAME package must reach the SAME
@@ -161,12 +167,22 @@ def replay_throw_with_engine(package: ThrowPackage | Path, engine_name: str) -> 
         # live pipeline actually does for Zeus-as-primary sessions --
         # exactly the "Replay is the source of truth" constraint this module exists to
         # uphold. The capability check alone is now the complete gate.
-        prior_dart_line_px = find_prior_dart_line_px(
-            package.package_dir.parent, package.visit_id, package.visit_index
-        )
+        #
+        # 2026-10-08 -- the visit's empty board for Argus (Zeus forwards
+        # it), from the same shared lookup live capture uses
+        # (opendarts.engines.argus.visit_context); replay has no in-memory
+        # cache, so it loads the visit's first package from this session.
+        kwargs = {}
+        if accepts_prior_line:
+            kwargs["prior_dart_line_px"] = find_prior_dart_line_px(
+                package.package_dir.parent, package.visit_id, package.visit_index
+            )
+        if accepts_visit_bg:
+            kwargs["visit_bg_images"] = find_visit_bg_images(
+                package.package_dir.parent, package.visit_id, package.visit_index
+            )
         return engine.score(
-            package.bg_frames, package.dart_frames, package.calibrations,
-            prior_dart_line_px=prior_dart_line_px,
+            package.bg_frames, package.dart_frames, package.calibrations, **kwargs,
         )
 
     return engine.score(package.bg_frames, package.dart_frames, package.calibrations)

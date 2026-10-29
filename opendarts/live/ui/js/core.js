@@ -13,6 +13,91 @@ const OD = JSON.parse(document.getElementById('bootstrap').textContent);
 // "control" is the whole app; "display" is a screen that only shows, set up
 // from a controller (display.js, opendarts/live/displays.py).
 const ROLE = OD.role === 'display' ? 'display' : 'control';
+// A display (a TV, /?display) has no keyboard and no back button: it must
+// never open a new window.
+const KIOSK = ROLE === 'display';
+
+// ---- the lightbox --------------------------------------------------------
+// Pictures, and on a kiosk whole pages, open over this one rather than in a
+// new window: a TV in a cabinet has no way back from a window it did not
+// ask for. A big ✕, a tap on the dark around it, or Esc closes it.
+const Lightbox = (() => {
+  let box = null, onKey = null, frames = null, at = 0, sets = null, setAt = 0;
+  function close() {
+    if (!box) return;
+    box.remove(); box = null; frames = null; sets = null;
+    document.removeEventListener('keydown', onKey, true);
+  }
+  function shell(content, caption, extra) {
+    close();
+    box = h('div', {class: 'lightbox', role: 'dialog', 'aria-modal': 'true'},
+      h('button', {type: 'button', class: 'lb-x', 'aria-label': 'Close', onclick: close}, '✕'),
+      h('div', {class: 'lb-stage'}, content),
+      h('div', {class: 'lb-bar'}, extra && extra.length !== undefined ? extra : [extra], h('span', {class: 'lb-cap'}, caption || '')));
+    // Any tap on the dark closes it -- around the picture, and the empty
+    // parts of the bar under it -- but never one on a control.
+    box.addEventListener('click', (ev) => {
+      const t = ev.target;
+      if (t === box || t.classList.contains('lb-stage') || t.classList.contains('lb-bar') || t.classList.contains('lb-cap')) close();
+    });
+    onKey = (ev) => {
+      if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); close(); }
+      else if (frames && ev.key === 'ArrowRight') { ev.preventDefault(); ev.stopPropagation(); step(1); }
+      else if (frames && ev.key === 'ArrowLeft') { ev.preventDefault(); ev.stopPropagation(); step(-1); }
+      else if (sets && (ev.key === 'ArrowUp' || ev.key === 'ArrowDown')) { ev.preventDefault(); ev.stopPropagation(); pick((setAt + 1) % sets.length); }
+      else if (sets && /^[a-z]$/i.test(ev.key)) {
+        const i = sets.findIndex((st) => st.label[0].toLowerCase() === ev.key.toLowerCase());
+        if (i >= 0) { ev.preventDefault(); ev.stopPropagation(); pick(i); }
+      }
+    };
+    document.addEventListener('keydown', onKey, true);
+    document.body.append(box);
+  }
+  function showFrame() {
+    const f = frames[at];
+    $('.lb-stage img', box).src = f.src;
+    $('.lb-cap', box).textContent = f.caption + (frames.length > 1 ? '  ·  ' + (at + 1) + ' / ' + frames.length : '');
+  }
+  function step(d) { if (!frames) return; at = (at + d + frames.length) % frames.length; showFrame(); }
+  // Switch between parallel sets (Before / After), keeping the camera.
+  function pick(i) {
+    setAt = i; frames = sets[i].list;
+    $$('.lb-sets button', box).forEach((b, k) => b.setAttribute('aria-pressed', String(k === i)));
+    showFrame();
+  }
+  // Pictures to step through (one camera each), opened at `index`. With
+  // `variants` -- [{label, list}] of the same cameras, e.g. Before / After --
+  // a switch flips between them on the camera you are looking at.
+  function images(list, index, extra, variants, variant) {
+    const switcher = variants && variants.length > 1
+      ? h('div', {class: 'seg lb-sets', role: 'group'}, variants.map((st, i) => h('button', {type: 'button', 'aria-pressed': String(i === (variant || 0)),
+        onclick: (ev) => { ev.stopPropagation(); pick(i); }}, st.label)))
+      : null;
+    shell(h('img', {class: 'lb-img', alt: ''}), '', [switcher, extra].filter(Boolean));
+    sets = switcher ? variants : null; setAt = variant || 0;
+    frames = sets ? sets[setAt].list : list; at = index || 0;
+    if (frames.length > 1) {
+      $('.lb-stage', box).append(
+        h('button', {type: 'button', class: 'lb-nav prev', 'aria-label': 'Previous', onclick: (ev) => { ev.stopPropagation(); step(-1); }}, '‹'),
+        h('button', {type: 'button', class: 'lb-nav next', 'aria-label': 'Next', onclick: (ev) => { ev.stopPropagation(); step(1); }}, '›'));
+    }
+    showFrame();
+  }
+  function page(url, caption) { shell(h('iframe', {class: 'lb-page', src: url, title: caption || 'page'}), caption); }
+  // A link to another page opens it here, over this one, on every screen:
+  // a kiosk app turns a new window into "replace this page", with no way
+  // back. The href stays real, so on a laptop a Cmd/Ctrl/Shift- or
+  // middle-click still opens a tab the browser's own way.
+  function guard(a, caption) {
+    a.removeAttribute('target');
+    a.addEventListener('click', (ev) => {
+      if (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey || ev.button !== 0) return;
+      ev.preventDefault(); page(a.getAttribute('href'), caption);
+    });
+    return a;
+  }
+  return {images, page, guard, close, get open() { return !!box; }};
+})();
 const CAM_IDS = OD.cam_ids;
 const BOARD_SECTORS = OD.board_sectors;          // clockwise from 20 at the top
 const BOARD_RINGS = OD.board_rings;

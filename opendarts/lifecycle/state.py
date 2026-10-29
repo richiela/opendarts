@@ -52,6 +52,7 @@ from typing import Any, Callable
 import numpy as np
 
 from opendarts.capture.lazy_frame import as_frames, handles_of, pixels_of
+from opendarts.lifecycle import same_dart
 from opendarts.lifecycle.reference import ReferenceSet
 from opendarts.lifecycle.signals import (
     DEFAULT_SIGNAL_CONFIG,
@@ -68,6 +69,8 @@ from opendarts.lifecycle.signals import (
 #: empty board again (the driver logs each at INFO)
 CLEARED_NOT_PARTIAL = "board matches the empty board, not a partial removal"
 CLEARED_STRANDED = "board matches the empty board, was stuck waiting for a takeout"
+#: a clear made because the board changed under a hand -- nothing verified empty
+CLEARED_UNDER_HAND = "board changed under hand"
 
 
 class Phase(enum.Enum):
@@ -123,7 +126,15 @@ class LifecycleConfig:
     #: already-committed neighbour (the union swallowed most of its
     #: pixels and fragmented the remainder into sub-floor blobs, so it
     #: was never scored at all).
-    dart_min_px: int = 80
+    #: 2026-10-05, lowered 80 -> 60. On a rig with low cameras a third dart
+    #: grouped behind the first two read 78/61/26 and 9/63/72 px and was
+    #: never scored (the oracle scored both, S20/T20). Replayed over every
+    #: logged session on both rigs: at 60 both are caught, and every other
+    #: change the lower floor admits is seen by one camera only (the second
+    #: at <= 6 px), which the second-camera rule below already refuses -- no
+    #: new commits. The floor is a trigger; the one-camera rule is what
+    #: keeps ghosts out (see docs/LIFECYCLE.md).
+    dart_min_px: int = 60
     #: frames of dart evidence -- a camera passing the dart test, stable
     #: or NOT -- required before a commit; the commit itself additionally
     #: waits for a currently-stable frame. This is deliberately not
@@ -255,6 +266,49 @@ class LifecycleConfig:
     #: into the reference -- long enough that a real dart's other views,
     #: a frame or two behind while it settles, are never cut short.
     single_cam_absorb_frames: int = 6
+    # ... unless another camera saw THE SAME dart off the board or as a
+    # 1 px shaft: at least same_dart_min_px of its changed pixels, and
+    # same_dart_share of them, on the band the seeing camera's pixels map
+    # to (opendarts/lifecycle/same_dart.py; needs the calibration). Real
+    # darts: 1,241 of 1,242 one-camera trials at 0.5 or more (lowest
+    # 0.46); ghosts never over 0.43. The pixel floor: across 1,783
+    # one-camera trials of real darts the confirming camera never had
+    # fewer than 144 px on the band (the missed dart this was built for:
+    # 215); the strip switching off at 2026-10-04 10:13:06 confirmed
+    # itself with 11 of 11 px at the old floor of 8.
+    same_dart_min_px: int = 50
+    same_dart_share: float = 0.5
+    same_dart_len_mm: float = 150.0
+    same_dart_lean_deg: float = 35.0
+    same_dart_max_rays: int = 400
+    same_dart_band_px: int = 2
+    # --- two cameras near the floor, one dart ------------------------------
+    # 2026-10-09, a third dart grouped on two S1 darts was never scored
+    # (the oracle called S1). Its black flight landed on the earlier black
+    # flights, so most of its change sat on them or off the board: replayed
+    # from the frame dump, cameras 0/2 read 57/41, 75/60 and 57/55 board px
+    # on three frames running. The one frame at 60 restarted the evidence
+    # count, the next fell back under it, and the quiet branch adopted the
+    # dart as background. A dart under the one-camera floor still counts
+    # when the two cameras that see it most agree it is ONE dart:
+    #   * each has at least pair_min_px board pixels;
+    #   * each one's change lies on the other's dart band, both directions
+    #     (same_dart.py, at same_dart_min_px / same_dart_share);
+    #   * each shows a dart shape at full resolution (Apollo's detect_tip
+    #     finds a component elongated past its MIN_ELONGATION_RATIO).
+    # Neither test alone keeps the recorded phantoms out: the band passes a
+    # light glinting on the cabinet bracket above the board (10-05 18:28,
+    # a real object in the dart's space, seen by two cameras), the shape
+    # gate passes two others (thin elongated edges in two cameras); both
+    # together refuse all four. pair_min_px is a trigger, like dart_min_px:
+    # in 2,721 quiet frames of five frame dumps no camera ever read a
+    # single changed board pixel outside a dart, so the floor is not what
+    # keeps noise out -- it is set low enough that this dart is caught with
+    # margin (at 50 it commits on its last frame, by 5 px).
+    pair_min_px: int = 40
+    #: the pair must also look like a dart at full resolution in both
+    #: cameras (Apollo's detect_tip finds an elongated component)
+    pair_shape_check: bool = True
 
     # --- cooldowns / adoption ------------------------------------------
     commit_cooldown_frames: int = 6
@@ -373,8 +427,13 @@ class Lifecycle:
         board_masks: dict[int, np.ndarray],
         config: LifecycleConfig = DEFAULT_CONFIG,
         hold: Callable[[], "str | None"] | None = None,
+        calibrations: dict[int, Any] | None = None,
     ) -> None:
         self.cfg = config
+        #: per-camera calibrations the board masks were built from; lets a
+        #: one-camera dart be confirmed by another camera seeing the same
+        #: dart (same_dart.py). None/empty: the one-camera rule as before.
+        self._calibrations = dict(calibrations) if calibrations else {}
         #: ``() -> reason | None``: a reason not to score right now, from
         #: outside the board (the oracle is on and not ready --
         #: opendarts/live/oracle_hold.py). Asked when a dart first shows up;
@@ -394,6 +453,8 @@ class Lifecycle:
         #: a partial removal has been accepted this visit: darts are still
         #: counted, and the rest of the takeout is awaited
         self._partial_adopted = False
+        #: set by a verified clear: retake the empty board when its cooldown ends
+        self._retake_empty = False
 
     def reset(self) -> None:
         """Operator reset: forget darts and re-warm on the current scene."""
@@ -450,6 +511,8 @@ class Lifecycle:
             return Tick(self.tick_n, self.phase, Action.NONE, self.dart_count, {}, False, False, [], "no cameras")
 
         agg = self._aggregate(signals)
+        if not agg.dart_cams:
+            agg.dart_cams = self._pair_dart_cams(signals, agg, fulls, smalls)
         tick = self._step(agg, signals, fulls, smalls)
         return tick
 
@@ -507,12 +570,22 @@ class Lifecycle:
         # object. A partial removal sits at 0.25-0.7 coverage, below the
         # removal_cams floor, and must not commit a phantom; this is why
         # ``board_new_px`` / ``in_union_px`` stay computed unchanged.
+        # ... but only once darts could really be leaving: at least
+        # takeout_partial_coverage of the committed darts changed. A new
+        # dart landing IN FRONT of a group puts most of its change on the
+        # darts already there while changing little of them (0.15 and 0.01
+        # for the two real darts this guard dropped on the low-camera rig, 10-04
+        # 22:14:46 and 10-02 10:32:21); a pull changes far more. Below the
+        # max dart count only -- at the max nothing can commit anyway.
+        # See docs/LIFECYCLE.md, "The union-dominance guard".
         dart_cams = [
             c
             for c, s in signals.items()
             if c not in removal_cams
             and s.board_px >= cfg.dart_min_px
-            and s.board_new_px >= s.in_union_px
+            and (s.board_new_px >= s.in_union_px
+                 or (s.union_coverage < cfg.takeout_partial_coverage
+                     and self.dart_count < cfg.max_darts))
         ]
         partial_cams = [c for c in union_cams if signals[c].union_coverage >= cfg.takeout_partial_coverage]
         over_darts = any(signals[c].union_coverage >= cfg.over_darts_coverage for c in union_cams)
@@ -568,11 +641,71 @@ class Lifecycle:
         if self.dart_count == 0 and self._empty and self._looks_empty(smalls):
             self._set_empty(smalls)
 
-    def _corroborated(self, signals) -> bool:
-        """A second camera sees the change too -- or the rig has only one."""
+    def _corroborated(self, signals, smalls: dict[int, np.ndarray]) -> str | None:
+        """Why a second camera counts as seeing the change -- or None.
+        The rig may have only one camera; otherwise a second camera sees it
+        on the board, or sees the same dart (see same_dart.py)."""
+        cfg = self.cfg
         need = min(2, len(signals))
-        seen = sum(1 for s in signals.values() if s.board_px >= self.cfg.corroborate_min_px)
-        return seen >= need
+        seen = [cam for cam, s in signals.items() if s.board_px >= cfg.corroborate_min_px]
+        if len(seen) >= need:
+            return "on the board"
+        if len(seen) != 1 or not self._calibrations:
+            return None
+        cam = seen[0]
+        others = {c: (smalls[c], self.refs[c].small) for c in signals if c != cam and c in smalls}
+        found = same_dart.support(
+            self._calibrations, cam, self._last_change[cam], others,
+            cfg.signals, dart_len_mm=cfg.same_dart_len_mm, lean_deg=cfg.same_dart_lean_deg,
+            max_rays=cfg.same_dart_max_rays, band_px=cfg.same_dart_band_px,
+        )
+        for other, (on, total) in sorted(found.items()):
+            if on >= cfg.same_dart_min_px and on >= cfg.same_dart_share * total:
+                return f"same dart seen by camera {other} ({on}/{total} px)"
+        return None
+
+    def _pair_dart_cams(self, signals, agg, frames, smalls: dict[int, np.ndarray]) -> list[int]:
+        """The two strongest cameras, when each sees ``pair_min_px`` board
+        pixels, each one's change lies on the other's dart band (both
+        directions of same_dart.py), and each shows a dart shape at full
+        resolution: one dart, seen from two sides, under the one-camera
+        floor in both. Else [] (see ``pair_min_px``)."""
+        cfg = self.cfg
+        if self.dart_count >= cfg.max_darts or not self._calibrations:
+            return []
+        # the same union-dominance guard as ``dart_cams`` (see _aggregate)
+        near = sorted(
+            (c for c, s in signals.items()
+             if c not in agg.removal_cams and c in smalls and c in frames
+             and c in self._calibrations and s.board_px >= cfg.pair_min_px
+             and (s.board_new_px >= s.in_union_px
+                  or s.union_coverage < cfg.takeout_partial_coverage)),
+            key=lambda c: (-signals[c].board_px, c),
+        )
+        if len(near) < 2:
+            return []
+        a, b = near[0], near[1]
+        for seen, other in ((a, b), (b, a)):
+            found = same_dart.support(
+                self._calibrations, seen, self._last_change[seen],
+                {other: (smalls[other], self.refs[other].small)},
+                cfg.signals, dart_len_mm=cfg.same_dart_len_mm, lean_deg=cfg.same_dart_lean_deg,
+                max_rays=cfg.same_dart_max_rays, band_px=cfg.same_dart_band_px,
+            )
+            on, total = found.get(other, (0, 0))
+            if on < cfg.same_dart_min_px or on < cfg.same_dart_share * total:
+                return []
+        if cfg.pair_shape_check:
+            # Only here, a few frames per visit at most, are the full frames
+            # decoded: Apollo's own dart-shape gate on each camera's change.
+            from opendarts.engines.apollo.tip_detection import MIN_ELONGATION_RATIO, detect_tip
+
+            for cam in (a, b):
+                found = detect_tip(pixels_of(self.refs[cam].full), pixels_of(frames[cam]))
+                elongation = (found.diagnostics or {}).get("elongation_ratio") or 0.0
+                if not found.ok or elongation < MIN_ELONGATION_RATIO:
+                    return []
+        return [a, b]
 
     def _refuse(self, agg, signals, frames, smalls, reason: str) -> Tick:
         """Absorb a would-be dart into the reference without scoring it,
@@ -647,15 +780,29 @@ class Lifecycle:
             if c.cooldown <= 0:
                 self.phase = Phase.IDLE
                 c.reset_idle()
-                if self.dart_count == 0 and not self._empty:
+                # The empty board is "the board before the visit's first
+                # dart" (see the config notes above): taken at warmup, and
+                # again at the end of every verified clear -- which is
+                # exactly that moment. Taking it only once let a picture
+                # made with darts in the board (a restart or Reset mid-visit)
+                # stand for good, and a later dart landing where one of
+                # those had been was refused as "a removal" (2026-10-05).
+                if self.dart_count == 0 and (not self._empty or self._retake_empty):
                     self._set_empty(smalls)
+                self._retake_empty = False
             return self._tick(agg, signals, Action.NONE)
 
         # ---- scene change (lighting step): every camera's board changed.
         # Evaluated before the hand rules because a whole-frame step also
         # satisfies the static-arm rule; never commit, re-adopt when still.
         if self.phase is Phase.SCENE_CHANGE:
-            if not agg.scene:
+            # "Passed" only when the board is back to the reference. Lights
+            # that fade in, then auto-exposure pulling most of the board
+            # back, shrink the change below scene_board_frac while it is
+            # still moving -- and what stays different must be adopted
+            # below once still, not judged as a dart against the old
+            # reference (a phantom at every Start that lit the cabinet).
+            if not agg.scene and not agg.dart_cams:
                 self.phase = Phase.IDLE
                 c.reset_idle()
                 return self._tick(agg, signals, Action.NONE, "scene change passed")
@@ -751,7 +898,7 @@ class Lifecycle:
                     c.dart >= cfg.post_hand_stable_frames and agg.stable
                 ) or c.pending >= cfg.dart_force_frames:
                     if self.dart_count > 0:
-                        return self._clear(agg, signals, frames, smalls, "board changed under hand")
+                        return self._clear(agg, signals, frames, smalls, CLEARED_UNDER_HAND)
                     self._adopt(frames, smalls)
                     self.phase = Phase.IDLE
                     c.reset_idle()
@@ -784,7 +931,8 @@ class Lifecycle:
                     # was taken away (a dart pulled after an early clear),
                     # not thrown.
                     return self._refuse(agg, signals, frames, smalls, "a removal, not a dart")
-                if not self._corroborated(signals):
+                why = self._corroborated(signals, smalls)
+                if why is None:
                     # One camera alone -- a hand at the edge of one view,
                     # not a dart on the board every camera watches. Hold a
                     # few stable frames (a real dart's other views can lag
@@ -803,7 +951,8 @@ class Lifecycle:
                             agg, signals, frames, smalls, False, "over darts, stable"
                         )
                     return self._tick(agg, signals, Action.NONE, "held: change over committed darts")
-                return self._commit(agg, signals, frames, smalls, forced)
+                return self._commit(agg, signals, frames, smalls, forced,
+                                    why if why.startswith("same dart") else "")
             c.over_darts = 0
             return self._tick(agg, signals, Action.NONE)
 
@@ -812,6 +961,20 @@ class Lifecycle:
         c.held = None
 
         # ---- committed darts being removed
+        # A takeout is entered on a STILL frame, never a moving one. A dart in
+        # flight passing in front of a committed one reads, for that single
+        # blurred frame, exactly like that dart being pulled (low-camera
+        # rig 10-05 14:55:07.958: 29% of dart 1 "changed", the next frame was
+        # dart 2), and entering TAKEOUT_PENDING announces a takeout to every
+        # listener -- the cabinet strip flashed yellow after dart 2. Every
+        # count below already ignores moving frames, so this only delays the
+        # announcement (replayed: median 2 frames, 28 such flashes removed
+        # across both rigs' logs); when a visit clears is unchanged.
+        if (agg.union_cams and (agg.removal_cams or agg.partial_cams)
+                and not agg.stable and self.phase is not Phase.TAKEOUT_PENDING):
+            c.takeout = c.partial = c.quiet = c.stranded = 0
+            return self._tick(agg, signals, Action.NONE)
+
         if agg.union_cams and agg.removal_cams:
             self.phase = Phase.TAKEOUT_PENDING
             c.partial = c.quiet = c.stranded = 0
@@ -972,6 +1135,13 @@ class Lifecycle:
     def _clear(self, agg, signals, frames, smalls, reason: str = "") -> Tick:
         cfg, c = self.cfg, self._c
         cleared = self.dart_count
+        # Retake the empty board after the cooldown only when the board
+        # vouched for it: it matched the empty board (stranded / not
+        # partial), or the darts were gone where they had been. Not after a
+        # clear forced by clear_force_frames (something may still be over a
+        # dart) nor one made because the board changed under a hand.
+        self._retake_empty = (reason in (CLEARED_NOT_PARTIAL, CLEARED_STRANDED)
+                              or (not reason and self._darts_gone(smalls)))
         self.refs.clear_darts()
         self.dart_count = 0
         self._partial_adopted = False

@@ -162,6 +162,14 @@ class FrameSet:
     pixels: Mapping[int, np.ndarray]
     nbytes: int
     jpegs: Mapping[int, bytes] = field(default_factory=dict)
+    #: slot -> capture time for this set, on whichever clock `clock`
+    #: names ("driver" or "arrival" -- see opendarts.live.set_assembly's
+    #: "THE CLOCK" section). Empty for a caller that never passed one (an
+    #: older recording, or a test) -- diagnostic only, never compared
+    #: across sets on different clocks.
+    capture_ms: Mapping[int, float] = field(default_factory=dict)
+    #: "driver" or "arrival", or None when `capture_ms` is empty.
+    clock: "str | None" = None
 
     @property
     def slots(self) -> list[int]:
@@ -336,6 +344,8 @@ class FrameRing:
         monotonic_s: float,
         generation: int,
         jpegs: "Mapping[int, bytes] | None" = None,
+        capture_ms: "Mapping[int, float] | None" = None,
+        clock: "str | None" = None,
     ) -> None:
         """Retain one pump cycle. Called from the pump thread, once per
         cycle, with the SAME two clock samples the pump already took for
@@ -346,6 +356,11 @@ class FrameRing:
         `frames` is copied at the DICT level only (so a later mutation of
         the pump's own cache dict cannot reach into a retained set) and
         never at the array level -- see `FrameSet`'s docstring.
+
+        `capture_ms`/`clock` are additive, optional per-camera capture
+        times (opendarts.live.set_assembly) -- absent for an older caller
+        or a test, same "additive, never load-bearing" posture `jpegs`
+        already has.
 
         Never raises. This runs on the capture path, and the capture
         loop's correctness must not depend on a diagnostic -- the same
@@ -367,6 +382,7 @@ class FrameRing:
         pixels = {i: f for i, f in kept.items() if i not in kept_jpegs}
         nbytes = (sum(int(f.nbytes) for f in pixels.values())
                   + sum(len(j) for j in kept_jpegs.values()))
+        kept_capture_ms = {i: float(t) for i, t in (capture_ms or {}).items() if i in kept}
         entry = FrameSet(
             generation=int(generation),
             wall_s=float(wall_s),
@@ -374,6 +390,8 @@ class FrameRing:
             pixels=pixels,
             nbytes=nbytes,
             jpegs=kept_jpegs,
+            capture_ms=kept_capture_ms,
+            clock=(clock if kept_capture_ms else None),
         )
         with self._lock:
             if self._paused:

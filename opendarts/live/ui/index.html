@@ -6,6 +6,9 @@
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" content="#060810">
 <title>@@OD_HOST_LABEL@@ · opendarts</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <style>
 @@OD_UI_CSS@@
 </style>
@@ -74,14 +77,31 @@
       </div>
     </aside>
     <div class="ticker" id="earlier"><span class="tag2">EARLIER</span><ol class="run" id="recent-turns"></ol></div>
+    <!-- floats along the foot of Play, over the ticker: it never moves the page -->
+    <div class="omiss" id="oracle-miss" role="alert" hidden>
+      <span class="k omiss-k" id="omiss-kicker">MISSED DART</span>
+      <p class="omiss-t" id="omiss-text"></p>
+      <small class="omiss-f" id="omiss-foot"></small>
+      <button type="button" class="omiss-x" id="omiss-x" aria-label="Dismiss">✕</button>
+    </div>
   </section>
 
   <!-- =============================== LAB: THROWS =============================== -->
   <section id="throws" class="throws" hidden aria-label="Throws">
     <!-- a display in its Engines layout has no bar: the oracle is said here -->
     <div class="oracle-throws"><span id="oracle-throws" class="oracle-ind oracle-show" data-tone="off"></span></div>
-    <header class="throws-head">
+    <!-- notices float over the page, never push it (rla: nothing shifts) -->
+    <div class="throws-notices">
       <div class="banner warn" id="throws-banner" hidden></div>
+      <!-- the same notice as the scoreboard's: a TV on Engines is where it is watched while testing -->
+      <div class="omiss" id="oracle-miss-lab" role="alert" hidden>
+        <span class="k omiss-k">MISSED DART</span>
+        <p class="omiss-t"></p>
+        <small class="omiss-f"></small>
+        <button type="button" class="omiss-x" aria-label="Dismiss">✕</button>
+      </div>
+    </div>
+    <header class="throws-head">
       <div class="throws-top">
         <div><h1 class="title">Throws</h1><p class="sub" id="throws-sub">—</p></div>
         <div class="throws-tools">
@@ -266,7 +286,7 @@
         <div class="setting">
           <span class="k">A problem?</span>
           <p class="d">Everything on this page as one block of text, for a bug report.</p>
-          <div class="c btn-row"><button type="button" class="btn" id="btn-copy-diag">Copy diagnostics</button><a class="btn ghost" id="link-logs" href="/api/logs/run_product?n=500" target="_blank" rel="noopener">Log ↗</a></div>
+          <div class="c btn-row"><button type="button" class="btn" id="btn-copy-diag">Copy diagnostics</button><a class="btn ghost" id="link-logs" href="/api/logs/run_product?n=500">Log</a></div>
         </div>
         <details class="advanced">
           <summary>Advanced</summary>
@@ -345,7 +365,7 @@
       <div class="setting"><label class="k" for="scr-overlay">Camera overlay</label><span></span><div class="c"><input type="checkbox" class="switch" id="scr-overlay"></div></div>
       <div class="setting"><span class="k">Lab paper</span><span></span><div class="c"><div class="seg" id="scr-theme" role="group"><button type="button" data-v="light">Paper</button><button type="button" data-v="dark">Blueprint</button><button type="button" data-v="auto">Auto</button></div></div></div>
       <div class="setting"><span class="k">Text size</span><span></span><div class="c"><div class="seg" id="scr-text" role="group"><button type="button" data-v="normal">Normal</button><button type="button" data-v="large">Large</button><button type="button" data-v="huge">Huge</button></div></div><p class="note">Throws, for a screen read from across the room.</p></div>
-      <div class="setting"><span class="k">Wall display</span><span></span><div class="c"><button type="button" class="btn" id="scr-fullscreen">Full screen</button></div><p class="note">For a TV nobody touches, open <code>?kiosk=1&amp;sound=on</code>.</p></div>
+      <div class="setting"><span class="k">Wall display</span><span></span><div class="c"><button type="button" class="btn" id="scr-fullscreen">Full screen</button></div><p class="note">For a TV nobody touches, open <code>/?display=tv&amp;sound=on</code> and set it up under Rig › Displays.</p></div>
     </div>
   </div>
 </dialog>

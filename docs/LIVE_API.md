@@ -19,9 +19,9 @@ on.
 |---|---|
 | `GET /api/health` | liveness, plus `capabilities` (which external tools exist on this machine), `build` (the running version), `streams` (open and maximum MJPEG connections) and this process's `pid` — comparing the pid is how a caller tells "the rig is back" from "the process it asked to restart has not died yet" |
 | `GET /api/state` | current rig state. Its `capture_loop` section carries `status_epoch` / `status_seq` (see [Ordering stamps](#ordering-stamps)) |
-| `GET /api/cameras/status` | per-camera backend, resolution, frame counts and errors, plus where the slot's JPEG comes from: `jpeg_passthrough` (the camera's own) or `jpeg_synthetic` / `jpeg_synthetic_quality` (encoded by the rig — see `docs/STREAMING.md`) |
+| `GET /api/cameras/status` | per-camera backend, resolution, frame counts and errors, `frame_age_ms` (the last frame's age from the driver's capture time; null where the source reports none), plus where the slot's JPEG comes from: `jpeg_passthrough` (the camera's own) or `jpeg_synthetic` / `jpeg_synthetic_quality` (encoded by the rig — see `docs/STREAMING.md`). `CameraHub.frame_set_sync()` (see `docs/CAMERAS.md`'s "Frame-set sync") carries `in_sync` / `spread_ms` / `clock` / `stalled` / `repeats_total` / `dropped` for the last published frame set, but is not yet wired into this endpoint's own JSON |
 | `GET /api/frame-health` | whether frames are keeping up on **both** sides: `capture` (is the pump reading every frame the camera produces — a 30fps camera delivering 21 is degrading silently) and `publish` (is the virtual-camera consumer collecting every frame we hand it) |
-| `POST /api/start` / `POST /api/stop` | start or stop the capture loop. Replies carry `status_epoch` / `status_seq`. While the oracle is on, connected and stopped, Start also starts it; its answer is in `oracle_start` (absent otherwise) |
+| `POST /api/start` / `POST /api/stop` | start or stop the capture loop. Stop (and the idle stop) also stops a running oracle; its answer is in `oracle_stop`. Replies carry `status_epoch` / `status_seq`. While the oracle is on, connected and stopped, Start also starts it -- once OD has seen a still, empty board for 2 s after warm-up (any change restarts the wait), so the oracle takes its empty board with the cabinet lights on and the cameras settled. `oracle_start` (absent otherwise) is then `{ok: true, deferred: true}`; the oracle's start shows as usual in `ad_board_status` / `AD_BOARD_STATUS`. A Stop before warm-up ends cancels it. An oracle already running is checked at the same moment: in a takeout with no darts thrown (the lights came on under it), it is reset |
 | `POST /api/reset` | reset session state: the board as it is now becomes the starting point, dart or no dart. While the oracle is on it also resets Autodarts; its answer is in `oracle_reset` (absent while the oracle is off). Pull every dart first |
 | `POST /api/restart` | exit cleanly so the launcher (`run.sh` / `run.ps1`) starts the process again; replies with `restarting` and the old `pid`. Without a launcher loop it only stops the process. Optional body `{"update": true}` asks the launcher to `git pull` first: it records `update_on_next_restart` in `data/config.json`, and refuses to restart if it cannot. **No body restarts without pulling** |
 | `GET /api/restart` | reports, without restarting anything, the two launcher update flags (`always_update`, `update_on_next_restart`) — what a restart *would* do. Both are also keys of the config document |
@@ -161,6 +161,12 @@ switch could not express that.
 gets its permitting tap at setup and silently loses it on any reload.
 The TV knows; nobody at the oche does — so every dashboard shows every
 other dashboard's state.
+
+## Icons
+
+`GET /favicon.ico` (16, 32 and 48 px), `GET /favicon.svg` and
+`GET /apple-touch-icon.png` (180 px): the rig's icon, a dart into the bull.
+Every page links them; browsers also ask for `/favicon.ico` on their own.
 
 ## Dashboard
 
@@ -323,3 +329,37 @@ a takeout that began within 3 s of it landing -- Autodarts goes into
 takeout on the third throw it sees, often a moment before OD sees the
 same dart. The gate judges the oracle as the dart lands, not when it
 scores.
+
+### Oracle count mismatch
+
+While the oracle is on, OD compares Autodarts' dart count for the visit
+with its own every half second -- while OD is running and not in its own
+takeout, and Autodarts is connected and either ready or in the takeout it
+starts by itself on its third throw (its count still standing, and OD's
+visit still open). That last case is a missed third dart: 3 against 2. A
+disagreement is recorded once it lasts 1.5 s unchanged when Autodarts is
+ahead, 2.5 s when OD is:
+
+- **The oracle saw a dart OD did not** (`kind: "oracle_saw_dart_od_missed"`)
+  -- OD missed one.
+- **OD counted a dart the oracle did not** (`kind:
+  "od_counted_dart_oracle_did_not"`) -- possibly a phantom.
+
+Each one is logged, keeps the frame ring as a missed-dart dump with
+`trigger: "oracle"` and the mismatch in its manifest's `extra` (at most one
+every 60 s; a dump is ~300 MB), and is broadcast on `/api/events` as
+`ORACLE_MISMATCH` with `kind`, `visit_id`, `oracle_n`, `od_n`,
+`oracle_call` (the oracle's latest throw, e.g. `"S20"`), `reason`,
+`at_utc`, `captured` (whether frames were kept) and `capture` (the dump's
+directory, or why none was written; null when this rig has no capture).
+`GET /api/state` carries the last 20 as `oracle_mismatches`.
+
+Every screen shows the latest one in a banner floating along the foot of
+Play and of the Throws / Engines view, over the oldest content; it never
+moves the page ("Missed dart:
+the oracle saw dart 3 (S20), OpenDarts has 2"), from the moment it arrives
+until the takeout that ends that visit, or until someone dismisses it on a
+controller. A display shows it too.
+
+The oracle never scores here: the visit keeps exactly the darts OD
+committed. `oracle_call` is a note for whoever reads the capture.
